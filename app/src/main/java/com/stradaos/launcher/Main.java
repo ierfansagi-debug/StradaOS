@@ -13,7 +13,13 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.RectF;
+import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
@@ -156,9 +162,23 @@ public class Main extends Activity {
     private View mapTagBox, navSearchBtn, navHud, navLaneBox, topNavPill;
     private Nav.ManeuverView navTurnIc, topNavIc;
     private Nav.LaneStripView navLaneView;
-    private TextView navDistTv, navStepTv, navEtaTv, speedSignTv, camBadgeTv, topNavDistTv;
+    private TextView navDistTv, navStepTv, navEtaTv, speedSignTv, navCurSpeedTv, navCurUnitTv, camBadgeTv, topNavDistTv;
+    private LinearLayout speedHudBox;
+    private WaveAlertView waveAlertView;
+    private double waveAlertLat = Double.NaN, waveAlertLon = Double.NaN;
+    private Nav.PoliceReport waveAlertPolice;
     private final List<Nav.Place> pendingStops = new ArrayList<Nav.Place>();
     private LiveMapView liveMap;
+    private MapLibreMapView mlMap;
+    private boolean mapLibreFallback;
+    private boolean autoSimPending;
+    private Nav.Place previewPlace;
+    private FrameLayout mapPreviewCard, mapSearchOverlay, mapStepsOverlay;
+    private View mapCtrlBox, mapRecenterBtn, mapOverviewBtn, mapStepsBtn, mapTiltQuickBtn, mapSimBtn, mapPoliceBtn, mapEngineBtn;
+    private TextView mapTiltQuickTv, mapEngineTv;
+    private ImageView mapSimIc;
+    private View mapConnPanel, mapConnHandle, mapConnNavBtn, mapConnGauge;
+    private boolean mapConnHasPanel, mapConnNavBtnVisible;
     private MediaWatcher mediaWatcher;
     private Hcn hcn;   // pantallas HCN / Hengchen (issue #5)
     private boolean askedPerms;
@@ -194,6 +214,8 @@ public class Main extends Activity {
         prefs = getSharedPreferences("launcher", MODE_PRIVATE);
         I18n.init(this, prefs);
         LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+        LiveMapView.view3d = prefs.getBoolean("map_3d", false);
+        LiveMapView.tiltAngle = prefs.getInt("map_angle", 45);
         lm = (LocationManager) getSystemService(LOCATION_SERVICE);
         if (getPackageName().endsWith(".debug") && getIntent() != null && "saltar".equals(getIntent().getStringExtra("prueba")))
             prefs.edit().putBoolean("setup_done", true).apply();
@@ -305,6 +327,9 @@ public class Main extends Activity {
             IntentFilter bf = new IntentFilter("android.bluetooth.device.action.ACL_CONNECTED");
             bf.addAction("android.bluetooth.a2dp-sink.profile.action.CONNECTION_STATE_CHANGED");
             registerReceiver(btConnReceiver, bf);
+        } catch (Throwable ignored) { }
+        try {
+            registerReceiver(netReceiver, new IntentFilter(android.net.ConnectivityManager.CONNECTIVITY_ACTION));
         } catch (Throwable ignored) { }
     }
 
@@ -466,6 +491,7 @@ public class Main extends Activity {
         try { unregisterReceiver(usbOffReceiver); } catch (Throwable ignored) { }
         try { bt.disconnect(); } catch (Throwable ignored) { }
         try { unregisterReceiver(btConnReceiver); } catch (Throwable ignored) { }
+        try { unregisterReceiver(netReceiver); } catch (Throwable ignored) { }
         h.removeCallbacks(btTicker);
         h.removeCallbacks(aaWait);
         try { if (mediaWatcher != null) mediaWatcher.stop(); } catch (Throwable ignored) { }
@@ -473,6 +499,10 @@ public class Main extends Activity {
         try { lm.removeUpdates(odoListener); } catch (Throwable ignored) { }
         odoRunning = false;
         if (odoPending > 0) prefs.edit().putFloat("odo_gps_m", prefs.getFloat("odo_gps_m", 0) + odoPending).apply();
+        Nav.stopSimulation();
+        simLastOk = false;
+        if (waveAlertView != null) { waveAlertView.setAlert(false, 0); waveAlertView = null; }
+        if (mlMap != null) { mlMap.destroy(); mlMap = null; }
         Nav.shutdownTts();
         Guard.stopWatchdog();
         super.onDestroy();
@@ -481,6 +511,7 @@ public class Main extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (mlMap != null) mlMap.onResume();
         Obd.addListener(obdWatch);
         if (homeFixing && SDK < 29) h.postDelayed(new Runnable() { public void run() { homeResult(); } }, 700);
         immersive();
@@ -648,6 +679,7 @@ public class Main extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        if (mlMap != null) mlMap.onPause();
         Obd.removeListener(obdWatch);
         if (obdDlg != null) obdDlg.stopDiscovery();
         h.removeCallbacks(idleRun);
@@ -1070,6 +1102,9 @@ public class Main extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (mapStepsOverlay != null) { closeStepsSheet(); return; }
+        if (mapSearchOverlay != null) { closeMapSearchOverlay(); return; }
+        if (previewPlace != null) { clearMapPlacePreview(true); return; }
         if (vpanel != null && vpanel.isOpen()) { vpanel.close(); return; }
         if (settingsView != null) {
             if (settingsSub != null && settingsCat == C_VEHICLE) { settingsBack(); return; }
@@ -1203,6 +1238,7 @@ public class Main extends Activity {
             }
             updatePlayIcon();
             updateStatusIcons();
+            checkAutoMapEngineSwitch();
             if (++themeTick % 30 == 0) {
                 boolean was = LIGHT;
                 applyTheme();
@@ -1217,6 +1253,21 @@ public class Main extends Activity {
         public void onReceive(Context c, Intent i) { updateClock(); }
     };
 
+    private final BroadcastReceiver netReceiver = new BroadcastReceiver() {
+        public void onReceive(Context c, Intent i) { checkAutoMapEngineSwitch(); }
+    };
+
+    private void checkAutoMapEngineSwitch() {
+        if (isFinishing() || root == null || !showMap) return;
+        if (!prefs.getBoolean("map_live", true)) return;
+        if (previewPlace != null || mapSearchOverlay != null || mapStepsOverlay != null) return;
+        boolean wantMl = useMapLibre();
+        boolean hasMl = mlMap != null;
+        if (wantMl != hasMl) {
+            rebuild();
+        }
+    }
+
     private final BroadcastReceiver pkgReceiver = new BroadcastReceiver() {
         public void onReceive(Context c, Intent i) {
             loadApps();
@@ -1227,11 +1278,23 @@ public class Main extends Activity {
     // ───────────────────────── construcción de la UI ─────────────────────────
 
     private void build(int W, int H) {
+        builtW = W;
+        builtH = H;
         build0(W, H);
         attachVehicle();
     }
 
     private void build0(int W, int H) {
+        if (waveAlertView != null) { waveAlertView.setAlert(false, 0, false); waveAlertView = null; }
+        waveAlertPolice = null;
+        if (mlMap != null) { mlMap.destroy(); mlMap = null; }
+        speedHudBox = null; navCurSpeedTv = null; navCurUnitTv = null;
+        mapSearchOverlay = null;
+        mapStepsOverlay = null;
+        mapPreviewCard = null;
+        mapCtrlBox = null; mapRecenterBtn = null; mapOverviewBtn = null;
+        mapStepsBtn = null; mapTiltQuickBtn = null; mapSimBtn = null; mapPoliceBtn = null;
+        mapEngineBtn = null; mapEngineTv = null;
         root.removeAllViews();
         idleView = null; idleClock = idleDate = idleSpeedTv = null; idleGauge = null;
         // versión de prueba: simular otra pantalla (p. ej. una ancha de 1920x720 en una tablet)
@@ -1261,10 +1324,8 @@ public class Main extends Activity {
         playerLeft = "left".equals(prefs.getString("player_side", "right"));
         showCar = prefs.getBoolean("show_car", true);
         showMap = true;   // «ocultar el mapa» del PR #35 queda para más adelante
-        if (Nav.active != null && !"internal".equals(prefs.getString("nav_app", null))) {
-            Nav.stop(this);
-            LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
-        }
+        LiveMapView.view3d = prefs.getBoolean("map_3d", false);
+        LiveMapView.tiltAngle = prefs.getInt("map_angle", 45);
         // 2.18: ocultar el reproductor (el mapa gana espacio), la velocidad y el servicio (carros sin GPS) y el aceite
         showPlayer = prefs.getBoolean("show_player", true);
         carSpeed = prefs.getBoolean("car_speed", true);
@@ -2731,12 +2792,214 @@ public class Main extends Activity {
             .show();
     }
 
+    private boolean useMapLibre() {
+        if (prefs == null) return false;
+        if ("osm".equals(prefs.getString("map_engine", "maplibre"))) return false;
+        if (mapLibreFallback) return false;
+        if (LiveMapView.fileMap != null && !Nav.hasNetwork(this)) return false;
+        return true;
+    }
+
+    private void toggleMapEngineFromMap() {
+        boolean curMl = mlMap != null;
+        String next = curMl ? "osm" : "maplibre";
+        prefs.edit().putString("map_engine", next).apply();
+        mapLibreFallback = false;
+        if ("osm".equals(next)) {
+            toast("Motor: OpenStreetMap");
+        } else if (LiveMapView.fileMap != null && !Nav.hasNetwork(this)) {
+            toast("MapLibre seleccionado (sin internet: usando OSM)");
+        } else {
+            toast("Motor: MapLibre");
+        }
+        rebuild();
+    }
+
+    private boolean mapHasFix() {
+        return mlMap != null ? mlMap.hasFix() : (liveMap != null && liveMap.hasFix());
+    }
+
+    private boolean mapIsFollowing() {
+        return mlMap != null ? mlMap.isFollowing() : (liveMap == null || liveMap.isFollowing());
+    }
+
+    private boolean mapIsOverview() {
+        return mlMap != null ? mlMap.isOverview() : (liveMap != null && liveMap.isOverview());
+    }
+
+    private double mapCenterLat() {
+        if (!Double.isNaN(wLat)) return wLat;
+        if (mlMap != null) return mlMap.getCenterLat();
+        if (liveMap != null) return liveMap.getCenterLat();
+        return 4.7110;
+    }
+
+    private double mapCenterLon() {
+        if (!Double.isNaN(wLon)) return wLon;
+        if (mlMap != null) return mlMap.getCenterLon();
+        if (liveMap != null) return liveMap.getCenterLon();
+        return -74.0721;
+    }
+
+    private void mapSyncTilt() {
+        if (mlMap != null) mlMap.onTiltConfigChanged();
+        if (liveMap != null) liveMap.onTiltConfigChanged();
+        updateMapControls();
+    }
+
+    private void mapSyncHeading() {
+        if (mlMap != null) mlMap.setHeadingUp(LiveMapView.headingUp);
+        if (liveMap != null) liveMap.invalidate();
+    }
+
+    private void mapSyncRoute() {
+        if (mlMap != null) mlMap.syncRoute();
+        if (liveMap != null) liveMap.invalidate();
+    }
+
+    private void mapSyncPolice() {
+        if (mlMap != null) mlMap.syncPoliceReports();
+        if (liveMap != null) liveMap.invalidate();
+    }
+
+    private void reportPoliceHere() {
+        double lat, lon;
+        if (previewPlace != null && !Double.isNaN(previewPlace.lat) && !Double.isNaN(previewPlace.lon)) {
+            lat = previewPlace.lat;
+            lon = previewPlace.lon;
+        } else if (mlMap != null && !mapIsFollowing()) {
+            lat = mlMap.getCenterLat();
+            lon = mlMap.getCenterLon();
+        } else if (liveMap != null && !mapIsFollowing()) {
+            lat = liveMap.getCenterLat();
+            lon = liveMap.getCenterLon();
+        } else {
+            lat = mapCenterLat();
+            lon = mapCenterLon();
+        }
+        reportPoliceAt(lat, lon, "");
+    }
+
+    private void reportPoliceAt(double lat, double lon, String label) {
+        if (Double.isNaN(lat) || Double.isNaN(lon)) return;
+        Nav.reportPolice(this, lat, lon, label);
+        mapSyncPolice();
+        updateNavHud();
+        toast("Policía reportada en el mapa");
+    }
+
+    private void openPoliceAlertDialog(final Nav.PoliceReport pr, double distM) {
+        if (pr == null) return;
+        mapFocusPoint(pr.lat, pr.lon, 17);
+        long ageMin = Math.max(0L, (System.currentTimeMillis() - pr.reportedAtMs) / 60000L);
+        String ageTxt = ageMin < 1 ? I18n.t("Hace un momento") : I18n.t("Reportado hace {} min").replace("{}", String.valueOf(ageMin));
+        StringBuilder sb = new StringBuilder();
+        if (pr.label != null && pr.label.length() > 0) sb.append(pr.label).append('\n');
+        sb.append(Nav.fmtStepDist(distM, useMph())).append(" · ").append(ageTxt);
+        new TB(this, dlg())
+            .setTitle("Alerta de policía")
+            .setMessage(sb.toString())
+            .setPositiveButton("Sigue ahí", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    Nav.confirmPolice(Main.this, pr);
+                    mapSyncPolice();
+                    toast("Alerta confirmada");
+                }
+            })
+            .setNeutralButton("Ya no está", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    Nav.clearPolice(Main.this, pr);
+                    mapSyncPolice();
+                    updateNavHud();
+                    toast("Alerta eliminada");
+                }
+            })
+            .setNegativeButton("Cerrar", null)
+            .show();
+    }
+
+    private void mapRecenter() {
+        if (mlMap != null) mlMap.recenter();
+        if (liveMap != null) liveMap.recenter();
+        updateMapControls();
+    }
+
+    private void mapSetOverview(boolean ov) {
+        if (mlMap != null) mlMap.setOverview(ov);
+        if (liveMap != null) liveMap.setOverview(ov);
+        updateMapControls();
+    }
+
+    private void mapFocusPoint(double la, double lo, int z) {
+        if (mlMap != null) mlMap.focusPoint(la, lo, z);
+        if (liveMap != null) liveMap.focusPoint(la, lo, z);
+        updateMapControls();
+    }
+
+    private void mapZoomBy(int d) {
+        if (mlMap != null) mlMap.zoomBy(d);
+        if (liveMap != null) liveMap.zoomBy(d);
+    }
+
+    private void onMapPicked(final double lat, final double lon) {
+        if (isFinishing() || Double.isNaN(lat) || Double.isNaN(lon)) return;
+        Nav.Place loading = new Nav.Place();
+        loading.lat = lat;
+        loading.lon = lon;
+        loading.name = String.format(java.util.Locale.US, "%.5f, %.5f", lat, lon);
+        loading.sub = I18n.t("Buscando dirección…");
+        showMapPlacePreview(loading);
+        Nav.reverseGeocode(this, lat, lon, new Nav.SearchCb() {
+            public void onResult(java.util.List<Nav.Place> places, String error) {
+                if (isFinishing() || previewPlace == null) return;
+                if (Math.abs(previewPlace.lat - lat) > 1e-5 || Math.abs(previewPlace.lon - lon) > 1e-5) return;
+                if (places != null && !places.isEmpty()) showMapPlacePreview(places.get(0));
+            }
+        });
+    }
+
+    private void startNavSimulation() {
+        if (Nav.active == null) return;
+        Nav.previewMode = false;
+        LiveMapView.headingUp = true;
+        mapSyncHeading();
+        mapRecenter();
+        Nav.startSimulation(this, useMph(), new Nav.SimListener() {
+            public void onSimLocation(Location loc) {
+                if (isFinishing()) return;
+                feedMap(loc);
+                updateNavHud();
+            }
+            public void onSimEnded() {
+                if (isFinishing()) return;
+                simLastOk = false;
+                LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+                mapSyncHeading();
+                if (Nav.active == null) toast("Llegaste a tu destino");
+                mapSyncRoute();
+                showSpeed();
+                updateNavHud();
+            }
+        });
+        updateNavHud();
+        updateMapControls();
+        toast("Simulación de ruta iniciada");
+    }
+
     private void buildAaCard() {
+        if (waveAlertView != null) { waveAlertView.setAlert(false, 0, false); waveAlertView = null; }
+        waveAlertPolice = null;
+        if (mlMap != null) { mlMap.destroy(); mlMap = null; }
         if (!showMap) {
             liveMap = null; navHud = null; navTurnIc = null; navDistTv = null; navStepTv = null;
-            navEtaTv = null; navLaneBox = null; navLaneView = null; speedSignTv = null; camBadgeTv = null;
+            navEtaTv = null; navLaneBox = null; navLaneView = null;
+            speedHudBox = null; speedSignTv = null; navCurSpeedTv = null; navCurUnitTv = null; camBadgeTv = null;
             mapTagBox = null; mapTagTv = null; navSearchBtn = null; aaBtnTv = null; aaSubTv = null;
             cpSubTv = null; mapGauge = null; mapGaugeBox = null; panelWx = null;
+            mapPreviewCard = null; mapCtrlBox = null; mapRecenterBtn = null; mapOverviewBtn = null;
+            mapStepsBtn = null; mapTiltQuickBtn = null; mapSimBtn = null; mapPoliceBtn = null;
+            mapEngineBtn = null; mapEngineTv = null;
+            mapConnPanel = null; mapConnHandle = null; mapConnNavBtn = null; mapConnGauge = null;
             seedLastLocation();
             return;
         }
@@ -2753,27 +3016,63 @@ public class Main extends Activity {
         mapCardView = card;
         // fondo decorativo mientras no hay GPS; encima, el mapa en vivo (Faro: sin dibujo de relleno, el área queda limpia)
         if (!(premium && Prem.faro())) card.addView(new MapView(this, s, 20 * s), new FrameLayout.LayoutParams(-1, -1));
-        if (!prefs.getBoolean("map_live", true)) { liveMap = null; seedLastLocation(); buildAaCardRest(card); return; }
-        liveMap = new LiveMapView(this, s, 20 * s);
-        card.addView(liveMap, new FrameLayout.LayoutParams(-1, -1));
-        // Aurora: esquinas redondas de verdad sobre el fondo y el mapa un poco translúcido
-        if (premium && premBg != null) liveMap.setBackdrop(premBg, premBgHolder, Prem.mapAlpha(LIGHT));
-        if (premium && Prem.faro()) { liveMap.setAttribution(14 * s, 70 * s); liveMap.setTone(Faro.mapTone(LIGHT)); }
-        // Cobalto: el mapa se difumina hasta donde empieza el reproductor (abajo, hacia las tarjetas, en vertical)
-        if (premium && Prem.cob() && !mapOnly && premBg != null) liveMap.setFade(vertical ? 2 : 1, (vertical ? 150 : Math.max(260, mapW * 0.5f)) * s);
-        liveMap.setVisibility(premium && Prem.faro() ? View.VISIBLE : View.INVISIBLE);
-        liveMap.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { liveMap.cycleZoom(); }
-        });
-        liveMap.setOnLongClickListener(new View.OnLongClickListener() {
-            public boolean onLongClick(View v) {
-                showMapDiag();
-                return true;
-            }
-        });
+        if (!prefs.getBoolean("map_live", true)) { liveMap = null; mlMap = null; seedLastLocation(); buildAaCardRest(card); return; }
+
+        Location sv = savedLoc();
+        double initLat = !Double.isNaN(wLat) ? wLat : (sv != null ? sv.getLatitude() : 4.7110);
+        double initLon = !Double.isNaN(wLon) ? wLon : (sv != null ? sv.getLongitude() : -74.0721);
+
+        if (useMapLibre()) {
+            liveMap = null;
+            mlMap = new MapLibreMapView(this, 20 * s, LIGHT, RED);
+            mlMap.setInitialCenter(initLat, initLon);
+            mlMap.setHeadingUp(LiveMapView.headingUp);
+            mlMap.onTiltConfigChanged();
+            if (premium && Prem.faro()) mlMap.setAlpha(0.88f);
+            mlMap.setListener(new MapLibreMapView.Listener() {
+                public void onEngineFallback(String reason) {
+                    if (isFinishing()) return;
+                    mapLibreFallback = true;
+                    toast(I18n.t("Modo clásico de mapa activado"));
+                    rebuild();
+                }
+                public void onFollowChanged(boolean following) {
+                    updateMapControls();
+                }
+                public void onMapPick(double lat, double lon) {
+                    onMapPicked(lat, lon);
+                }
+            });
+            card.addView(mlMap, new FrameLayout.LayoutParams(-1, -1));
+        } else {
+            mlMap = null;
+            liveMap = new LiveMapView(this, s, 20 * s);
+            liveMap.setInitialCenter(initLat, initLon);
+            card.addView(liveMap, new FrameLayout.LayoutParams(-1, -1));
+            // Aurora: esquinas redondas de verdad sobre el fondo y el mapa un poco translúcido
+            if (premium && premBg != null) liveMap.setBackdrop(premBg, premBgHolder, Prem.mapAlpha(LIGHT));
+            if (premium && Prem.faro()) { liveMap.setAttribution(14 * s, 70 * s); liveMap.setTone(Faro.mapTone(LIGHT)); }
+            // Cobalto: el mapa se difumina hasta donde empieza el reproductor (abajo, hacia las tarjetas, en vertical)
+            if (premium && Prem.cob() && !mapOnly && premBg != null) liveMap.setFade(vertical ? 2 : 1, (vertical ? 150 : Math.max(260, mapW * 0.5f)) * s);
+            liveMap.setVisibility(View.VISIBLE);
+            liveMap.setListener(new LiveMapView.Listener() {
+                public void onFollowChanged(boolean following) {
+                    updateMapControls();
+                }
+                public void onMapPick(double lat, double lon) {
+                    onMapPicked(lat, lon);
+                }
+            });
+        }
+        Nav.loadPoliceReports(this);
         seedLastLocation();
+        mapSyncPolice();
+
+        waveAlertView = new WaveAlertView(this, s, 20 * s);
+        card.addView(waveAlertView, new FrameLayout.LayoutParams(-1, -1));
 
         buildAaCardRest(card);
+        if (previewPlace != null) showMapPlacePreview(previewPlace);
     }
 
     private void buildAaCardRest(FrameLayout card) {
@@ -2782,39 +3081,56 @@ public class Main extends Activity {
         else {
         LinearLayout topRow = new LinearLayout(this);
         topRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout tag = new LinearLayout(this);
-        tag.setGravity(Gravity.CENTER_VERTICAL);
-        tag.setBackground(round((CARD & 0x00FFFFFF) | 0xE0000000, 12));
-        tag.setPadding((int) (12 * s), (int) (7 * s), (int) (12 * s), (int) (7 * s));
-        tag.addView(icon("my_location", 16), new LinearLayout.LayoutParams((int) (16 * s), (int) (16 * s)));
-        mapTagTv = tv("Buscando GPS…", 13, TEXT, true);
-        mapTagTv.setPadding((int) (8 * s), 0, 0, 0);
-        tag.addView(mapTagTv);
-        topRow.addView(tag);
-        tag.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { fixGps(); }
-        });
 
         LinearLayout goBtn = new LinearLayout(this);
         goBtn.setGravity(Gravity.CENTER_VERTICAL);
-        goBtn.setBackground(round((CARD & 0x00FFFFFF) | 0xE0000000, 12));
-        goBtn.setPadding((int) (10 * s), (int) (7 * s), (int) (12 * s), (int) (7 * s));
-        ImageView goIc = icon("navigation", 16);
-        goIc.setColorFilter(RED);
+        goBtn.setClickable(true);
+        goBtn.setFocusable(false);
+        goBtn.setMinimumHeight((int) (42 * s));
+        GradientDrawable gdSearch = round((CARD & 0x00FFFFFF) | 0xEA000000, 14);
+        if (LIGHT) gdSearch.setStroke(Math.max(1, (int) s), 0x18000000);
+        goBtn.setBackground(gdSearch);
+        goBtn.setPadding((int) (14 * s), (int) (9 * s), (int) (15 * s), (int) (9 * s));
+        Faro.Icon goIc = new Faro.Icon(this, Faro.I_SEARCH, RED);
+        goIc.setClickable(false);
+        goIc.setFocusable(false);
         goBtn.addView(goIc, new LinearLayout.LayoutParams((int) (16 * s), (int) (16 * s)));
-        TextView goTv = tv("Ir a…", 13, TEXT, true);
-        goTv.setPadding((int) (6 * s), 0, 0, 0);
+        TextView goTv = tv("Buscar lugar…", 13, TEXT, true);
+        goTv.setClickable(false);
+        goTv.setFocusable(false);
+        goTv.setPadding((int) (7 * s), 0, 0, 0);
         goBtn.addView(goTv);
         LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-2, -2);
-        glp.leftMargin = (int) (8 * s);
         topRow.addView(goBtn, glp);
         goBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { openNavSearch(); }
         });
-        if (!prefs.getBoolean("map_live", true) || !"internal".equals(prefs.getString("nav_app", null))) goBtn.setVisibility(View.GONE);
         navSearchBtn = goBtn;
+
+        LinearLayout tag = new LinearLayout(this);
+        tag.setGravity(Gravity.CENTER_VERTICAL);
+        tag.setBackground(round((CARD & 0x00FFFFFF) | 0xE0000000, 12));
+        tag.setPadding((int) (10 * s), (int) (7 * s), (int) (10 * s), (int) (7 * s));
+        tag.addView(icon("my_location", 15), new LinearLayout.LayoutParams((int) (15 * s), (int) (15 * s)));
+        mapTagTv = tv("Buscando GPS…", 12, MUTED, true);
+        mapTagTv.setPadding((int) (6 * s), 0, 0, 0);
+        mapTagTv.setMaxWidth((int) (Math.max(90, mapW - 190) * s));
+        tag.addView(mapTagTv);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(-2, -2);
+        tlp.leftMargin = (int) (8 * s);
+        topRow.addView(tag, tlp);
+        tag.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (previewPlace != null) clearMapPlacePreview(true);
+                else fixGps();
+            }
+        });
+        tag.setOnLongClickListener(new View.OnLongClickListener() {
+            public boolean onLongClick(View v) { showMapDiag(); return true; }
+        });
+
         mapTagBox = topRow;
-        placeWrap(card, topRow, 16, 16);
+        placeWrap(card, topRow, 14, 14);
         }
 
         LinearLayout hud = new LinearLayout(this);
@@ -2934,19 +3250,54 @@ public class Main extends Activity {
         float laneW = Math.min(184, Math.max(110, mapW - 140));
         place(card, laneBox, (mapW - laneW) * 0.5f, 92, laneW, 30);
 
-        speedSignTv = tv("", 15, 0xFF181A1F, true);
+        LinearLayout shb = new LinearLayout(this);
+        shb.setOrientation(LinearLayout.HORIZONTAL);
+        shb.setGravity(Gravity.CENTER_VERTICAL);
+        shb.setPadding((int) (7 * s), (int) (6 * s), (int) (12 * s), (int) (6 * s));
+        speedSignTv = tv("—", 14, 0xFF181A1F, true);
         speedSignTv.setGravity(Gravity.CENTER);
-        speedSignTv.setVisibility(View.GONE);
-        float sdx = gaugeTopLeft ? mapW - 58 : 12;
-        place(card, speedSignTv, sdx, 92, 46, 46);
-        if (faroT) speedSignTv = null;   // Faro: el límite va en el velocímetro
+        shb.addView(speedSignTv, new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s)));
+        LinearLayout spCol = new LinearLayout(this);
+        spCol.setOrientation(LinearLayout.VERTICAL);
+        spCol.setGravity(Gravity.CENTER_VERTICAL);
+        spCol.setPadding((int) (9 * s), 0, 0, 0);
+        navCurSpeedTv = tv("--", 21, TEXT, true);
+        navCurSpeedTv.setSingleLine(true);
+        navCurSpeedTv.setMinWidth((int) (34 * s));
+        navCurSpeedTv.setGravity(Gravity.CENTER_HORIZONTAL);
+        spCol.addView(navCurSpeedTv, new LinearLayout.LayoutParams(-2, -2));
+        navCurUnitTv = tv(useMph() ? "MPH" : "KM/H", 9, MUTED, true);
+        navCurUnitTv.setSingleLine(true);
+        navCurUnitTv.setGravity(Gravity.CENTER_HORIZONTAL);
+        spCol.addView(navCurUnitTv, new LinearLayout.LayoutParams(-2, -2));
+        shb.addView(spCol, new LinearLayout.LayoutParams(-2, -2));
+        shb.setVisibility(View.GONE);
+        shb.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { openNavMenu(); }
+        });
+        speedHudBox = shb;
+        float sdx = gaugeTopLeft ? Math.max(12, mapW - 12 - 40 - insR - 122) : 12;
+        placeWrap(card, shb, sdx, 92);
 
         camBadgeTv = tv("", 11, Color.WHITE, true);
-        camBadgeTv.setBackground(round(0xFFD92B2B, 10));
-        camBadgeTv.setPadding((int) (8 * s), (int) (3 * s), (int) (8 * s), (int) (3 * s));
+        camBadgeTv.setBackground(round(0xFFD92B2B, 11));
+        camBadgeTv.setPadding((int) (10 * s), (int) (4 * s), (int) (10 * s), (int) (4 * s));
+        camBadgeTv.setSingleLine(true);
+        camBadgeTv.setEllipsize(TextUtils.TruncateAt.END);
+        camBadgeTv.setMaxWidth((int) (Math.max(120, mapW - 84) * s));
         camBadgeTv.setVisibility(View.GONE);
-        placeWrap(card, camBadgeTv, gaugeTopLeft ? Math.max(12, mapW - 108) : 12, 144);
+        camBadgeTv.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (waveAlertPolice != null) {
+                    openPoliceAlertDialog(waveAlertPolice, Nav.nearbyPoliceDistM);
+                } else if (!Double.isNaN(waveAlertLat) && !Double.isNaN(waveAlertLon)) {
+                    mapFocusPoint(waveAlertLat, waveAlertLon, 17);
+                }
+            }
+        });
+        placeWrap(card, camBadgeTv, gaugeTopLeft ? Math.max(12, mapW - 12 - 40 - insR - 148) : 12, 152);
 
+        buildMapControls(card, faroT);
         updateNavHud();
         navBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { openNavApp(); }
@@ -2988,6 +3339,12 @@ public class Main extends Activity {
         clp.gravity = Gravity.CENTER;
         handle.addView(chev, clp);
         place(card, handle, 12 + insL + (panelW - 64) / 2, panelY - 28, 64, 24);
+        mapConnPanel = panel;
+        mapConnHandle = handle;
+        mapConnNavBtn = navBtn;
+        mapConnGauge = mapGaugeBox;
+        mapConnHasPanel = hasPanel;
+        mapConnNavBtnVisible = nbSize != 3 && !faroT;
         final float shift = 96 * s;
         final View[] moving = mapGaugeBox != null ? new View[]{panel, navBtn, handle, mapGaugeBox} : new View[]{panel, navBtn, handle};
         if (!hasPanel) handle.setVisibility(View.GONE);
@@ -3049,6 +3406,19 @@ public class Main extends Activity {
             cp.setOnLongClickListener(new View.OnLongClickListener() {
                 public boolean onLongClick(View v) { pickFor("carplay", "CarPlay"); return true; }
             });
+        }
+        if (mapCtrlBox != null) {
+            mapCtrlBox.bringToFront();
+            if (SDK >= 21) mapCtrlBox.setElevation(8f * s);
+        }
+        if (mapTagBox != null) {
+            mapTagBox.bringToFront();
+            if (SDK >= 21) mapTagBox.setElevation(8f * s);
+        }
+        if (navSearchBtn != null && SDK >= 21) navSearchBtn.setElevation(8f * s);
+        if (navHud != null) {
+            navHud.bringToFront();
+            if (SDK >= 21) navHud.setElevation(8f * s);
         }
         updateMapTag();
     }
@@ -3270,7 +3640,10 @@ public class Main extends Activity {
         Location sv = savedLoc();
         if (sv == null) return;
         if (Double.isNaN(wLat) || Double.isNaN(wLon)) { wLat = sv.getLatitude(); wLon = sv.getLongitude(); }
-        if (liveMap != null && !liveMap.hasFix()) {
+        if (mlMap != null && !mlMap.hasFix()) {
+            mlMap.setInitialCenter(sv.getLatitude(), sv.getLongitude());
+            updateMapTag();
+        } else if (liveMap != null && !liveMap.hasFix()) {
             liveMap.setPosition(sv.getLatitude(), sv.getLongitude(), Float.NaN, 0);
             liveMap.setVisibility(View.VISIBLE);
             updateMapTag();
@@ -3308,27 +3681,53 @@ public class Main extends Activity {
 
     private void feedMap(Location l) {
         if (l != null && !validLoc(l)) return;
+        boolean isSim = l != null && "sim".equals(l.getProvider());
+        if (Nav.simulating && l != null && !isSim) {
+            if (l.hasSpeed() && l.getSpeed() > 3.0f) Nav.stopSimulation();
+            else return;
+        }
         if (l != null) {
             wLat = l.getLatitude(); wLon = l.getLongitude();
-            if (Nav.active != null) {
-                Nav.onLocation(this, l, useMph(), new Runnable() {
-                    public void run() {
-                        if (Nav.active == null) {
-                            LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
-                            toast("Llegaste a tu destino");
+            if (!isSim) {
+                Nav.previewMode = false;
+                if (Nav.active != null) {
+                    Nav.onLocation(this, l, useMph(), new Runnable() {
+                        public void run() {
+                            if (Nav.active == null) {
+                                LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+                                mapSyncHeading();
+                                toast("Llegaste a tu destino");
+                            }
+                            mapSyncRoute();
+                            updateNavHud();
                         }
-                        updateNavHud();
-                        if (liveMap != null) liveMap.invalidate();
-                    }
-                });
-                updateNavHud();
+                    });
+                    updateNavHud();
+                } else {
+                    Nav.onFreeLocation(this, l);
+                    updateWaveAlerts(useMph());
+                }
             }
         }
-        if (liveMap == null || l == null) return;
+        if (l == null) return;
         float kmh = l.hasSpeed() ? l.getSpeed() * 3.6f : 0;
-        liveMap.setPosition(l.getLatitude(), l.getLongitude(), l.hasBearing() && kmh > 4 ? l.getBearing() : Float.NaN, kmh);
-        liveMap.setVisibility(View.VISIBLE);
+        if (isSim) {
+            simLastOk = true;
+            simLastKmh = kmh;
+            showSpeed();
+        } else if (!Nav.simulating) {
+            simLastOk = false;
+        }
+        float br = l.hasBearing() && (isSim || kmh > 4) ? l.getBearing() : Float.NaN;
+        if (mlMap != null) {
+            mlMap.setPosition(l.getLatitude(), l.getLongitude(), br, kmh);
+        }
+        if (liveMap != null) {
+            liveMap.setPosition(l.getLatitude(), l.getLongitude(), br, kmh);
+            liveMap.setVisibility(View.VISIBLE);
+        }
         updateMapTag();
+        updateMapControls();
     }
 
     /** km/h o mph: lo elegido, o mph en EE. UU., Reino Unido, Liberia y Birmania. */
@@ -3394,7 +3793,9 @@ public class Main extends Activity {
             + " · ubicación por red: " + (netOn ? "encendida" : "apagada")
             + "\nÚltima señal: " + (ago < 0 ? "ninguna desde que abrió StradaOS" : ago < 120 ? "hace " + ago + " s" : "hace " + (ago / 60) + " min")
             + (gpsStartAt > 0 ? "\nBuscando desde hace " + ((SystemClock.elapsedRealtime() - gpsStartAt) / 60000) + " min" : "");
-        return I18n.lines(head + "\n\n" + (liveMap != null ? liveMap.diag() : "Mapa en vivo apagado"));
+        String off = LiveMapView.fileMap != null ? (" · .map=" + LiveMapView.fileMap.file.getName()) : "";
+        String eng = mlMap != null ? "Motor: MapLibre GL JS (3D=" + LiveMapView.view3d + ")" + off : (liveMap != null ? liveMap.diag() : "Mapa en vivo apagado" + off);
+        return I18n.lines(head + "\n\n" + eng);
     }
 
     private void showMapDiag() {
@@ -3408,12 +3809,356 @@ public class Main extends Activity {
         if (!prefs.getBoolean("map_live", true)) mapTagTv.setText(I18n.t("Mapa en vivo apagado"));
         else if (!live && st == 1) mapTagTv.setText(I18n.t("Sin permiso de ubicación · toca aquí"));
         else if (!live && st == 2) mapTagTv.setText(I18n.t("Ubicación apagada · toca aquí"));
-        else if (liveMap == null || !liveMap.hasFix())
+        else if (!mapHasFix())
             mapTagTv.setText(I18n.t(gpsStartAt > 0 && SystemClock.elapsedRealtime() - gpsStartAt > 180000 ? "Sin señal GPS · toca aquí" : "Buscando GPS…"));
-        else if (liveMap.usingFile()) mapTagTv.setText(I18n.t(live ? "Mapa sin conexión" : "Sin señal GPS · mapa sin conexión"));
-        else if (liveMap.offline()) mapTagTv.setText(I18n.t(live ? "En vivo · sin internet" : "Sin señal GPS ni internet"));
-        else mapTagTv.setText(I18n.t(live ? "Mapa en vivo" : "Sin señal GPS · última posición"));
+        else if (liveMap != null && liveMap.usingFile()) mapTagTv.setText(I18n.t(live ? "Mapa sin conexión" : "Sin señal GPS · mapa sin conexión"));
+        else if (liveMap != null && liveMap.offline()) mapTagTv.setText(I18n.t(live ? "En vivo · sin internet" : "Sin señal GPS ni internet"));
+        else mapTagTv.setText(I18n.t(live ? (LiveMapView.view3d ? "Mapa 3D" : "Mapa en vivo") : "Sin señal GPS · última posición"));
         updateFaroPill();
+    }
+
+    private void buildMapControls(FrameLayout card, boolean faroT) {
+        if (!prefs.getBoolean("map_live", true)) return;
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        int bgCol = faroT ? Faro.glass(LIGHT) : (CARD & 0x00FFFFFF) | 0xEB000000;
+
+        FrameLayout recBtn = new FrameLayout(this);
+        GradientDrawable recGd = round(bgCol, 12);
+        if (LIGHT) recGd.setStroke(Math.max(1, (int) s), 0x18000000);
+        recBtn.setBackground(recGd);
+        ImageView recIc = icon("my_location", 18);
+        recIc.setColorFilter(RED);
+        FrameLayout.LayoutParams rlp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        rlp.gravity = Gravity.CENTER;
+        recBtn.addView(recIc, rlp);
+        recBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { mapRecenter(); }
+        });
+        LinearLayout.LayoutParams lpRec = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
+        lpRec.bottomMargin = (int) (6 * s);
+        col.addView(recBtn, lpRec);
+        mapRecenterBtn = recBtn;
+
+        FrameLayout ovBtn = new FrameLayout(this);
+        ovBtn.setBackground(round(bgCol, 12));
+        ImageView ovIc = icon("map", 18);
+        ovIc.setColorFilter(TEXT);
+        ovBtn.setTag(ovIc);
+        FrameLayout.LayoutParams olp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        olp.gravity = Gravity.CENTER;
+        ovBtn.addView(ovIc, olp);
+        ovBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { mapSetOverview(!mapIsOverview()); }
+        });
+        LinearLayout.LayoutParams lpOv = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
+        lpOv.bottomMargin = (int) (6 * s);
+        col.addView(ovBtn, lpOv);
+        mapOverviewBtn = ovBtn;
+
+        FrameLayout stBtn = new FrameLayout(this);
+        GradientDrawable stGd = round(bgCol, 12);
+        if (LIGHT) stGd.setStroke(Math.max(1, (int) s), 0x18000000);
+        stBtn.setBackground(stGd);
+        ImageView stIc = icon("dehaze", 18);
+        stIc.setColorFilter(TEXT);
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        slp.gravity = Gravity.CENTER;
+        stBtn.addView(stIc, slp);
+        stBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { openStepsSheet(); }
+        });
+        LinearLayout.LayoutParams lpSt = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
+        lpSt.bottomMargin = (int) (6 * s);
+        col.addView(stBtn, lpSt);
+        mapStepsBtn = stBtn;
+
+        FrameLayout engBtn = new FrameLayout(this);
+        engBtn.setBackground(round(bgCol, 12));
+        engBtn.setContentDescription(I18n.t("Cambiar motor del mapa"));
+        TextView engTv = tv(mlMap != null ? "ML" : "OSM", 11, mlMap != null ? Color.WHITE : TEXT, true);
+        engTv.setGravity(Gravity.CENTER);
+        engBtn.addView(engTv, new FrameLayout.LayoutParams(-1, -1));
+        engBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { toggleMapEngineFromMap(); }
+        });
+        LinearLayout.LayoutParams lpEng = new LinearLayout.LayoutParams((int) (40 * s), (int) (32 * s));
+        lpEng.bottomMargin = (int) (6 * s);
+        col.addView(engBtn, lpEng);
+        mapEngineBtn = engBtn;
+        mapEngineTv = engTv;
+
+        FrameLayout tiltBtn = new FrameLayout(this);
+        tiltBtn.setBackground(round(bgCol, 12));
+        TextView tiltTv = tv(LiveMapView.view3d ? "3D" : "2D", 12, LiveMapView.view3d ? Color.WHITE : TEXT, true);
+        tiltTv.setGravity(Gravity.CENTER);
+        tiltBtn.addView(tiltTv, new FrameLayout.LayoutParams(-1, -1));
+        tiltBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean next = !prefs.getBoolean("map_3d", false);
+                prefs.edit().putBoolean("map_3d", next).apply();
+                LiveMapView.view3d = next;
+                mapSyncTilt();
+                updateMapTag();
+            }
+        });
+        LinearLayout.LayoutParams lpTilt = new LinearLayout.LayoutParams((int) (40 * s), (int) (32 * s));
+        lpTilt.bottomMargin = (int) (6 * s);
+        col.addView(tiltBtn, lpTilt);
+        mapTiltQuickBtn = tiltBtn;
+        mapTiltQuickTv = tiltTv;
+
+        FrameLayout simBtn = new FrameLayout(this);
+        simBtn.setBackground(round(bgCol, 12));
+        ImageView simIc = icon("play_arrow", 19);
+        simIc.setColorFilter(TEXT);
+        FrameLayout.LayoutParams silp = new FrameLayout.LayoutParams((int) (19 * s), (int) (19 * s));
+        silp.gravity = Gravity.CENTER;
+        simBtn.addView(simIc, silp);
+        simBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (Nav.active == null) return;
+                if (!Nav.simulating) startNavSimulation();
+                else {
+                    Nav.toggleSimPause();
+                    updateMapControls();
+                    updateNavHud();
+                    toast(Nav.simPaused ? "Simulación en pausa" : "Simulación en curso");
+                }
+            }
+        });
+        simBtn.setOnLongClickListener(new View.OnLongClickListener() {
+            public boolean onLongClick(View v) {
+                if (Nav.simulating) {
+                    Nav.stopSimulation();
+                    updateMapControls();
+                    updateNavHud();
+                    toast("Simulación detenida");
+                    return true;
+                }
+                return false;
+            }
+        });
+        LinearLayout.LayoutParams lpSim = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
+        lpSim.bottomMargin = (int) (6 * s);
+        col.addView(simBtn, lpSim);
+        mapSimBtn = simBtn;
+        mapSimIc = simIc;
+
+        FrameLayout polBtn = new FrameLayout(this);
+        GradientDrawable polGd = round(bgCol, 12);
+        if (LIGHT) polGd.setStroke(Math.max(1, (int) s), 0x18000000);
+        polBtn.setBackground(polGd);
+        polBtn.setContentDescription(I18n.t("Reportar policía"));
+        ImageView polIc = icon("verified_user", 18);
+        polIc.setColorFilter(0xFF2563EB);
+        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        plp.gravity = Gravity.CENTER;
+        polBtn.addView(polIc, plp);
+        polBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { reportPoliceHere(); }
+        });
+        LinearLayout.LayoutParams lpPol = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
+        lpPol.bottomMargin = (int) (6 * s);
+        col.addView(polBtn, lpPol);
+        mapPoliceBtn = polBtn;
+
+        if (!faroT && mapH >= 240) {
+            LinearLayout zBox = new LinearLayout(this);
+            zBox.setOrientation(LinearLayout.VERTICAL);
+            GradientDrawable zd = round(bgCol, 12);
+            if (LIGHT) zd.setStroke(Math.max(1, (int) s), 0x18000000);
+            zBox.setBackground(zd);
+            TextView zp = tv("+", 17, TEXT, true);
+            zp.setGravity(Gravity.CENTER);
+            zp.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { mapZoomBy(1); } });
+            zBox.addView(zp, new LinearLayout.LayoutParams((int) (40 * s), (int) (34 * s)));
+            View div = new View(this);
+            div.setBackgroundColor(LIGHT ? 0x18000000 : 0x22FFFFFF);
+            zBox.addView(div, new LinearLayout.LayoutParams(-1, Math.max(1, (int) s)));
+            TextView zm = tv("−", 17, TEXT, true);
+            zm.setGravity(Gravity.CENTER);
+            zm.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { mapZoomBy(-1); } });
+            zBox.addView(zm, new LinearLayout.LayoutParams((int) (40 * s), (int) (34 * s)));
+            col.addView(zBox, new LinearLayout.LayoutParams((int) (40 * s), (int) (69 * s)));
+        }
+
+        mapCtrlBox = col;
+        float topY = (faroT && Nav.active == null && mapH >= 220) ? 152 : 92;
+        placeWrap(card, col, mapW - 12 - 40 - insR, topY);
+        updateMapControls();
+    }
+
+    private void updateMapControls() {
+        if (mapCtrlBox == null) return;
+        boolean hasRoute = Nav.active != null;
+        boolean hideForPreview = previewPlace != null;
+        mapCtrlBox.setVisibility(hideForPreview ? View.GONE : View.VISIBLE);
+        if (hideForPreview) return;
+
+        if (mapRecenterBtn != null) {
+            mapRecenterBtn.setVisibility((!mapIsFollowing() || mapIsOverview()) ? View.VISIBLE : View.GONE);
+        }
+        if (mapOverviewBtn != null) {
+            mapOverviewBtn.setVisibility(hasRoute ? View.VISIBLE : View.GONE);
+            boolean ov = mapIsOverview();
+            GradientDrawable gd = round(ov ? RED : ((CARD & 0x00FFFFFF) | 0xEB000000), 12);
+            if (!ov && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
+            mapOverviewBtn.setBackground(gd);
+            if (mapOverviewBtn.getTag() instanceof ImageView) {
+                ((ImageView) mapOverviewBtn.getTag()).setColorFilter(ov ? Color.WHITE : TEXT);
+            }
+        }
+        if (mapStepsBtn != null) {
+            mapStepsBtn.setVisibility(hasRoute ? View.VISIBLE : View.GONE);
+        }
+        if (mapEngineBtn != null && mapEngineTv != null) {
+            boolean isMl = mlMap != null;
+            GradientDrawable gd = round(isMl ? RED : ((CARD & 0x00FFFFFF) | 0xEB000000), 12);
+            if (!isMl && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
+            mapEngineBtn.setBackground(gd);
+            mapEngineTv.setText(isMl ? "ML" : "OSM");
+            mapEngineTv.setTextColor(isMl ? Color.WHITE : TEXT);
+        }
+        if (mapTiltQuickBtn != null && mapTiltQuickTv != null) {
+            boolean is3d = LiveMapView.view3d;
+            GradientDrawable gd = round(is3d ? RED : ((CARD & 0x00FFFFFF) | 0xEB000000), 12);
+            if (!is3d && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
+            mapTiltQuickBtn.setBackground(gd);
+            mapTiltQuickTv.setText(is3d ? "3D" : "2D");
+            mapTiltQuickTv.setTextColor(is3d ? Color.WHITE : TEXT);
+        }
+        if (mapSimBtn != null && mapSimIc != null) {
+            mapSimBtn.setVisibility(hasRoute ? View.VISIBLE : View.GONE);
+            boolean activeSim = Nav.simulating && !Nav.simPaused;
+            GradientDrawable gd = round(Nav.simulating ? RED : ((CARD & 0x00FFFFFF) | 0xEB000000), 12);
+            if (!Nav.simulating && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
+            mapSimBtn.setBackground(gd);
+            try {
+                mapSimIc.setImageBitmap(asset("ic/" + (activeSim ? "pause" : "play_arrow") + ".png"));
+            } catch (Throwable ignored) { }
+            mapSimIc.setColorFilter(Nav.simulating ? Color.WHITE : TEXT);
+        }
+    }
+
+    private void closeStepsSheet() {
+        if (mapStepsOverlay == null) return;
+        if (root != null) root.removeView(mapStepsOverlay);
+        mapStepsOverlay = null;
+    }
+
+    private void openStepsSheet() {
+        final Nav.Route r = Nav.active;
+        if (r == null || r.steps.isEmpty() || root == null) return;
+        closeStepsSheet();
+        final boolean mph = useMph();
+
+        final FrameLayout scrim = new FrameLayout(this);
+        scrim.setBackgroundColor(0x99000000);
+        scrim.setClickable(true);
+        scrim.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { closeStepsSheet(); } });
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        sheet.setClickable(true);
+        GradientDrawable bg = round(CARD, 20);
+        if (LIGHT) bg.setStroke(Math.max(1, (int) s), 0x18000000);
+        sheet.setBackground(bg);
+        int pad = (int) (16 * s);
+        sheet.setPadding(pad, (int) (14 * s), pad, (int) (14 * s));
+
+        LinearLayout hdr = new LinearLayout(this);
+        hdr.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout titleCol = new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.VERTICAL);
+        TextView titleTv = tv(r.destName != null && r.destName.length() > 0 ? r.destName : I18n.t("Instrucciones paso a paso"), 16, TEXT, true);
+        titleCol.addView(titleTv);
+        TextView subHdr = tv(Nav.fmtEta(this, Nav.remDurS, Nav.remDistM, mph), 12, RED, true);
+        subHdr.setPadding(0, (int) (2 * s), 0, 0);
+        titleCol.addView(subHdr);
+        hdr.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        TextView ovPill = tv(I18n.t("Vista general"), 12, TEXT, true);
+        ovPill.setBackground(round(INNER, 10));
+        ovPill.setPadding((int) (10 * s), (int) (7 * s), (int) (10 * s), (int) (7 * s));
+        ovPill.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { closeStepsSheet(); mapSetOverview(true); }
+        });
+        LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(-2, -2);
+        olp.rightMargin = (int) (8 * s);
+        hdr.addView(ovPill, olp);
+
+        TextView cls = tv("✕", 14, TEXT, true);
+        cls.setGravity(Gravity.CENTER);
+        cls.setBackground(round(INNER, 16));
+        cls.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { closeStepsSheet(); } });
+        hdr.addView(cls, new LinearLayout.LayoutParams((int) (34 * s), (int) (34 * s)));
+        sheet.addView(hdr, new LinearLayout.LayoutParams(-1, -2));
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(0, (int) (10 * s), 0, 0);
+        sc.addView(body, new LinearLayout.LayoutParams(-1, -2));
+
+        for (int i = 0; i < r.steps.size(); i++) {
+            final Nav.Step st = r.steps.get(i);
+            final boolean isCur = i == Nav.curStepIdx;
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            GradientDrawable rgd = round(isCur ? RED_DARK : INNER, 12);
+            if (isCur) rgd.setStroke(Math.max(1, (int) (1.5f * s)), RED);
+            row.setBackground(rgd);
+            row.setPadding((int) (12 * s), (int) (10 * s), (int) (12 * s), (int) (10 * s));
+
+            FrameLayout icBox = new FrameLayout(this);
+            icBox.setBackground(round(isCur ? RED : BTN, 10));
+            Nav.ManeuverView mv = new Nav.ManeuverView(this);
+            mv.setIcon(st.icon);
+            icBox.addView(mv, new FrameLayout.LayoutParams(-1, -1));
+            LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams((int) (36 * s), (int) (36 * s));
+            icLp.rightMargin = (int) (10 * s);
+            row.addView(icBox, icLp);
+
+            LinearLayout col = new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            TextView inst = tv(st.instruction != null ? I18n.t(st.instruction) : "", 14, TEXT, isCur);
+            inst.setSingleLine(false);
+            col.addView(inst);
+            String stDist = st.distM > 1 ? Nav.fmtStepDist(st.distM, mph) : "";
+            String subTxt = st.street != null && st.street.length() > 0 ? st.street : "";
+            if (stDist.length() > 0 && subTxt.length() > 0) subTxt = stDist + " · " + subTxt;
+            else if (stDist.length() > 0) subTxt = stDist;
+            if (subTxt.length() > 0) {
+                TextView sub = tv("", 12, isCur ? RED : MUTED, false);
+                sub.setText(subTxt);
+                sub.setPadding(0, (int) (2 * s), 0, 0);
+                col.addView(sub);
+            }
+            row.addView(col, new LinearLayout.LayoutParams(0, -2, 1f));
+            row.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    closeStepsSheet();
+                    mapFocusPoint(st.lat, st.lon, 17);
+                }
+            });
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+            rlp.bottomMargin = (int) (6 * s);
+            body.addView(row, rlp);
+        }
+
+        int maxH = Math.max((int) (200 * s), Math.min((int) (builtH * 0.68f), (int) (420 * s)));
+        sheet.addView(sc, new LinearLayout.LayoutParams(-1, maxH));
+
+        int availW = root.getWidth() > 0 ? root.getWidth() : (builtW > 0 ? builtW : Math.round(1024 * s));
+        int sheetW = Math.min((int) (availW * 0.92f), (int) (580 * s));
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(sheetW, -2);
+        slp.gravity = Gravity.CENTER;
+        scrim.addView(sheet, slp);
+        mapStepsOverlay = scrim;
+        root.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
     }
 
     private void updateNavHud() {
@@ -3437,9 +4182,10 @@ public class Main extends Activity {
         if (r == null) {
             navHud.setVisibility(View.GONE);
             if (navLaneBox != null) navLaneBox.setVisibility(View.GONE);
-            if (speedSignTv != null) speedSignTv.setVisibility(View.GONE);
-            if (camBadgeTv != null) camBadgeTv.setVisibility(View.GONE);
+            if (speedHudBox != null) speedHudBox.setVisibility(View.GONE);
+            updateWaveAlerts(mph);
             mapTagBox.setVisibility(View.VISIBLE);
+            updateMapControls();
             return;
         }
         mapTagBox.setVisibility(View.GONE);
@@ -3447,13 +4193,15 @@ public class Main extends Activity {
         if (navTurnIc != null) navTurnIc.setIcon(st != null ? st.icon : 0);
         if (navEtaTv != null) {
             String eta = Nav.fmtEta(this, Nav.remDurS, Nav.remDistM, mph);
+            if (Nav.simulating) eta = (Nav.simPaused ? "[SIM ⏸] " : "[SIM] ") + eta;
+            else if (Nav.previewMode) eta = "[" + I18n.t("Vista previa") + "] " + eta;
             if ("map".equals(r.source) && r.offline) eta = eta + " · " + I18n.t("aproximada");
             int dMin = (int) Math.round(Nav.trafficDelayS / 60.0);
             if (dMin >= 1) {
                 eta = eta + " (+" + dMin + " min)";
                 navEtaTv.setTextColor(dMin >= 8 ? RED : 0xFFF5A623);
             } else {
-                navEtaTv.setTextColor(MUTED);
+                navEtaTv.setTextColor(Nav.simulating ? RED : MUTED);
             }
             navEtaTv.setText(eta);
         }
@@ -3466,34 +4214,9 @@ public class Main extends Activity {
                 navLaneBox.setVisibility(View.GONE);
             }
         }
-        if (speedSignTv != null) {
-            if (Nav.curSpeedLimitKmh > 0 && prefs.getBoolean("nav_speed_alert", false)) {
-                int val = mph ? Math.max(5, (int) (Math.round((Nav.curSpeedLimitKmh / 1.60934) / 5.0) * 5)) : Nav.curSpeedLimitKmh;
-                GradientDrawable sg = new GradientDrawable();
-                sg.setShape(GradientDrawable.OVAL);
-                if (Nav.speedingAlert) {
-                    sg.setColor(0xFFD92B2B);
-                    speedSignTv.setTextColor(Color.WHITE);
-                } else {
-                    sg.setColor(0xFFFDFDFE);
-                    sg.setStroke(Math.max(2, (int) (4 * s)), 0xFFD92B2B);
-                    speedSignTv.setTextColor(0xFF181A1F);
-                }
-                speedSignTv.setBackground(sg);
-                speedSignTv.setText(String.valueOf(val));
-                speedSignTv.setVisibility(View.VISIBLE);
-            } else {
-                speedSignTv.setVisibility(View.GONE);
-            }
-        }
-        if (camBadgeTv != null) {
-            if (Nav.nearbyCamera != null && Nav.nearbyCameraDistM >= 0 && prefs.getBoolean("nav_speed_cams", false)) {
-                camBadgeTv.setText(I18n.t("Radar") + " · " + Nav.fmtStepDist(Nav.nearbyCameraDistM, mph));
-                camBadgeTv.setVisibility(View.VISIBLE);
-            } else {
-                camBadgeTv.setVisibility(View.GONE);
-            }
-        }
+        updateSpeedHudReadout();
+        updateWaveAlerts(mph);
+
         String stepTxt = st != null && st.instruction != null ? I18n.t(st.instruction) : (r.destName != null ? r.destName : "");
         if (Nav.rerouting) {
             if (navDistTv != null) navDistTv.setText(I18n.t("Recalculando…"));
@@ -3504,6 +4227,73 @@ public class Main extends Activity {
         } else {
             if (navDistTv != null) navDistTv.setText(Nav.fmtStepDist(Nav.distToStepM, mph));
             if (navStepTv != null) navStepTv.setText(stepTxt);
+        }
+        updateMapControls();
+    }
+
+    private void updateWaveAlerts(boolean mph) {
+        if (prefs == null) return;
+        boolean hasRoute = Nav.active != null;
+        boolean polEnabled = prefs.getBoolean("nav_police_alerts", true);
+        boolean camEnabled = prefs.getBoolean("nav_speed_cams", true);
+        boolean incEnabled = prefs.getBoolean("nav_inc_alerts", true);
+        Nav.PoliceReport pol = polEnabled ? Nav.nearbyPolice : null;
+        Nav.Camera cam = (hasRoute && camEnabled) ? Nav.nearbyCamera : null;
+        Nav.Incident inc = (hasRoute && incEnabled) ? Nav.nearbyIncident : null;
+        boolean hasPolice = pol != null && Nav.nearbyPoliceDistM >= 0;
+        boolean hasRadar = cam != null && Nav.nearbyCameraDistM >= 0;
+        boolean hasInc = inc != null && Nav.nearbyIncidentDistM >= 0;
+
+        if (camBadgeTv != null && camBadgeTv.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams clp = (FrameLayout.LayoutParams) camBadgeTv.getLayoutParams();
+            int wantTop = Math.round((hasRoute ? 152 : 60) * s);
+            if (clp.topMargin != wantTop) {
+                clp.topMargin = wantTop;
+                camBadgeTv.setLayoutParams(clp);
+            }
+        }
+
+        boolean preferPolice = hasPolice && (!hasRadar || Nav.nearbyPoliceDistM <= Nav.nearbyCameraDistM + 60.0);
+        if (preferPolice) {
+            waveAlertPolice = pol;
+            waveAlertLat = pol.lat; waveAlertLon = pol.lon;
+            if (camBadgeTv != null) {
+                camBadgeTv.setBackground(round(0xFF2563EB, 11));
+                camBadgeTv.setTextColor(Color.WHITE);
+                camBadgeTv.setText(I18n.t("Policía") + " · " + Nav.fmtStepDist(Nav.nearbyPoliceDistM, mph));
+                camBadgeTv.setVisibility(View.VISIBLE);
+            }
+            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFF2563EB, true);
+            if (mlMap != null) mlMap.setWaveAlert(true, "police", pol.lat, pol.lon);
+        } else if (hasRadar) {
+            waveAlertPolice = null;
+            waveAlertLat = cam.lat; waveAlertLon = cam.lon;
+            if (camBadgeTv != null) {
+                camBadgeTv.setBackground(round(0xFFD92B2B, 11));
+                camBadgeTv.setTextColor(Color.WHITE);
+                camBadgeTv.setText(I18n.t("Radar") + " · " + Nav.fmtStepDist(Nav.nearbyCameraDistM, mph));
+                camBadgeTv.setVisibility(View.VISIBLE);
+            }
+            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFFEF4444, false);
+            if (mlMap != null) mlMap.setWaveAlert(true, "radar", cam.lat, cam.lon);
+        } else if (hasInc) {
+            waveAlertPolice = null;
+            waveAlertLat = inc.lat; waveAlertLon = inc.lon;
+            String lbl = inc.desc != null && inc.desc.length() > 0 ? inc.desc : Nav.incidentLabel(inc.category);
+            if (camBadgeTv != null) {
+                camBadgeTv.setBackground(round(0xFFF59E0B, 11));
+                camBadgeTv.setTextColor(0xFF14161B);
+                camBadgeTv.setText(lbl + " · " + Nav.fmtStepDist(Nav.nearbyIncidentDistM, mph));
+                camBadgeTv.setVisibility(View.VISIBLE);
+            }
+            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFFF59E0B, false);
+            if (mlMap != null) mlMap.setWaveAlert(true, "hazard", inc.lat, inc.lon);
+        } else {
+            waveAlertPolice = null;
+            waveAlertLat = Double.NaN; waveAlertLon = Double.NaN;
+            if (camBadgeTv != null) camBadgeTv.setVisibility(View.GONE);
+            if (waveAlertView != null) waveAlertView.setAlert(false, 0, false);
+            if (mlMap != null) mlMap.setWaveAlert(false, "radar", Double.NaN, Double.NaN);
         }
     }
 
@@ -3851,7 +4641,7 @@ public class Main extends Activity {
      *  a la derecha con todo el alto; con la cabecera arriba el mapa quedaba como una franja. */
     private boolean premWide;
     private float premColW;
-    private View mapCardView;
+    private FrameLayout mapCardView;
     private FrameLayout mapClipView;
     private View premTopRow;
     private Bitmap premBg;
@@ -4932,26 +5722,35 @@ public class Main extends Activity {
         place(card, box, 0, 0, mapW, mapH);
         LinearLayout pill = new LinearLayout(this);
         pill.setGravity(Gravity.CENTER_VERTICAL);
+        pill.setClickable(true);
+        pill.setFocusable(false);
         GradientDrawable pd = round(LIGHT ? 0xF2FFFFFF : 0xEB1C1E23, 12);
         if (LIGHT) pd.setStroke(Math.max(1, (int) s), 0x14000000);
         pill.setBackground(pd);
         pill.setPadding((int) (12 * s), 0, (int) (12 * s), 0);
         faroPillIc = new Faro.Icon(this, Faro.I_SEARCH, TEXT);
+        faroPillIc.setClickable(false);
+        faroPillIc.setFocusable(false);
         pill.addView(faroPillIc, new LinearLayout.LayoutParams((int) (18 * s), (int) (18 * s)));
         faroPillTv = tv("", 14, TEXT, false);
+        faroPillTv.setClickable(false);
+        faroPillTv.setFocusable(false);
         faroPillTv.setPadding((int) (10 * s), 0, 0, 0);
         pill.addView(faroPillTv, new LinearLayout.LayoutParams(0, -2, 1f));
         float pw = Math.min(250, Math.max(140, mapW - 12 - 12 - 40 - 12));
-        place(box, pill, 12, 12, pw, 40);
+        place(box, pill, 12, 12, pw, 42);
+        if (SDK >= 21) pill.setElevation(8f * s);
         pill.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
-            if (liveMap == null || !liveMap.hasFix()) { fixGps(); return; }
-            if ("internal".equals(prefs.getString("nav_app", null))) openNavSearch(); else openNavApp();
+            openNavSearch();
         }});
         pill.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { pickFor("nav_app", "Navegación"); return true; } });
         // centrar + acercar / alejar
         FrameLayout loc = faroIconBtn(Faro.I_LOCATE, 40, 19, LIGHT ? 0xF2FFFFFF : 0xEB1C1E23);
         place(box, loc, mapW - 12 - 40, 12, 40, 40);
-        loc.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (liveMap != null) liveMap.autoZoom(); } });
+        loc.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
+            if (previewPlace != null) clearMapPlacePreview(true);
+            else mapRecenter();
+        }});
         LinearLayout zc = new LinearLayout(this);
         zc.setOrientation(LinearLayout.VERTICAL);
         GradientDrawable zd = round(LIGHT ? 0xF2FFFFFF : 0xEB1C1E23, 12);
@@ -4961,8 +5760,8 @@ public class Main extends Activity {
         zc.addView(zin, new LinearLayout.LayoutParams((int) (40 * s), (int) (42 * s)));
         zc.addView(zout, new LinearLayout.LayoutParams((int) (40 * s), (int) (42 * s)));
         place(box, zc, mapW - 12 - 40, 60, 40, 84);
-        zin.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (liveMap != null) liveMap.zoomBy(1); } });
-        zout.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { if (liveMap != null) liveMap.zoomBy(-1); } });
+        zin.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { mapZoomBy(1); } });
+        zout.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { mapZoomBy(-1); } });
         if (mapH < 200) zc.setVisibility(View.GONE);
         mapTagTv = tv("", 13, TEXT, true);   // no se muestra: el estado del GPS va en el buscador
         navSearchBtn = null;
@@ -4978,16 +5777,16 @@ public class Main extends Activity {
         }
     }
 
-    /** El texto del buscador: el estado del GPS mientras no hay ubicación; luego «Ir a…» o «Navegar». */
+    /** El texto del buscador: el estado del GPS si falta permiso/ubicación; si no, «Buscar lugar…». */
     private void updateFaroPill() {
         if (faroPillTv == null) return;
-        boolean fix = liveMap != null && liveMap.hasFix();
-        if (!fix) {
+        boolean fix = mapHasFix();
+        if (!fix && gpsState() != 0) {
             faroPillTv.setText(mapTagTv != null ? mapTagTv.getText() : "");
             faroPillTv.setTextColor(MUTED);
             faroPillIc.set(Faro.I_LOCATE);
         } else {
-            faroPillTv.setText(I18n.t("internal".equals(prefs.getString("nav_app", null)) ? "Ir a…" : "Navegar"));
+            faroPillTv.setText(I18n.t("Buscar lugar…"));
             faroPillTv.setTextColor(TEXT);
             faroPillIc.set(Faro.I_SEARCH);
         }
@@ -5917,161 +6716,390 @@ public class Main extends Activity {
         openNavSearch(false);
     }
 
+    private void closeMapSearchOverlay() {
+        if (mapSearchOverlay == null) return;
+        try {
+            android.view.inputmethod.InputMethodManager imm = (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(mapSearchOverlay.getWindowToken(), 0);
+        } catch (Throwable ignored) { }
+        if (root != null) root.removeView(mapSearchOverlay);
+        mapSearchOverlay = null;
+    }
+
     private void openNavSearch(final boolean insertActive) {
-        if (!prefs.getBoolean("map_live", true)) { toast("Activa el mapa en vivo en Ajustes → Mapa y clima"); return; }
-        final android.app.AlertDialog[] dref = new android.app.AlertDialog[1];
+        if (root == null) return;
+        closeMapSearchOverlay();
+
         final boolean[] addStopMode = {false};
-        LinearLayout wrap = new LinearLayout(this);
-        wrap.setOrientation(LinearLayout.VERTICAL);
-        int pad = (int) (20 * s);
-        wrap.setPadding(pad, pad / 2, pad, 0);
+        final int[] searchSeq = {0};
+        final Runnable[] pendingSearch = new Runnable[1];
+
+        final FrameLayout scrim = new FrameLayout(this);
+        scrim.setBackgroundColor(0x99000000);
+        scrim.setClickable(true);
+        scrim.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { closeMapSearchOverlay(); }
+        });
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        sheet.setClickable(true);
+        GradientDrawable sheetBg = round(CARD, 20);
+        if (LIGHT) sheetBg.setStroke(Math.max(1, (int) s), 0x18000000);
+        sheet.setBackground(sheetBg);
+        int pad = (int) (16 * s);
+        sheet.setPadding(pad, (int) (14 * s), pad, (int) (14 * s));
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+
+        FrameLayout backBtn = new FrameLayout(this);
+        backBtn.setBackground(round(INNER, 12));
+        ImageView backIc = icon("arrow_back", 18);
+        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        blp.gravity = Gravity.CENTER;
+        backBtn.addView(backIc, blp);
+        backBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { closeMapSearchOverlay(); }
+        });
+        bar.addView(backBtn, new LinearLayout.LayoutParams((int) (42 * s), (int) (42 * s)));
 
         final android.widget.EditText et = field();
         et.setSingleLine(true);
-        et.setHint(I18n.t(insertActive ? "Buscar parada intermedia" : "Escribe una dirección o lugar"));
+        et.setTextSize(TypedValue.COMPLEX_UNIT_PX, 15 * s * FONT);
+        et.setPadding((int) (14 * s), (int) (10 * s), (int) (14 * s), (int) (10 * s));
+        et.setHint(I18n.t(insertActive ? "Buscar parada intermedia" : "Buscar dirección, lugar o coordenadas…"));
         et.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH);
+        LinearLayout.LayoutParams etLp = new LinearLayout.LayoutParams(0, (int) (42 * s), 1f);
+        etLp.leftMargin = (int) (8 * s);
+        etLp.rightMargin = (int) (6 * s);
+        bar.addView(et, etLp);
+
+        final TextView clrInput = tv("✕", 14, MUTED, true);
+        clrInput.setGravity(Gravity.CENTER);
+        clrInput.setBackground(round(INNER, 12));
+        clrInput.setVisibility(View.GONE);
+        LinearLayout.LayoutParams clpIn = new LinearLayout.LayoutParams((int) (36 * s), (int) (42 * s));
+        clpIn.rightMargin = (int) (6 * s);
+        bar.addView(clrInput, clpIn);
+
+        FrameLayout goSearchBtn = new FrameLayout(this);
+        goSearchBtn.setBackground(round(RED, 12));
+        Faro.Icon goIc = new Faro.Icon(this, Faro.I_SEARCH, Color.WHITE);
+        FrameLayout.LayoutParams glp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        glp.gravity = Gravity.CENTER;
+        goSearchBtn.addView(goIc, glp);
+        bar.addView(goSearchBtn, new LinearLayout.LayoutParams((int) (44 * s), (int) (42 * s)));
+
+        sheet.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        final LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(0, (int) (10 * s), 0, 0);
+        sc.addView(body, new LinearLayout.LayoutParams(-1, -2));
+
+        int availW = root.getWidth() > 0 ? root.getWidth() : (builtW > 0 ? builtW : Math.round(1024 * s));
+        int availH = root.getHeight() > 0 ? root.getHeight() : (builtH > 0 ? builtH : Math.round(600 * s));
+        int maxBodyH = Math.max((int) (180 * s), Math.min((int) (availH * 0.62f), (int) (380 * s)));
+        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(-1, maxBodyH);
+        sheet.addView(sc, scLp);
+
+        final Runnable[] renderDefaults = new Runnable[1];
+        final Runnable[] runQuery = new Runnable[1];
+
+        final Nav.SearchCb inlineCb = new Nav.SearchCb() {
+            public void onResult(final List<Nav.Place> places, final String error) {
+                if (isFinishing() || mapSearchOverlay != scrim) return;
+                body.removeAllViews();
+                if (places == null) {
+                    TextView msg = tv(error != null ? error : I18n.t("No se pudo buscar"), 13, MUTED, false);
+                    msg.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
+                    body.addView(msg);
+                    return;
+                }
+                if (places.isEmpty()) {
+                    TextView msg = tv(I18n.t("No se encontraron resultados"), 13, MUTED, false);
+                    msg.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
+                    body.addView(msg);
+                    return;
+                }
+                TextView hdr = tv(I18n.t(insertActive || addStopMode[0] ? "Elegir parada" : "Resultados") + " (" + places.size() + ")", 11, RED, true);
+                hdr.setPadding(0, (int) (2 * s), 0, (int) (6 * s));
+                body.addView(hdr);
+                for (int i = 0; i < places.size(); i++) {
+                    final Nav.Place p = places.get(i);
+                    LinearLayout row = new LinearLayout(Main.this);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setGravity(Gravity.CENTER_VERTICAL);
+                    row.setBackground(round(INNER, 12));
+                    row.setPadding((int) (12 * s), (int) (10 * s), (int) (12 * s), (int) (10 * s));
+
+                    ImageView pinIc = icon("location_on", 18);
+                    pinIc.setColorFilter(RED);
+                    LinearLayout.LayoutParams pilp = new LinearLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+                    pilp.rightMargin = (int) (10 * s);
+                    row.addView(pinIc, pilp);
+
+                    LinearLayout col = new LinearLayout(Main.this);
+                    col.setOrientation(LinearLayout.VERTICAL);
+                    TextView nt = tv("", 14, TEXT, true);
+                    nt.setText(p.name);
+                    col.addView(nt);
+                    String distStr = placeDistLabel(p);
+                    String subTxt = p.sub != null ? p.sub : "";
+                    if (distStr.length() > 0 && subTxt.length() > 0) subTxt = distStr + " · " + subTxt;
+                    else if (distStr.length() > 0) subTxt = distStr;
+                    if (subTxt.length() > 0) {
+                        TextView st = tv("", 12, MUTED, false);
+                        st.setText(subTxt);
+                        st.setPadding(0, (int) (2 * s), 0, 0);
+                        col.addView(st);
+                    }
+                    row.addView(col, new LinearLayout.LayoutParams(0, -2, 1f));
+
+                    LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+                    rlp.bottomMargin = (int) (6 * s);
+                    body.addView(row, rlp);
+                    row.setOnClickListener(new View.OnClickListener() {
+                        public void onClick(View v) {
+                            closeMapSearchOverlay();
+                            if (insertActive || addStopMode[0]) handlePickedPlace(p, insertActive, addStopMode[0]);
+                            else showMapPlacePreview(p);
+                        }
+                    });
+                    row.setOnLongClickListener(new View.OnLongClickListener() {
+                        public boolean onLongClick(View v) {
+                            closeMapSearchOverlay();
+                            openPlaceOptions(p);
+                            return true;
+                        }
+                    });
+                }
+            }
+        };
+
+        runQuery[0] = new Runnable() {
+            public void run() {
+                final String q = et.getText().toString().trim();
+                if (q.length() == 0) { renderDefaults[0].run(); return; }
+                final int mySeq = ++searchSeq[0];
+                body.removeAllViews();
+                TextView loading = tv(I18n.t("Buscando…"), 13, MUTED, false);
+                loading.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
+                body.addView(loading);
+                double bLat = Double.isNaN(wLat) ? mapCenterLat() : wLat;
+                double bLon = Double.isNaN(wLon) ? mapCenterLon() : wLon;
+                Nav.search(Main.this, q, bLat, bLon, useMph(), new Nav.SearchCb() {
+                    public void onResult(List<Nav.Place> places, String error) {
+                        if (mySeq != searchSeq[0]) return;
+                        inlineCb.onResult(places, error);
+                    }
+                });
+            }
+        };
+
+        renderDefaults[0] = new Runnable() {
+            public void run() {
+                searchSeq[0]++;
+                body.removeAllViews();
+                if (!insertActive && !pendingStops.isEmpty()) {
+                    LinearLayout hdrRow = new LinearLayout(Main.this);
+                    hdrRow.setGravity(Gravity.CENTER_VERTICAL);
+                    TextView stHdr = tv(I18n.t("PARADAS") + " (" + pendingStops.size() + ")", 11, RED, true);
+                    hdrRow.addView(stHdr, new LinearLayout.LayoutParams(0, -2, 1));
+                    TextView clrBtn = tv("Limpiar", 11, MUTED, true);
+                    clrBtn.setPadding((int) (8 * s), (int) (4 * s), (int) (4 * s), (int) (4 * s));
+                    clrBtn.setOnClickListener(new View.OnClickListener() {
+                        public void onClick(View v) {
+                            pendingStops.clear();
+                            renderDefaults[0].run();
+                        }
+                    });
+                    hdrRow.addView(clrBtn);
+                    body.addView(hdrRow);
+                    for (int i = 0; i < pendingStops.size(); i++) {
+                        final int stopIdx = i;
+                        Nav.Place st = pendingStops.get(i);
+                        LinearLayout sRow = new LinearLayout(Main.this);
+                        sRow.setGravity(Gravity.CENTER_VERTICAL);
+                        sRow.setBackground(round(INNER, 10));
+                        sRow.setPadding((int) (12 * s), (int) (8 * s), (int) (12 * s), (int) (8 * s));
+                        TextView sTv = tv("", 13, TEXT, true);
+                        sTv.setText((i + 1) + ". " + st.name);
+                        sRow.addView(sTv, new LinearLayout.LayoutParams(0, -2, 1));
+                        TextView del = tv("✕", 13, MUTED, true);
+                        del.setPadding((int) (10 * s), (int) (2 * s), (int) (2 * s), (int) (2 * s));
+                        del.setOnClickListener(new View.OnClickListener() {
+                            public void onClick(View v) {
+                                if (stopIdx < pendingStops.size()) pendingStops.remove(stopIdx);
+                                renderDefaults[0].run();
+                            }
+                        });
+                        sRow.addView(del);
+                        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, -2);
+                        slp.topMargin = (int) (4 * s);
+                        slp.bottomMargin = (int) (4 * s);
+                        body.addView(sRow, slp);
+                    }
+                }
+
+                if (!insertActive) {
+                    final TextView addStopPill = tv(addStopMode[0] ? "Modo parada activo: elige una parada" : "+ Añadir parada intermedia", 12, addStopMode[0] ? Color.WHITE : SOFT, true);
+                    addStopPill.setGravity(Gravity.CENTER);
+                    addStopPill.setBackground(round(addStopMode[0] ? RED : INNER, 10));
+                    addStopPill.setPadding((int) (12 * s), (int) (7 * s), (int) (12 * s), (int) (7 * s));
+                    addStopPill.setOnClickListener(new View.OnClickListener() {
+                        public void onClick(View v) {
+                            addStopMode[0] = !addStopMode[0];
+                            addStopPill.setBackground(round(addStopMode[0] ? RED : INNER, 10));
+                            addStopPill.setTextColor(addStopMode[0] ? Color.WHITE : SOFT);
+                            addStopPill.setText(I18n.t(addStopMode[0] ? "Modo parada activo: elige una parada" : "+ Añadir parada intermedia"));
+                        }
+                    });
+                    LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-1, -2);
+                    alp.bottomMargin = (int) (8 * s);
+                    body.addView(addStopPill, alp);
+                }
+
+                LinearLayout quickRow = new LinearLayout(Main.this);
+                quickRow.setOrientation(LinearLayout.HORIZONTAL);
+                addOverlayQuickSlot(quickRow, "nav_home", "Casa", true, insertActive, addStopMode, renderDefaults[0]);
+                addOverlayQuickSlot(quickRow, "nav_work", "Trabajo", false, insertActive, addStopMode, renderDefaults[0]);
+                LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(-1, -2);
+                qlp.bottomMargin = (int) (8 * s);
+                body.addView(quickRow, qlp);
+
+                LinearLayout catRow = new LinearLayout(Main.this);
+                catRow.setOrientation(LinearLayout.HORIZONTAL);
+                String[][] cats = {
+                    {"fuel", "Gasolina"},
+                    {"health", "Salud"},
+                    {"parking", "Parqueo"},
+                    {"food", "Comida"}
+                };
+                for (int i = 0; i < cats.length; i++) {
+                    final String cKey = cats[i][0];
+                    final String cLbl = cats[i][1];
+                    TextView pill = tv(cLbl, 12, TEXT, true);
+                    pill.setGravity(Gravity.CENTER);
+                    pill.setBackground(round(INNER, 10));
+                    pill.setPadding((int) (6 * s), (int) (8 * s), (int) (6 * s), (int) (8 * s));
+                    LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(0, -2, 1);
+                    if (i + 1 < cats.length) plp.rightMargin = (int) (6 * s);
+                    catRow.addView(pill, plp);
+                    pill.setOnClickListener(new View.OnClickListener() {
+                        public void onClick(View v) {
+                            if (Double.isNaN(wLat) || Double.isNaN(wLon)) seedLastLocation();
+                            double bLat = Double.isNaN(wLat) ? mapCenterLat() : wLat;
+                            double bLon = Double.isNaN(wLon) ? mapCenterLon() : wLon;
+                            final int mySeq = ++searchSeq[0];
+                            body.removeAllViews();
+                            TextView loading = tv(I18n.t("Buscando…"), 13, MUTED, false);
+                            loading.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
+                            body.addView(loading);
+                            Nav.searchCategory(Main.this, cKey, bLat, bLon, useMph(), new Nav.SearchCb() {
+                                public void onResult(List<Nav.Place> places, String error) {
+                                    if (mySeq != searchSeq[0]) return;
+                                    inlineCb.onResult(places, error);
+                                }
+                            });
+                        }
+                    });
+                }
+                LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, -2);
+                clp.bottomMargin = (int) (6 * s);
+                body.addView(catRow, clp);
+
+                addOverlayPlaceSection(body, "FAVORITOS", Nav.favorites(Main.this), insertActive, addStopMode);
+                addOverlayPlaceSection(body, "RECIENTES", Nav.recents(Main.this), insertActive, addStopMode);
+
+                if (Nav.active != null && !insertActive) {
+                    TextView stopNavBtn = tv("Detener navegación", 13, RED, true);
+                    stopNavBtn.setGravity(Gravity.CENTER);
+                    stopNavBtn.setBackground(round(INNER, 12));
+                    stopNavBtn.setPadding((int) (12 * s), (int) (10 * s), (int) (12 * s), (int) (10 * s));
+                    stopNavBtn.setOnClickListener(new View.OnClickListener() {
+                        public void onClick(View v) {
+                            closeMapSearchOverlay();
+                            stopInternalNav();
+                        }
+                    });
+                    LinearLayout.LayoutParams snlp = new LinearLayout.LayoutParams(-1, -2);
+                    snlp.topMargin = (int) (6 * s);
+                    body.addView(stopNavBtn, snlp);
+                }
+            }
+        };
+
+        renderDefaults[0].run();
+
+        et.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s0, int st, int c, int a) { }
+            public void onTextChanged(CharSequence s0, int st, int b, int c) { }
+            public void afterTextChanged(android.text.Editable ed) {
+                if (pendingSearch[0] != null) h.removeCallbacks(pendingSearch[0]);
+                String q = ed.toString().trim();
+                clrInput.setVisibility(q.length() > 0 ? View.VISIBLE : View.GONE);
+                if (q.length() == 0) {
+                    renderDefaults[0].run();
+                } else if (q.length() >= 3) {
+                    pendingSearch[0] = new Runnable() {
+                        public void run() { runQuery[0].run(); }
+                    };
+                    h.postDelayed(pendingSearch[0], 450);
+                }
+            }
+        });
+
+        clrInput.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                et.setText("");
+                renderDefaults[0].run();
+            }
+        });
+
+        View.OnClickListener submitAction = new View.OnClickListener() {
+            public void onClick(View v) {
+                if (pendingSearch[0] != null) h.removeCallbacks(pendingSearch[0]);
+                if (et.getText().toString().trim().length() == 0) {
+                    toast("Escribe una dirección o lugar");
+                    return;
+                }
+                try {
+                    android.view.inputmethod.InputMethodManager imm = (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                    if (imm != null) imm.hideSoftInputFromWindow(et.getWindowToken(), 0);
+                } catch (Throwable ignored) { }
+                runQuery[0].run();
+            }
+        };
+        goSearchBtn.setOnClickListener(submitAction);
         et.setOnEditorActionListener(new TextView.OnEditorActionListener() {
             public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
                 if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
                         || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER && event.getAction() == KeyEvent.ACTION_DOWN)) {
-                    if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
-                    searchNav(et.getText().toString(), insertActive, addStopMode[0]);
+                    submitAction.onClick(v);
                     return true;
                 }
                 return false;
             }
         });
-        wrap.addView(et, new LinearLayout.LayoutParams(-1, -2));
 
-        android.widget.ScrollView sc = new android.widget.ScrollView(this);
-        LinearLayout body = new LinearLayout(this);
-        body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(0, (int) (10 * s), 0, 0);
+        int sheetW = Math.min((int) (availW * 0.92f), (int) (640 * s));
+        FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(sheetW, -2);
+        slp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        slp.topMargin = (int) (14 * s);
+        scrim.addView(sheet, slp);
 
-        if (!insertActive && !pendingStops.isEmpty()) {
-            LinearLayout hdrRow = new LinearLayout(this);
-            hdrRow.setGravity(Gravity.CENTER_VERTICAL);
-            TextView stHdr = tv(I18n.t("PARADAS") + " (" + pendingStops.size() + ")", 11, RED, true);
-            hdrRow.addView(stHdr, new LinearLayout.LayoutParams(0, -2, 1));
-            TextView clrBtn = tv("Limpiar", 11, MUTED, true);
-            clrBtn.setPadding((int) (8 * s), (int) (4 * s), (int) (4 * s), (int) (4 * s));
-            clrBtn.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    pendingStops.clear();
-                    if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
-                    openNavSearch(false);
-                }
-            });
-            hdrRow.addView(clrBtn);
-            body.addView(hdrRow);
-            for (int i = 0; i < pendingStops.size(); i++) {
-                final int stopIdx = i;
-                Nav.Place st = pendingStops.get(i);
-                LinearLayout sRow = new LinearLayout(this);
-                sRow.setGravity(Gravity.CENTER_VERTICAL);
-                sRow.setBackground(round(INNER, 10));
-                sRow.setPadding((int) (12 * s), (int) (8 * s), (int) (12 * s), (int) (8 * s));
-                TextView sTv = tv("", 13, TEXT, true);
-                sTv.setText((i + 1) + ". " + st.name);
-                sRow.addView(sTv, new LinearLayout.LayoutParams(0, -2, 1));
-                TextView del = tv("✕", 13, MUTED, true);
-                del.setPadding((int) (10 * s), (int) (2 * s), (int) (2 * s), (int) (2 * s));
-                del.setOnClickListener(new View.OnClickListener() {
-                    public void onClick(View v) {
-                        if (stopIdx < pendingStops.size()) pendingStops.remove(stopIdx);
-                        if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
-                        openNavSearch(false);
-                    }
-                });
-                sRow.addView(del);
-                LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, -2);
-                slp.topMargin = (int) (4 * s);
-                slp.bottomMargin = (int) (4 * s);
-                body.addView(sRow, slp);
-            }
-        }
-
-        if (!insertActive) {
-            final TextView addStopPill = tv("+ Añadir parada intermedia", 12, SOFT, true);
-            addStopPill.setGravity(Gravity.CENTER);
-            addStopPill.setBackground(round(INNER, 10));
-            addStopPill.setPadding((int) (12 * s), (int) (7 * s), (int) (12 * s), (int) (7 * s));
-            addStopPill.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    addStopMode[0] = !addStopMode[0];
-                    addStopPill.setBackground(round(addStopMode[0] ? RED : INNER, 10));
-                    addStopPill.setTextColor(addStopMode[0] ? Color.WHITE : SOFT);
-                    addStopPill.setText(I18n.t(addStopMode[0] ? "Modo parada activo: elige una parada" : "+ Añadir parada intermedia"));
-                }
-            });
-            LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(-1, -2);
-            alp.bottomMargin = (int) (8 * s);
-            body.addView(addStopPill, alp);
-        }
-
-        LinearLayout quickRow = new LinearLayout(this);
-        quickRow.setOrientation(LinearLayout.HORIZONTAL);
-        addQuickSlot(quickRow, "nav_home", "Casa", true, dref, insertActive, addStopMode);
-        addQuickSlot(quickRow, "nav_work", "Trabajo", false, dref, insertActive, addStopMode);
-        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(-1, -2);
-        qlp.bottomMargin = (int) (8 * s);
-        body.addView(quickRow, qlp);
-
-
-        if (LiveMapView.fileMap != null) {
-            LinearLayout catRow = new LinearLayout(this);
-            catRow.setOrientation(LinearLayout.HORIZONTAL);
-            String[][] cats = {
-                {"fuel", "Gasolina"},
-                {"health", "Salud"},
-                {"parking", "Parqueo"},
-                {"food", "Comida"}
-            };
-            for (int i = 0; i < cats.length; i++) {
-                final String cKey = cats[i][0];
-                final String cLbl = cats[i][1];
-                TextView pill = tv(cLbl, 12, TEXT, true);
-                pill.setGravity(Gravity.CENTER);
-                pill.setBackground(round(INNER, 10));
-                pill.setPadding((int) (6 * s), (int) (8 * s), (int) (6 * s), (int) (8 * s));
-                LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(0, -2, 1);
-                if (i + 1 < cats.length) plp.rightMargin = (int) (6 * s);
-                catRow.addView(pill, plp);
-                pill.setOnClickListener(new View.OnClickListener() {
-                    public void onClick(View v) {
-                        if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
-                        searchNavCategory(cKey, cLbl, insertActive, addStopMode[0]);
-                    }
-                });
-            }
-            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, -2);
-            clp.bottomMargin = (int) (6 * s);
-            body.addView(catRow, clp);
-        }
-
-        addPlaceSection(body, "FAVORITOS", Nav.favorites(this), dref, insertActive, addStopMode);
-        addPlaceSection(body, "RECIENTES", Nav.recents(this), dref, insertActive, addStopMode);
-
-        sc.addView(body, new LinearLayout.LayoutParams(-1, -2));
-        wrap.addView(sc, new LinearLayout.LayoutParams(-1, -2));
-
-        TB b = new TB(this, dlg()).wide()
-            .setTitle(insertActive ? "Añadir parada en ruta" : (!pendingStops.isEmpty() ? "Elegir destino final" : "¿A dónde vamos?"))
-            .setView(wrap)
-            .setPositiveButton("Buscar", new DialogInterface.OnClickListener() {
-                public void onClick(DialogInterface d, int w) { searchNav(et.getText().toString(), insertActive, addStopMode[0]); }
-            })
-            .setNegativeButton("Cancelar", null);
-        if (!insertActive && Nav.active != null) {
-            b.setNeutralButton("Detener", new DialogInterface.OnClickListener() {
-                public void onClick(DialogInterface d, int w) { stopInternalNav(); }
-            });
-        }
-        dref[0] = b.show();
+        mapSearchOverlay = scrim;
+        root.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+        scrim.bringToFront();
+        if (SDK >= 21) scrim.setElevation(24f * s);
+        et.requestFocus();
     }
 
-    private void addQuickSlot(LinearLayout parent, final String key, final String label, boolean leftMarginRight,
-                              final android.app.AlertDialog[] dref, final boolean insertActive, final boolean[] addStopMode) {
+    private void addOverlayQuickSlot(LinearLayout parent, final String key, final String label, boolean leftMarginRight,
+                                     final boolean insertActive, final boolean[] addStopMode, final Runnable refresh) {
         final Nav.Place saved = Nav.savedPlace(this, key);
         LinearLayout slot = new LinearLayout(this);
         slot.setOrientation(LinearLayout.VERTICAL);
@@ -6087,19 +7115,21 @@ public class Main extends Activity {
         parent.addView(slot, lp);
         slot.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
-                if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
                 if (saved != null) {
-                    handlePickedPlace(saved, insertActive, addStopMode != null && addStopMode[0]);
+                    closeMapSearchOverlay();
+                    if (insertActive || (addStopMode != null && addStopMode[0])) handlePickedPlace(saved, insertActive, addStopMode != null && addStopMode[0]);
+                    else showMapPlacePreview(saved);
                 } else if (saveCurrentGpsAs(key, label)) {
-                    openNavSearch(insertActive);
+                    refresh.run();
                 }
             }
         });
         if (saved != null) {
             slot.setOnLongClickListener(new View.OnLongClickListener() {
                 public boolean onLongClick(View v) {
-                    if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
+                    closeMapSearchOverlay();
                     String[] items = {
+                        I18n.t("Ver en el mapa"),
                         I18n.t("Ir ahora"),
                         I18n.t("Añadir como parada"),
                         I18n.t("Actualizar con GPS actual"),
@@ -6109,9 +7139,10 @@ public class Main extends Activity {
                         .setTitle(I18n.t(label))
                         .setItems(items, new DialogInterface.OnClickListener() {
                             public void onClick(DialogInterface d, int w) {
-                                if (w == 0) startInternalNav(saved);
-                                else if (w == 1) handlePickedPlace(saved, insertActive, true);
-                                else if (w == 2) { if (saveCurrentGpsAs(key, label)) openNavSearch(insertActive); }
+                                if (w == 0) showMapPlacePreview(saved);
+                                else if (w == 1) startInternalNav(saved);
+                                else if (w == 2) handlePickedPlace(saved, insertActive, true);
+                                else if (w == 3) { if (saveCurrentGpsAs(key, label)) openNavSearch(insertActive); }
                                 else {
                                     Nav.setSavedPlace(Main.this, key, null);
                                     toast("Eliminado");
@@ -6127,24 +7158,8 @@ public class Main extends Activity {
         }
     }
 
-    private boolean saveCurrentGpsAs(String key, String label) {
-        if (Double.isNaN(wLat) || Double.isNaN(wLon)) seedLastLocation();
-        if (Double.isNaN(wLat) || Double.isNaN(wLon)) {
-            toast("Esperando señal GPS para guardar ubicación");
-            return false;
-        }
-        Nav.Place p = new Nav.Place();
-        p.name = I18n.t(label);
-        p.sub = String.format(java.util.Locale.US, "%.5f, %.5f", wLat, wLon);
-        p.lat = wLat;
-        p.lon = wLon;
-        Nav.setSavedPlace(this, key, p);
-        toast("nav_home".equals(key) ? "Guardado en Casa" : "Guardado en Trabajo");
-        return true;
-    }
-
-    private void addPlaceSection(LinearLayout body, String title, List<Nav.Place> items,
-                                 final android.app.AlertDialog[] dref, final boolean insertActive, final boolean[] addStopMode) {
+    private void addOverlayPlaceSection(LinearLayout body, String title, List<Nav.Place> items,
+                                        final boolean insertActive, final boolean[] addStopMode) {
         if (items == null || items.isEmpty()) return;
         TextView hdr = tv(title, 11, MUTED, true);
         hdr.setPadding(0, (int) (8 * s), 0, (int) (6 * s));
@@ -6169,13 +7184,14 @@ public class Main extends Activity {
             body.addView(row, rlp);
             row.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
-                    if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
-                    handlePickedPlace(p, insertActive, addStopMode != null && addStopMode[0]);
+                    closeMapSearchOverlay();
+                    if (insertActive || (addStopMode != null && addStopMode[0])) handlePickedPlace(p, insertActive, addStopMode != null && addStopMode[0]);
+                    else showMapPlacePreview(p);
                 }
             });
             row.setOnLongClickListener(new View.OnLongClickListener() {
                 public boolean onLongClick(View v) {
-                    if (dref[0] != null) try { dref[0].dismiss(); } catch (Throwable ignored) { }
+                    closeMapSearchOverlay();
                     openPlaceOptions(p);
                     return true;
                 }
@@ -6183,9 +7199,229 @@ public class Main extends Activity {
         }
     }
 
+    private String placeDistLabel(Nav.Place p) {
+        if (p == null) return "";
+        if (Double.isNaN(wLat) || Double.isNaN(wLon)) seedLastLocation();
+        double bLat = Double.isNaN(wLat) ? mapCenterLat() : wLat;
+        double bLon = Double.isNaN(wLon) ? mapCenterLon() : wLon;
+        if (Double.isNaN(bLat) || Double.isNaN(bLon)) return "";
+        float[] res = new float[1];
+        Location.distanceBetween(bLat, bLon, p.lat, p.lon, res);
+        return Nav.fmtStepDist(res[0], useMph());
+    }
+
+    private void showMapPlacePreview(final Nav.Place p) {
+        if (p == null) return;
+        previewPlace = p;
+        if (mlMap != null) mlMap.setPreviewPlace(p);
+        if (liveMap != null) {
+            liveMap.setPreviewPlace(p);
+            liveMap.setVisibility(View.VISIBLE);
+        }
+        updateMapControls();
+        if (mapCardView == null) return;
+        if (mapPreviewCard != null) {
+            mapCardView.removeView(mapPreviewCard);
+            mapPreviewCard = null;
+        }
+        if (mapConnPanel != null) mapConnPanel.setVisibility(View.GONE);
+        if (mapConnHandle != null) mapConnHandle.setVisibility(View.GONE);
+        if (mapConnNavBtn != null) mapConnNavBtn.setVisibility(View.GONE);
+        if (mapConnGauge != null) mapConnGauge.setVisibility(View.GONE);
+
+        final boolean faroT = premium && Prem.faro();
+        LinearLayout cardBox = new LinearLayout(this);
+        cardBox.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = round(faroT ? Faro.glass(LIGHT) : (CARD & 0x00FFFFFF) | 0xF2000000, 16);
+        if (LIGHT) bg.setStroke(Math.max(1, (int) s), 0x18000000);
+        cardBox.setBackground(bg);
+        cardBox.setPadding((int) (12 * s), (int) (10 * s), (int) (12 * s), (int) (10 * s));
+        cardBox.setClickable(true);
+
+        LinearLayout top = new LinearLayout(this);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+
+        ImageView pinIc = icon("location_on", 20);
+        pinIc.setColorFilter(RED);
+        LinearLayout.LayoutParams pilp = new LinearLayout.LayoutParams((int) (20 * s), (int) (20 * s));
+        pilp.rightMargin = (int) (8 * s);
+        top.addView(pinIc, pilp);
+
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        TextView titleTv = tv("", 15, TEXT, true);
+        titleTv.setText(p.name);
+        info.addView(titleTv);
+        String dist = placeDistLabel(p);
+        String subTxt = p.sub != null ? p.sub : "";
+        if (dist.length() > 0 && subTxt.length() > 0) subTxt = dist + " · " + subTxt;
+        else if (dist.length() > 0) subTxt = dist;
+        if (subTxt.length() > 0) {
+            TextView subTv = tv("", 12, MUTED, false);
+            subTv.setText(subTxt);
+            subTv.setPadding(0, (int) (2 * s), 0, 0);
+            info.addView(subTv);
+        }
+        top.addView(info, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        final ImageView favIc = icon("star", 19);
+        favIc.setColorFilter(Nav.isFavorite(this, p) ? RED : MUTED);
+        FrameLayout favBtn = new FrameLayout(this);
+        favBtn.setBackground(round(BTN, 15));
+        FrameLayout.LayoutParams filp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        filp.gravity = Gravity.CENTER;
+        favBtn.addView(favIc, filp);
+        favBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean added = Nav.toggleFavorite(Main.this, p);
+                favIc.setColorFilter(added ? RED : MUTED);
+                toast(added ? "Añadido a favoritos" : "Quitado de favoritos");
+            }
+        });
+        LinearLayout.LayoutParams fblp = new LinearLayout.LayoutParams((int) (32 * s), (int) (32 * s));
+        fblp.leftMargin = (int) (8 * s);
+        top.addView(favBtn, fblp);
+
+        TextView closeBtn = tv("✕", 14, TEXT, true);
+        closeBtn.setGravity(Gravity.CENTER);
+        closeBtn.setBackground(round(BTN, 15));
+        closeBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { clearMapPlacePreview(true); }
+        });
+        LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams((int) (32 * s), (int) (32 * s));
+        cblp.leftMargin = (int) (6 * s);
+        top.addView(closeBtn, cblp);
+
+        cardBox.addView(top, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams aclp = new LinearLayout.LayoutParams(-1, -2);
+        aclp.topMargin = (int) (8 * s);
+
+        LinearLayout navGo = new LinearLayout(this);
+        navGo.setGravity(Gravity.CENTER);
+        navGo.setBackground(round(RED, 12));
+        navGo.setPadding((int) (12 * s), (int) (8 * s), (int) (12 * s), (int) (8 * s));
+        ImageView navIc = icon("navigation", 16);
+        navIc.setColorFilter(Color.WHITE);
+        LinearLayout.LayoutParams nilp = new LinearLayout.LayoutParams((int) (16 * s), (int) (16 * s));
+        nilp.rightMargin = (int) (6 * s);
+        navGo.addView(navIc, nilp);
+        navGo.addView(tv("Iniciar ruta", 13, Color.WHITE, true));
+        navGo.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                clearMapPlacePreview(false);
+                startInternalNav(p);
+            }
+        });
+        actions.addView(navGo, new LinearLayout.LayoutParams(0, (int) (36 * s), 1.4f));
+
+        TextView addStopBtn = tv("+ Parada", 12, TEXT, true);
+        addStopBtn.setGravity(Gravity.CENTER);
+        addStopBtn.setBackground(round(BTN, 12));
+        addStopBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (Nav.active != null) {
+                    clearMapPlacePreview(false);
+                    insertStopIntoActive(p);
+                } else {
+                    pendingStops.add(p);
+                    toast(I18n.t("Parada añadida") + ": " + p.name);
+                    clearMapPlacePreview(true);
+                }
+            }
+        });
+        LinearLayout.LayoutParams sblp = new LinearLayout.LayoutParams(0, (int) (36 * s), 0.9f);
+        sblp.leftMargin = (int) (8 * s);
+        actions.addView(addStopBtn, sblp);
+
+        FrameLayout simGo = new FrameLayout(this);
+        simGo.setBackground(round(BTN, 12));
+        ImageView simIc = icon("play_arrow", 18);
+        simIc.setColorFilter(RED);
+        FrameLayout.LayoutParams silp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        silp.gravity = Gravity.CENTER;
+        simGo.addView(simIc, silp);
+        simGo.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                autoSimPending = true;
+                clearMapPlacePreview(false);
+                startInternalNav(p);
+            }
+        });
+        LinearLayout.LayoutParams sglp = new LinearLayout.LayoutParams((int) (42 * s), (int) (36 * s));
+        sglp.leftMargin = (int) (8 * s);
+        actions.addView(simGo, sglp);
+
+        FrameLayout polGo = new FrameLayout(this);
+        polGo.setBackground(round(BTN, 12));
+        polGo.setContentDescription(I18n.t("Reportar policía"));
+        ImageView polIc = icon("verified_user", 18);
+        polIc.setColorFilter(0xFF2563EB);
+        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
+        plp.gravity = Gravity.CENTER;
+        polGo.addView(polIc, plp);
+        polGo.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                clearMapPlacePreview(false);
+                reportPoliceAt(p.lat, p.lon, p.name);
+            }
+        });
+        LinearLayout.LayoutParams pglp = new LinearLayout.LayoutParams((int) (42 * s), (int) (36 * s));
+        pglp.leftMargin = (int) (8 * s);
+        actions.addView(polGo, pglp);
+
+        cardBox.addView(actions, aclp);
+
+        FrameLayout wrapper = new FrameLayout(this);
+        wrapper.addView(cardBox, new FrameLayout.LayoutParams(-1, -2));
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1, -2);
+        lp.gravity = Gravity.BOTTOM;
+        lp.leftMargin = (int) ((12 + insL) * s);
+        lp.rightMargin = (int) ((12 + insR) * s);
+        lp.bottomMargin = (int) (12 * s);
+        mapPreviewCard = wrapper;
+        mapCardView.addView(wrapper, lp);
+    }
+
+    private void clearMapPlacePreview(boolean snapBack) {
+        previewPlace = null;
+        if (mapPreviewCard != null && mapCardView != null) {
+            mapCardView.removeView(mapPreviewCard);
+        }
+        mapPreviewCard = null;
+        if (mapConnPanel != null) mapConnPanel.setVisibility(mapConnHasPanel ? View.VISIBLE : View.GONE);
+        if (mapConnHandle != null) mapConnHandle.setVisibility(mapConnHasPanel ? View.VISIBLE : View.GONE);
+        if (mapConnNavBtn != null) mapConnNavBtn.setVisibility(mapConnNavBtnVisible ? View.VISIBLE : View.GONE);
+        if (mapConnGauge != null) mapConnGauge.setVisibility(View.VISIBLE);
+        if (mlMap != null) mlMap.clearPreview(snapBack);
+        if (liveMap != null) liveMap.setPreviewPlace(null);
+        updateMapControls();
+    }
+
+
+    private boolean saveCurrentGpsAs(String key, String label) {
+        if (Double.isNaN(wLat) || Double.isNaN(wLon)) seedLastLocation();
+        if (Double.isNaN(wLat) || Double.isNaN(wLon)) {
+            toast("Esperando señal GPS para guardar ubicación");
+            return false;
+        }
+        Nav.Place p = new Nav.Place();
+        p.name = I18n.t(label);
+        p.sub = String.format(java.util.Locale.US, "%.5f, %.5f", wLat, wLon);
+        p.lat = wLat;
+        p.lon = wLon;
+        Nav.setSavedPlace(this, key, p);
+        toast("nav_home".equals(key) ? "Guardado en Casa" : "Guardado en Trabajo");
+        return true;
+    }
+
+
     private void openPlaceOptions(final Nav.Place p) {
         final boolean fav = Nav.isFavorite(this, p);
         String[] items = {
+            I18n.t("Ver en el mapa"),
             I18n.t("Ir ahora"),
             I18n.t("Añadir como parada"),
             I18n.t(fav ? "Quitar de favoritos" : "Añadir a favoritos"),
@@ -6196,12 +7432,13 @@ public class Main extends Activity {
             .setTitle(p.name)
             .setItems(items, new DialogInterface.OnClickListener() {
                 public void onClick(DialogInterface d, int w) {
-                    if (w == 0) startInternalNav(p);
-                    else if (w == 1) handlePickedPlace(p, false, true);
-                    else if (w == 2) {
+                    if (w == 0) showMapPlacePreview(p);
+                    else if (w == 1) startInternalNav(p);
+                    else if (w == 2) handlePickedPlace(p, false, true);
+                    else if (w == 3) {
                         boolean added = Nav.toggleFavorite(Main.this, p);
                         toast(added ? "Añadido a favoritos" : "Quitado de favoritos");
-                    } else if (w == 3) {
+                    } else if (w == 4) {
                         Nav.setSavedPlace(Main.this, "nav_home", p);
                         toast("Guardado en Casa");
                     } else {
@@ -6226,7 +7463,7 @@ public class Main extends Activity {
             openNavSearch(false);
             return;
         }
-        startInternalNav(p);
+        showMapPlacePreview(p);
     }
 
     private void insertStopIntoActive(Nav.Place stop) {
@@ -6244,67 +7481,6 @@ public class Main extends Activity {
         startRouteWithStops(stops, dest, false);
     }
 
-    private void searchNav(String query, final boolean insertActive, final boolean asStop) {
-        final String q = query == null ? "" : query.trim();
-        if (q.length() == 0) { toast("Escribe una dirección o lugar"); return; }
-        toast("Buscando…");
-        Nav.search(this, q, wLat, wLon, useMph(), new Nav.SearchCb() {
-            public void onResult(List<Nav.Place> places, String error) {
-                if (isFinishing()) return;
-                if (places == null) { toast(error != null ? error : "No se pudo buscar"); return; }
-                if (places.isEmpty()) { toast("No se encontraron resultados"); return; }
-                String pfx = I18n.t(insertActive || asStop ? "Elegir parada" : "Resultados");
-                showSearchResults(pfx + ": " + q, places, insertActive, asStop);
-            }
-        });
-    }
-
-    private void searchNavCategory(String cat, final String label, final boolean insertActive, final boolean asStop) {
-        if (Double.isNaN(wLat) || Double.isNaN(wLon)) seedLastLocation();
-        toast("Buscando…");
-        Nav.searchCategory(cat, wLat, wLon, useMph(), new Nav.SearchCb() {
-            public void onResult(List<Nav.Place> places, String error) {
-                if (isFinishing()) return;
-                if (places == null || places.isEmpty()) {
-                    toast(error != null ? error : "No se encontraron resultados");
-                    return;
-                }
-                String tit = insertActive || asStop ? I18n.t("Elegir parada") + " · " + I18n.t(label) : I18n.t(label);
-                showSearchResults(tit, places, insertActive, asStop);
-            }
-        });
-    }
-
-    private void showSearchResults(String title, final List<Nav.Place> places, final boolean insertActive, final boolean asStop) {
-        BaseAdapter ad = new BaseAdapter() {
-            public int getCount() { return places.size(); }
-            public Object getItem(int pos) { return places.get(pos); }
-            public long getItemId(int pos) { return pos; }
-            public View getView(int pos, View cv, ViewGroup parent) {
-                Nav.Place p = places.get(pos);
-                LinearLayout row = new LinearLayout(Main.this);
-                row.setOrientation(LinearLayout.VERTICAL);
-                row.setPadding((int) (22 * s), (int) (12 * s), (int) (22 * s), (int) (12 * s));
-                TextView t = tv("", 16, TEXT, true);
-                t.setText(p.name);
-                row.addView(t);
-                if (p.sub != null && p.sub.length() > 0) {
-                    TextView sub = tv("", 13, MUTED, false);
-                    sub.setText(p.sub);
-                    sub.setPadding(0, (int) (2 * s), 0, 0);
-                    row.addView(sub);
-                }
-                return row;
-            }
-        };
-        new TB(Main.this, dlg()).raw()
-            .setTitle(title)
-            .setAdapter(ad, new DialogInterface.OnClickListener() {
-                public void onClick(DialogInterface d, int w) { handlePickedPlace(places.get(w), insertActive, asStop); }
-            })
-            .setNegativeButton("Cancelar", null)
-            .show();
-    }
 
     private void startInternalNav(final Nav.Place dest) {
         List<Nav.Place> stops = new ArrayList<Nav.Place>(pendingStops.size() + 1);
@@ -6316,17 +7492,21 @@ public class Main extends Activity {
 
     private void startRouteWithStops(final List<Nav.Place> stops, final Nav.Place dest, boolean wantAlt) {
         if (Double.isNaN(wLat) || Double.isNaN(wLon)) seedLastLocation();
-        if (Double.isNaN(wLat) || Double.isNaN(wLon)) {
-            toast("Esperando señal GPS para calcular la ruta");
-            return;
+        double origLat = wLat, origLon = wLon;
+        boolean noFix = Double.isNaN(origLat) || Double.isNaN(origLon);
+        if (noFix) {
+            origLat = mapCenterLat();
+            origLon = mapCenterLon();
         }
+        Nav.previewMode = noFix || (!mapHasFix() && lastFix == 0);
         Nav.saveRecent(this, dest);
         if (Nav.active == null) Nav.savedHeadingUp = prefs.getBoolean("map_heading", false);
         toast("Calculando ruta…");
-        Nav.fetchRoutes(this, wLat, wLon, stops, wantAlt && stops.size() == 1, new Nav.RoutesCb() {
+        Nav.fetchRoutes(this, origLat, origLon, stops, wantAlt && stops.size() == 1, new Nav.RoutesCb() {
             public void onRoutes(List<Nav.Route> routes, String error) {
                 if (isFinishing()) return;
                 if (routes == null || routes.isEmpty()) {
+                    autoSimPending = false;
                     android.util.Log.w("StradaNav", "sin ruta: " + error);
                     toast(error != null ? error : "No se pudo calcular la ruta");
                     return;
@@ -6342,8 +7522,20 @@ public class Main extends Activity {
         Nav.activate(this, r);
         Nav.announceStart(this, r);
         LiveMapView.headingUp = true;
+        mapSyncHeading();
+        mapSyncRoute();
         updateNavHud();
-        if (liveMap != null) liveMap.invalidate();
+        if (autoSimPending) {
+            autoSimPending = false;
+            startNavSimulation();
+            return;
+        }
+        if (Nav.previewMode) {
+            mapSetOverview(true);
+            toast("Vista previa de ruta (sin GPS)");
+        } else {
+            mapRecenter();
+        }
         if (!r.incidents.isEmpty()) {
             toast(r.incidents.size() + " " + I18n.t(r.incidents.size() == 1 ? "incidente en la ruta" : "incidentes en la ruta"));
         } else if ("cache".equals(r.source)) {
@@ -6357,7 +7549,8 @@ public class Main extends Activity {
         final Nav.Route prevActive = Nav.active;
         Nav.active = routes.get(0);
         Nav.altRoutes = new ArrayList<Nav.Route>(routes.subList(1, routes.size()));
-        if (liveMap != null) liveMap.invalidate();
+        mapSyncRoute();
+        mapSetOverview(true);
 
         final boolean mph = useMph();
         BaseAdapter ad = new BaseAdapter() {
@@ -6397,20 +7590,22 @@ public class Main extends Activity {
             .setNegativeButton("Cancelar", new DialogInterface.OnClickListener() {
                 public void onClick(DialogInterface d, int w) {
                     if (!chosen[0]) {
+                        autoSimPending = false;
                         Nav.active = prevActive;
                         Nav.altRoutes = null;
+                        mapSyncRoute();
                         updateNavHud();
-                        if (liveMap != null) liveMap.invalidate();
                     }
                 }
             })
             .setOnCancelListener(new DialogInterface.OnCancelListener() {
                 public void onCancel(DialogInterface d) {
                     if (!chosen[0]) {
+                        autoSimPending = false;
                         Nav.active = prevActive;
                         Nav.altRoutes = null;
+                        mapSyncRoute();
                         updateNavHud();
-                        if (liveMap != null) liveMap.invalidate();
                     }
                 }
             })
@@ -6452,10 +7647,13 @@ public class Main extends Activity {
     }
 
     private void stopInternalNav() {
+        autoSimPending = false;
+        simLastOk = false;
         Nav.stop(this);
         LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+        mapSyncHeading();
+        mapSyncRoute();
         updateNavHud();
-        if (liveMap != null) liveMap.invalidate();
     }
 
     private void openNavMenu() {
@@ -6464,6 +7662,8 @@ public class Main extends Activity {
         final boolean voice = prefs.getBoolean("nav_voice", true);
         final boolean clockEta = prefs.getBoolean("nav_eta_clock", false);
         final boolean heading = LiveMapView.headingUp;
+        final boolean ovNow = mapIsOverview();
+        final boolean is3dNow = LiveMapView.view3d;
         final Nav.Place curDest = new Nav.Place();
         curDest.name = r.destName != null && r.destName.length() > 0
                 ? r.destName : String.format(java.util.Locale.US, "%.5f, %.5f", r.destLat, r.destLon);
@@ -6476,6 +7676,23 @@ public class Main extends Activity {
         if (!r.incidents.isEmpty()) {
             labels.add(I18n.t("Incidentes en la ruta") + " (" + r.incidents.size() + ")");
             actions.add(new Runnable() { public void run() { showIncidentsDialog(r); } });
+        }
+        labels.add(I18n.t("Lista de pasos"));
+        actions.add(new Runnable() { public void run() { openStepsSheet(); } });
+        labels.add(I18n.t(ovNow ? "Seguir mi ubicación" : "Vista general de ruta"));
+        actions.add(new Runnable() { public void run() { mapSetOverview(!ovNow); } });
+        if (!Nav.simulating) {
+            labels.add(I18n.t("Simular ruta"));
+            actions.add(new Runnable() { public void run() { startNavSimulation(); } });
+        } else {
+            labels.add(I18n.t(Nav.simPaused ? "Reanudar simulación" : "Pausar simulación"));
+            actions.add(new Runnable() {
+                public void run() { Nav.toggleSimPause(); updateNavHud(); }
+            });
+            labels.add(I18n.t("Detener simulación"));
+            actions.add(new Runnable() {
+                public void run() { Nav.stopSimulation(); simLastOk = false; showSpeed(); updateNavHud(); toast("Simulación detenida"); }
+            });
         }
         labels.add(I18n.t("Cambiar destino"));
         actions.add(new Runnable() { public void run() { openNavSearch(false); } });
@@ -6499,7 +7716,16 @@ public class Main extends Activity {
         actions.add(new Runnable() {
             public void run() {
                 LiveMapView.headingUp = !heading;
-                if (liveMap != null) liveMap.invalidate();
+                mapSyncHeading();
+            }
+        });
+        labels.add(I18n.t(is3dNow ? "Vista 2D" : "Vista 3D"));
+        actions.add(new Runnable() {
+            public void run() {
+                boolean next = !is3dNow;
+                prefs.edit().putBoolean("map_3d", next).apply();
+                LiveMapView.view3d = next;
+                mapSyncTilt();
             }
         });
         labels.add(I18n.t("Recalcular ruta"));
@@ -6737,6 +7963,8 @@ public class Main extends Activity {
     }
     private boolean obdSpeedDemo;
     private boolean speedFromObd;
+    private float simLastKmh;
+    private boolean simLastOk;
 
     private void showSpeed() {
         float ob = obdKmh();
@@ -6746,6 +7974,7 @@ public class Main extends Activity {
         float kmh = fromObd ? ob : lastKmh;
         float conv = useMph() ? kmh * 0.621371f : kmh;
         if (!fromObd) conv = speedFix(conv);      // la corrección del velocímetro es para el GPS
+        updateSpeedHudReadout();
         if (idleView != null) {
             float iv = conv;
             if (idleSpeedTv != null) idleSpeedTv.setText(ok ? String.valueOf(Math.round(kmh < 2 ? 0 : iv)) : "--");
@@ -6767,6 +7996,65 @@ public class Main extends Activity {
         gpsTv.setText(fromObd ? "OBD" : ok ? "GPS" : I18n.t(gs == 1 ? "Sin permiso" : gs == 2 ? "GPS apagado" : "Buscando GPS"));
         gpsDot.setBackground(round(ok ? 0xFF3DDC84 : MUTED, 4));
         updateMapTag();
+    }
+
+    private void updateSpeedHudReadout() {
+        if (speedHudBox == null) return;
+        if (Nav.active == null) {
+            speedHudBox.setVisibility(View.GONE);
+            return;
+        }
+        speedHudBox.setVisibility(View.VISIBLE);
+        boolean mph = useMph();
+        boolean fromSim = Nav.simulating && simLastOk;
+        float ob = obdKmh();
+        boolean fromObd = !fromSim && !Float.isNaN(ob);
+        boolean ok = fromSim || fromObd || lastOk;
+        float rawKmh = fromSim ? simLastKmh : (fromObd ? ob : lastKmh);
+        float conv = mph ? rawKmh * 0.621371f : rawKmh;
+        if (!fromObd && !fromSim) conv = speedFix(conv);
+        int dispSpeed = Math.round(rawKmh < 2 ? 0 : conv);
+
+        boolean over = Nav.speedingAlert && prefs.getBoolean("nav_speed_alert", true);
+        if (navCurSpeedTv != null) {
+            navCurSpeedTv.setText(ok ? String.valueOf(dispSpeed) : "--");
+            navCurSpeedTv.setTextColor(over ? 0xFFEF4444 : TEXT);
+        }
+        if (navCurUnitTv != null) {
+            navCurUnitTv.setText(mph ? "MPH" : "KM/H");
+            navCurUnitTv.setTextColor(over ? 0xFFEF4444 : MUTED);
+        }
+        boolean faroT = premium && Prem.faro();
+        GradientDrawable bg = round(faroT ? Faro.glass(LIGHT) : ((CARD & 0x00FFFFFF) | 0xEB000000), 16);
+        bg.setStroke(Math.max(1, (int) ((over ? 1.5f : 1f) * s)), over ? 0xAAEF4444 : (LIGHT ? 0x1F000000 : 0x24FFFFFF));
+        speedHudBox.setBackground(bg);
+
+        if (speedSignTv != null) {
+            if (Nav.curSpeedLimitKmh > 0 && prefs.getBoolean("nav_speed_alert", true)) {
+                int val = mph ? Math.max(5, (int) (Math.round((Nav.curSpeedLimitKmh / 1.60934) / 5.0) * 5)) : Nav.curSpeedLimitKmh;
+                GradientDrawable sg = new GradientDrawable();
+                sg.setShape(GradientDrawable.OVAL);
+                if (over) {
+                    sg.setColor(0xFFD92B2B);
+                    speedSignTv.setTextColor(Color.WHITE);
+                } else {
+                    sg.setColor(0xFFFDFDFE);
+                    sg.setStroke(Math.max(2, (int) (3.5f * s)), 0xFFD92B2B);
+                    speedSignTv.setTextColor(0xFF181A1F);
+                }
+                speedSignTv.setBackground(sg);
+                speedSignTv.setText(String.valueOf(val));
+            } else {
+                GradientDrawable sg = new GradientDrawable();
+                sg.setShape(GradientDrawable.OVAL);
+                sg.setColor(LIGHT ? 0xFFF3F4F6 : 0xFF232732);
+                sg.setStroke(Math.max(1, (int) (2.5f * s)), 0x77D92B2B);
+                speedSignTv.setBackground(sg);
+                speedSignTv.setTextColor(MUTED);
+                speedSignTv.setText("—");
+            }
+            speedSignTv.setVisibility(View.VISIBLE);
+        }
     }
 
     private View.OnClickListener mediaClick(final int code) {
@@ -9275,10 +10563,36 @@ public class Main extends Activity {
             edit("city_manual", "Ciudad (vacío = automática por GPS)", ""));
         LinearLayout mo = section(body, "Mapa");
         LinearLayout ml = mo, nv = mo;
+        segmented(mo, "Motor del mapa", "MapLibre GL JS ofrece 3D fluido; OpenStreetMap funciona como respaldo y automáticamente sin internet si tienes un archivo .map",
+            new String[]{"MapLibre 3D", "OpenStreetMap"}, "osm".equals(prefs.getString("map_engine", "maplibre")) ? 1 : 0,
+            new IntCb() { public void on(int i) {
+                prefs.edit().putString("map_engine", i == 1 ? "osm" : "maplibre").apply();
+                mapLibreFallback = false;
+                rebuild();
+                showSettings(settingsCat);
+            }});
         segmented(mo, "El mapa apunta", "Según tu dirección: gira con el carro mientras te mueves", new String[]{"Norte arriba", "Según tu dirección"},
             prefs.getBoolean("map_heading", false) ? 1 : 0, new IntCb() { public void on(int i) {
                 prefs.edit().putBoolean("map_heading", i == 1).apply(); LiveMapView.headingUp = i == 1;
-                if (liveMap != null) liveMap.invalidate(); showSettings(settingsCat);
+                mapSyncHeading(); showSettings(settingsCat);
+            }});
+        segmented(mo, "Modo del mapa", "3D: vista inclinada en perspectiva automática", new String[]{"2D", "3D"},
+            prefs.getBoolean("map_3d", false) ? 1 : 0, new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("map_3d", i == 1).apply();
+                LiveMapView.view3d = i == 1;
+                mapSyncTilt();
+                showSettings(settingsCat);
+            }});
+        int curAngle = prefs.getInt("map_angle", 45);
+        int angleIdx = curAngle <= 35 ? 0 : curAngle >= 55 ? 2 : 1;
+        segmented(mo, "Ángulo del mapa",
+            prefs.getBoolean("map_3d", false) ? "Inclinación de la cámara en modo 3D" : "Se aplica al activar el modo 3D",
+            new String[]{"30°", "45°", "60°"}, angleIdx, new IntCb() { public void on(int i) {
+                int deg = i == 0 ? 30 : i == 2 ? 60 : 45;
+                prefs.edit().putInt("map_angle", deg).apply();
+                LiveMapView.tiltAngle = deg;
+                mapSyncTilt();
+                showSettings(settingsCat);
             }});
         toggle(ml, "Mapa en vivo", "Apágalo si la pantalla va lenta: queda un mapa de adorno y el velocímetro sigue funcionando", prefs.getBoolean("map_live", true), new IntCb() { public void on(int i) {
             prefs.edit().putBoolean("map_live", i == 1).apply(); rebuild(); showSettings(settingsCat);
@@ -9315,6 +10629,19 @@ public class Main extends Activity {
             }});
             toggle(nvp, "Rutas alternativas", "Muestra 2 o 3 opciones de ruta antes de iniciar", prefs.getBoolean("nav_alternatives", true), new IntCb() { public void on(int i) {
                 prefs.edit().putBoolean("nav_alternatives", i == 1).apply(); showSettings(settingsCat);
+            }});
+            toggle(nvp, "Límite y alerta de velocidad", "Muestra la señal de límite en el mapa y avisa al excederlo", prefs.getBoolean("nav_speed_alert", true), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("nav_speed_alert", i == 1).apply(); updateNavHud(); showSettings(settingsCat);
+            }});
+            boolean waveAlertsOn = prefs.getBoolean("nav_speed_cams", true)
+                || prefs.getBoolean("nav_inc_alerts", true)
+                || prefs.getBoolean("nav_police_alerts", true);
+            toggle(nvp, "Alertas de radares, policía e incidentes", "Ondas y avisos al acercarse a radares, policía o incidentes", waveAlertsOn, new IntCb() { public void on(int i) {
+                boolean on = i == 1;
+                prefs.edit().putBoolean("nav_speed_cams", on).putBoolean("nav_inc_alerts", on)
+                    .putBoolean("nav_incidents", on).putBoolean("nav_police_alerts", on).apply();
+                updateNavHud();
+                showSettings(settingsCat);
             }});
             toggle(nvp, "Mostrar hora de llegada", "Muestra la hora estimada en lugar del tiempo restante", prefs.getBoolean("nav_eta_clock", false), new IntCb() { public void on(int i) {
                 prefs.edit().putBoolean("nav_eta_clock", i == 1).apply(); updateNavHud(); showSettings(settingsCat);
@@ -9514,7 +10841,7 @@ public class Main extends Activity {
     /** Ayuda: de dónde bajar un mapa .map y dónde ponerlo. */
     private void mapHowTo() {
         new TB(this, dlg()).setTitle("Mapa sin conexión")
-            .setMessage("1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa se usa en el inicio incluso con internet. Para actualizarlo, descarga uno nuevo y reemplaza el archivo.")
+            .setMessage("1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa sin conexión se activa automáticamente si no hay internet, o cuando eliges OSM en el mapa. Para actualizarlo, descarga uno nuevo y reemplaza el archivo.")
             .setPositiveButton("OK", null).show();
     }
 
@@ -9911,6 +11238,8 @@ public class Main extends Activity {
     private void reloadAll() {
         I18n.init(this, prefs);
         LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+        LiveMapView.view3d = prefs.getBoolean("map_3d", false);
+        LiveMapView.tiltAngle = prefs.getInt("map_angle", 45);
         applyThemeNow();
         applyAccent();
         try { lm.removeUpdates(odoListener); } catch (Throwable ignored) { }
@@ -10363,8 +11692,7 @@ public class Main extends Activity {
 
     private void refreshStates() {
         if (navSearchBtn != null) {
-            boolean showGo = prefs.getBoolean("map_live", true) && "internal".equals(prefs.getString("nav_app", null));
-            navSearchBtn.setVisibility(showGo ? View.VISIBLE : View.GONE);
+            navSearchBtn.setVisibility(View.VISIBLE);
         }
         if (aaBtnTv == null && cpSubTv == null) return;
         if (aaBtnTv != null) {   // 2.18: con «Solo CarPlay» no hay botón de Android Auto
@@ -10737,11 +12065,7 @@ public class Main extends Activity {
             }
             // si deja la navegación integrada, la ruta en curso se detiene (si no, el recuadro de guía quedaba en el mapa)
             if ("nav_app".equals(key) && !"internal".equals(prefs.getString("nav_app", null)) && Nav.active != null) {
-                Nav.stop(Main.this);
-                // sin esto el recuadro de guía seguía en el mapa hasta tocarlo (Andrés, Picanto 16 nov.)
-                LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
-                updateNavHud();
-                if (liveMap != null) liveMap.invalidate();
+                stopInternalNav();
             }
             refreshStates();
             if (after != null) after.run();
@@ -11726,5 +13050,110 @@ public class Main extends Activity {
         if ("panel".equals(action)) return new Runnable() { public void run() { openVehiclePanel(); } };
         if (action.startsWith("obd")) return obdGo(action);
         return null;
+    }
+
+    private static class WaveAlertView extends View {
+        private final float s;
+        private final float cornerPx;
+        private final Paint edgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path clipPath = new Path();
+        private final RectF bounds = new RectF();
+        private LinearGradient shTop, shBot, shLeft, shRight;
+        private LinearGradient shTopAlt, shBotAlt, shLeftAlt, shRightAlt;
+        private int lastW, lastH, lastColor;
+        private boolean lastPolice;
+        private boolean active, policeFlash;
+        private int alertColor = 0xFFEF4444;
+
+        WaveAlertView(Context c, float scale, float radiusPx) {
+            super(c);
+            s = scale;
+            cornerPx = radiusPx;
+            setClickable(false);
+            setFocusable(false);
+            setVisibility(View.GONE);
+            borderPaint.setStyle(Paint.Style.STROKE);
+            borderPaint.setStrokeWidth(Math.max(2f, 2.5f * scale));
+        }
+
+        void setAlert(boolean on, int color) {
+            setAlert(on, color, false);
+        }
+
+        void setAlert(boolean on, int color, boolean flashPolice) {
+            int col = color != 0 ? color : 0xFFEF4444;
+            if (active == on && alertColor == col && policeFlash == flashPolice) return;
+            active = on;
+            alertColor = col;
+            policeFlash = on && flashPolice;
+            setVisibility(on ? View.VISIBLE : View.GONE);
+            if (on) invalidate();
+        }
+
+        private LinearGradient[] buildEdges(int w, int h, float edge, int color) {
+            int rgb = color & 0x00FFFFFF;
+            int[] cols = new int[]{rgb | 0xA8000000, rgb | 0x33000000, rgb};
+            float[] pos = new float[]{0f, 0.45f, 1f};
+            return new LinearGradient[]{
+                new LinearGradient(0f, 0f, 0f, edge, cols, pos, Shader.TileMode.CLAMP),
+                new LinearGradient(0f, h, 0f, h - edge, cols, pos, Shader.TileMode.CLAMP),
+                new LinearGradient(0f, 0f, edge, 0f, cols, pos, Shader.TileMode.CLAMP),
+                new LinearGradient(w, 0f, w - edge, 0f, cols, pos, Shader.TileMode.CLAMP)
+            };
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            if (!active) return;
+            int w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+
+            float edge = Math.min(Math.min(w, h) * 0.14f, 44f * s);
+            if (w != lastW || h != lastH || alertColor != lastColor || policeFlash != lastPolice || shTop == null) {
+                lastW = w; lastH = h; lastColor = alertColor; lastPolice = policeFlash;
+                LinearGradient[] g1 = buildEdges(w, h, edge, policeFlash ? 0xFF2563EB : alertColor);
+                shTop = g1[0]; shBot = g1[1]; shLeft = g1[2]; shRight = g1[3];
+                if (policeFlash) {
+                    LinearGradient[] g2 = buildEdges(w, h, edge, 0xFFEF4444);
+                    shTopAlt = g2[0]; shBotAlt = g2[1]; shLeftAlt = g2[2]; shRightAlt = g2[3];
+                } else {
+                    shTopAlt = shBotAlt = shLeftAlt = shRightAlt = null;
+                }
+                bounds.set(0f, 0f, w, h);
+                clipPath.reset();
+                clipPath.addRoundRect(bounds, cornerPx, cornerPx, Path.Direction.CW);
+            }
+
+            long period = policeFlash ? 1400L : 1800L;
+            long tick = SystemClock.uptimeMillis() % period;
+            float phase = tick / (float) period;
+            float pulse = 0.40f + 0.60f * (0.5f - 0.5f * (float) Math.cos(phase * Math.PI * (policeFlash ? 4.0 : 2.0)));
+            int alpha = Math.max(45, Math.min(255, Math.round(215f * pulse)));
+            boolean swap = policeFlash && tick >= 700L;
+
+            c.save();
+            if (android.os.Build.VERSION.SDK_INT >= 18 || !c.isHardwareAccelerated()) c.clipPath(clipPath);
+            edgePaint.setAlpha(alpha);
+            edgePaint.setShader(swap ? shTopAlt : shTop);
+            c.drawRect(0f, 0f, w, edge, edgePaint);
+            edgePaint.setShader(swap ? shBot : shBotAlt != null ? shBotAlt : shBot);
+            c.drawRect(0f, h - edge, w, h, edgePaint);
+            edgePaint.setShader(swap ? shLeftAlt : shLeft);
+            c.drawRect(0f, 0f, edge, h, edgePaint);
+            edgePaint.setShader(swap ? shRight : shRightAlt != null ? shRightAlt : shRight);
+            c.drawRect(w - edge, 0f, w, h, edgePaint);
+
+            int rimColor = policeFlash ? (swap ? 0xFFEF4444 : 0xFF2563EB) : alertColor;
+            borderPaint.setColor((rimColor & 0x00FFFFFF) | (Math.round(185f * pulse) << 24));
+            float inset = borderPaint.getStrokeWidth() * 0.5f;
+            bounds.set(inset, inset, w - inset, h - inset);
+            c.drawRoundRect(bounds, cornerPx, cornerPx, borderPaint);
+            c.restore();
+
+            if (active && getVisibility() == View.VISIBLE) {
+                postInvalidateOnAnimation();
+            }
+        }
     }
 }

@@ -113,7 +113,8 @@ public class Net {
         if (c instanceof HttpsURLConnection && f != null) ((HttpsURLConnection) c).setSSLSocketFactory(f);
         c.setConnectTimeout(timeoutMs);
         c.setReadTimeout(timeoutMs);
-        c.setRequestProperty("User-Agent", "StradaOS/2.1 (Android head unit launcher)");
+        c.setRequestProperty("User-Agent", "StradaOS/2.32 (Android car launcher; https://github.com/ierfansagi-debug/StradaOS)");
+        c.setRequestProperty("Accept", "application/json, image/png, */*;q=0.8");
         try {
             int code = c.getResponseCode();
             if (code != 200) throw new Exception("HTTP " + code);

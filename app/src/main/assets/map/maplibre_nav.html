@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>StradaOS MapLibre</title>
+<style>
+  html, body, #map {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #15171C;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .maplibregl-ctrl-attrib, .maplibregl-ctrl-logo {
+    opacity: 0.55;
+    font-size: 9px !important;
+  }
+  .strada-pin-lbl {
+    background: rgba(24, 27, 34, 0.92);
+    color: #F2F3F5;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 12px;
+    white-space: nowrap;
+    max-width: 210px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.35);
+    pointer-events: none;
+  }
+  .strada-pin-lbl.light {
+    background: rgba(255, 255, 255, 0.95);
+    color: #14161B;
+    border: 1px solid rgba(0,0,0,0.08);
+  }
+</style>
+<link id="ml-css" rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"/>
+</head>
+<body>
+<div id="map"></div>
+<script>
+(function() {
+  var bridge = window.AndroidBridge || null;
+  function notifyFail(reason) {
+    try { if (bridge && bridge.onEngineFailed) bridge.onEngineFailed(String(reason || 'webgl')); } catch (e) {}
+  }
+  function notifyReady() {
+    try { if (bridge && bridge.onMapReady) bridge.onMapReady(); } catch (e) {}
+  }
+  function notifyFollow(f) {
+    try { if (bridge && bridge.onFollowChanged) bridge.onFollowChanged(!!f); } catch (e) {}
+  }
+  function notifyCamera(lat, lon, z) {
+    try { if (bridge && bridge.onCameraMoved) bridge.onCameraMoved(lat, lon, z); } catch (e) {}
+  }
+  function notifyPick(lat, lon) {
+    var now = Date.now();
+    if (now - state.lastPickAt < 650) return;
+    state.lastPickAt = now;
+    try { if (bridge && bridge.onMapPick) bridge.onMapPick(lat, lon); } catch (e) {}
+  }
+
+  var state = {
+    map: null,
+    isLight: false,
+    accent: '#E63946',
+    view3d: false,
+    tiltAngle: 45,
+    headingUp: false,
+    following: true,
+    overview: false,
+    carLat: NaN,
+    carLon: NaN,
+    carBearing: 0,
+    hasFix: false,
+    initLat: 4.7110,
+    initLon: -74.0721,
+    initZoom: 14.5,
+    preview: null,
+    previewPopup: null,
+    routeData: null,
+    styleLoaded: false,
+    rasterFallback: false,
+    lastPickAt: 0,
+    pendingTimers: [],
+    policeReports: [],
+    wave: { active: false, kind: 'radar', lat: NaN, lon: NaN, raf: null }
+  };
+
+  function hasWebGL() {
+    try {
+      var c = document.createElement('canvas');
+      return !!(window.WebGLRenderingContext && (c.getContext('webgl') || c.getContext('experimental-webgl') || c.getContext('webgl2')));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function styleUrlFor(light, useRaster) {
+    if (useRaster) {
+      return {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            attribution: '© OpenStreetMap contributors'
+          }
+        },
+        layers: [{ id: 'osm-tiles', type: 'raster', source: 'osm', minzoom: 0, maxzoom: 19 }]
+      };
+    }
+    return light ? 'https://tiles.openfreemap.org/styles/liberty' : 'https://tiles.openfreemap.org/styles/dark';
+  }
+
+  function ensureImages(map) {
+    if (!map.hasImage('car-puck')) {
+      var sz = 72;
+      var c = document.createElement('canvas');
+      c.width = sz; c.height = sz;
+      var ctx = c.getContext('2d');
+      var cx = sz / 2, cy = sz / 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 30, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(230, 57, 70, 0.24)';
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 22);
+      ctx.lineTo(cx + 16, cy + 16);
+      ctx.lineTo(cx, cy + 8);
+      ctx.lineTo(cx - 16, cy + 16);
+      ctx.closePath();
+      ctx.fillStyle = state.accent || '#E63946';
+      ctx.fill();
+      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.stroke();
+      map.addImage('car-puck', ctx.getImageData(0, 0, sz, sz));
+    }
+    if (!map.hasImage('preview-pin')) {
+      var w = 64, h = 80;
+      var c2 = document.createElement('canvas');
+      c2.width = w; c2.height = h;
+      var g = c2.getContext('2d');
+      g.beginPath();
+      g.ellipse(32, 71, 13, 5, 0, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(0,0,0,0.34)';
+      g.fill();
+      g.beginPath();
+      g.moveTo(32, 70);
+      g.lineTo(14, 38);
+      g.arc(32, 28, 19, Math.PI * 0.85, Math.PI * 0.15, false);
+      g.closePath();
+      g.fillStyle = state.accent || '#E63946';
+      g.fill();
+      g.lineWidth = 3;
+      g.strokeStyle = '#FFFFFF';
+      g.stroke();
+      g.beginPath();
+      g.arc(32, 28, 7, 0, Math.PI * 2);
+      g.fillStyle = '#FFFFFF';
+      g.fill();
+      map.addImage('preview-pin', g.getImageData(0, 0, w, h));
+    }
+  }
+
+  function add3dBuildings(map) {
+    try {
+      if (map.getLayer('strada-3d-buildings')) return;
+      var style = map.getStyle();
+      if (!style || !style.sources) return;
+      var vecSrc = null;
+      for (var k in style.sources) {
+        if (style.sources[k] && style.sources[k].type === 'vector') { vecSrc = k; break; }
+      }
+      if (!vecSrc) return;
+      var layers = style.layers || [];
+      var labelId;
+      for (var i = 0; i < layers.length; i++) {
+        if (layers[i].type === 'symbol' && layers[i].layout && layers[i].layout['text-field']) {
+          labelId = layers[i].id;
+          break;
+        }
+      }
+      map.addLayer({
+        id: 'strada-3d-buildings',
+        source: vecSrc,
+        'source-layer': 'building',
+        type: 'fill-extrusion',
+        minzoom: 14,
+        layout: { visibility: state.view3d ? 'visible' : 'none' },
+        paint: {
+          'fill-extrusion-color': state.isLight ? '#D4D9E2' : '#262B36',
+          'fill-extrusion-height': ['coalesce', ['get', 'render_height'], ['get', 'height'], 12],
+          'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], ['get', 'min_height'], 0],
+          'fill-extrusion-opacity': 0.72
+        }
+      }, labelId);
+    } catch (e) {}
+  }
+
+  function setupDataLayers(map) {
+    ensureImages(map);
+    add3dBuildings(map);
+    var emptyFC = { type: 'FeatureCollection', features: [] };
+
+    if (!map.getSource('alt-routes')) {
+      map.addSource('alt-routes', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'alt-routes-line',
+        type: 'line',
+        source: 'alt-routes',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': state.isLight ? '#64748B' : '#94A3B8',
+          'line-width': 5,
+          'line-opacity': 0.65,
+          'line-dasharray': [2, 1.5]
+        }
+      });
+    }
+
+    if (!map.getSource('active-route')) {
+      map.addSource('active-route', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'active-route-casing',
+        type: 'line',
+        source: 'active-route',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': state.isLight ? '#1E293B' : '#090A0D',
+          'line-width': 11,
+          'line-opacity': 0.78
+        }
+      });
+      map.addLayer({
+        id: 'active-route-line',
+        type: 'line',
+        source: 'active-route',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': state.accent || '#E63946',
+          'line-width': 6.5
+        }
+      });
+    }
+
+    if (!map.getSource('route-points')) {
+      map.addSource('route-points', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'route-waypoints',
+        type: 'circle',
+        source: 'route-points',
+        filter: ['==', ['get', 'kind'], 'waypoint'],
+        paint: { 'circle-radius': 7, 'circle-color': '#F5A623', 'circle-stroke-width': 2.5, 'circle-stroke-color': '#FFFFFF' }
+      });
+      map.addLayer({
+        id: 'route-cameras',
+        type: 'circle',
+        source: 'route-points',
+        filter: ['==', ['get', 'kind'], 'camera'],
+        paint: { 'circle-radius': 6, 'circle-color': '#E63946', 'circle-stroke-width': 2, 'circle-stroke-color': '#FFFFFF' }
+      });
+      map.addLayer({
+        id: 'route-incidents',
+        type: 'circle',
+        source: 'route-points',
+        filter: ['==', ['get', 'kind'], 'incident'],
+        paint: { 'circle-radius': 7, 'circle-color': '#F59E0B', 'circle-stroke-width': 2, 'circle-stroke-color': '#181B22' }
+      });
+      map.addLayer({
+        id: 'route-dest',
+        type: 'circle',
+        source: 'route-points',
+        filter: ['==', ['get', 'kind'], 'dest'],
+        paint: { 'circle-radius': 9, 'circle-color': state.accent || '#E63946', 'circle-stroke-width': 3, 'circle-stroke-color': '#FFFFFF' }
+      });
+    }
+
+    if (!map.getSource('alert-wave-src')) {
+      map.addSource('alert-wave-src', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'alert-wave-outer',
+        type: 'circle',
+        source: 'alert-wave-src',
+        paint: {
+          'circle-radius': ['get', 'r1'],
+          'circle-color': ['get', 'col1'],
+          'circle-opacity': ['get', 'o1'],
+          'circle-stroke-width': 2.5,
+          'circle-stroke-color': ['get', 'col1'],
+          'circle-stroke-opacity': ['get', 'so1'],
+          'circle-pitch-alignment': 'map'
+        }
+      });
+      map.addLayer({
+        id: 'alert-wave-inner',
+        type: 'circle',
+        source: 'alert-wave-src',
+        paint: {
+          'circle-radius': ['get', 'r2'],
+          'circle-color': ['get', 'col2'],
+          'circle-opacity': ['get', 'o2'],
+          'circle-stroke-width': 2.0,
+          'circle-stroke-color': ['get', 'col2'],
+          'circle-stroke-opacity': ['get', 'so2'],
+          'circle-pitch-alignment': 'map'
+        }
+      });
+    }
+
+    if (!map.getSource('police-reports-src')) {
+      map.addSource('police-reports-src', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'police-reports-layer',
+        type: 'circle',
+        source: 'police-reports-src',
+        paint: {
+          'circle-radius': 8.5,
+          'circle-color': '#2563EB',
+          'circle-stroke-width': 2.8,
+          'circle-stroke-color': '#FFFFFF'
+        }
+      });
+    }
+
+    if (!map.getSource('preview-pin-src')) {
+      map.addSource('preview-pin-src', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'preview-pin-layer',
+        type: 'symbol',
+        source: 'preview-pin-src',
+        layout: {
+          'icon-image': 'preview-pin',
+          'icon-size': 0.72,
+          'icon-anchor': 'bottom',
+          'icon-allow-overlap': true
+        }
+      });
+    }
+
+    if (!map.getSource('car-src')) {
+      map.addSource('car-src', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'car-layer',
+        type: 'symbol',
+        source: 'car-src',
+        layout: {
+          'icon-image': 'car-puck',
+          'icon-size': 0.72,
+          'icon-rotate': ['get', 'bearing'],
+          'icon-rotation-alignment': 'map',
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true
+        }
+      });
+    }
+
+    syncRouteLayers();
+    syncPoliceLayer();
+    syncPreviewLayer();
+    syncCarLayer();
+    syncWaveLoop();
+  }
+
+  function syncRouteLayers() {
+    var map = state.map;
+    if (!map || !state.styleLoaded) return;
+    var emptyFC = { type: 'FeatureCollection', features: [] };
+    var rd = state.routeData;
+    var sAlt = map.getSource('alt-routes');
+    var sAct = map.getSource('active-route');
+    var sPts = map.getSource('route-points');
+    if (!sAlt || !sAct || !sPts) return;
+    if (!rd || !rd.pts || rd.pts.length < 4) {
+      sAlt.setData(emptyFC);
+      sAct.setData(emptyFC);
+      sPts.setData(emptyFC);
+      return;
+    }
+    var altFeats = [];
+    if (rd.alts && rd.alts.length) {
+      for (var ai = 0; ai < rd.alts.length; ai++) {
+        var ap = rd.alts[ai];
+        if (!ap || ap.length < 4) continue;
+        var ac = [];
+        for (var k = 0; k < ap.length; k += 2) ac.push([ap[k + 1], ap[k]]);
+        altFeats.push({ type: 'Feature', geometry: { type: 'LineString', coordinates: ac } });
+      }
+    }
+    sAlt.setData({ type: 'FeatureCollection', features: altFeats });
+
+    var coords = [];
+    for (var i = 0; i < rd.pts.length; i += 2) coords.push([rd.pts[i + 1], rd.pts[i]]);
+    sAct.setData({ type: 'FeatureCollection', features: [{ type: 'Feature', geometry: { type: 'LineString', coordinates: coords } }] });
+
+    var pFeats = [];
+    if (rd.waypoints) {
+      for (var wi = 0; wi < rd.waypoints.length; wi++) {
+        pFeats.push({ type: 'Feature', properties: { kind: 'waypoint' }, geometry: { type: 'Point', coordinates: [rd.waypoints[wi].lon, rd.waypoints[wi].lat] } });
+      }
+    }
+    if (rd.cameras) {
+      for (var ci = 0; ci < rd.cameras.length; ci++) {
+        pFeats.push({ type: 'Feature', properties: { kind: 'camera' }, geometry: { type: 'Point', coordinates: [rd.cameras[ci].lon, rd.cameras[ci].lat] } });
+      }
+    }
+    if (rd.incidents) {
+      for (var ii = 0; ii < rd.incidents.length; ii++) {
+        pFeats.push({ type: 'Feature', properties: { kind: 'incident' }, geometry: { type: 'Point', coordinates: [rd.incidents[ii].lon, rd.incidents[ii].lat] } });
+      }
+    }
+    if (!isNaN(rd.destLat) && !isNaN(rd.destLon)) {
+      pFeats.push({ type: 'Feature', properties: { kind: 'dest' }, geometry: { type: 'Point', coordinates: [rd.destLon, rd.destLat] } });
+    }
+    sPts.setData({ type: 'FeatureCollection', features: pFeats });
+  }
+
+  function syncPreviewLayer() {
+    var map = state.map;
+    if (!map || !state.styleLoaded) return;
+    var src = map.getSource('preview-pin-src');
+    if (!src) return;
+    if (state.previewPopup) {
+      try { state.previewPopup.remove(); } catch (e) {}
+      state.previewPopup = null;
+    }
+    if (!state.preview) {
+      src.setData({ type: 'FeatureCollection', features: [] });
+      return;
+    }
+    src.setData({
+      type: 'FeatureCollection',
+      features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: [state.preview.lon, state.preview.lat] } }]
+    });
+    if (state.preview.name) {
+      var el = document.createElement('div');
+      el.className = 'strada-pin-lbl' + (state.isLight ? ' light' : '');
+      el.textContent = state.preview.name;
+      state.previewPopup = new maplibregl.Marker({ element: el, anchor: 'bottom', offset: [0, -56] })
+        .setLngLat([state.preview.lon, state.preview.lat])
+        .addTo(map);
+    }
+  }
+
+  function syncCarLayer() {
+    var map = state.map;
+    if (!map || !state.styleLoaded) return;
+    var src = map.getSource('car-src');
+    if (!src) return;
+    if (!state.hasFix || isNaN(state.carLat) || isNaN(state.carLon)) {
+      src.setData({ type: 'FeatureCollection', features: [] });
+      return;
+    }
+    src.setData({
+      type: 'FeatureCollection',
+      features: [{
+        type: 'Feature',
+        properties: { bearing: state.carBearing || 0 },
+        geometry: { type: 'Point', coordinates: [state.carLon, state.carLat] }
+      }]
+    });
+  }
+
+  function syncPoliceLayer() {
+    var map = state.map;
+    if (!map || !state.styleLoaded) return;
+    var src = map.getSource('police-reports-src');
+    if (!src) return;
+    var list = state.policeReports || [];
+    var feats = [];
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i];
+      if (!p || isNaN(p.lat) || isNaN(p.lon)) continue;
+      feats.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [p.lon, p.lat] } });
+    }
+    src.setData({ type: 'FeatureCollection', features: feats });
+  }
+
+  function syncWaveLoop() {
+    if (state.wave.raf) {
+      cancelAnimationFrame(state.wave.raf);
+      state.wave.raf = null;
+    }
+    var map = state.map;
+    if (!map || !state.styleLoaded) return;
+    var src = map.getSource('alert-wave-src');
+    if (!src) return;
+    if (!state.wave.active || isNaN(state.wave.lat) || isNaN(state.wave.lon)) {
+      src.setData({ type: 'FeatureCollection', features: [] });
+      return;
+    }
+    function tickWave(ts) {
+      if (!state.wave.active || !state.map || !state.styleLoaded) {
+        state.wave.raf = null;
+        return;
+      }
+      var s = state.map.getSource('alert-wave-src');
+      if (s) {
+        var period = state.wave.kind === 'police' ? 1400 : 1700;
+        var p1 = (ts % period) / period;
+        var p2 = ((ts + period * 0.5) % period) / period;
+        var col1 = state.wave.kind === 'police' ? '#2563EB' : state.wave.kind === 'radar' ? '#EF4444' : '#F59E0B';
+        var col2 = state.wave.kind === 'police' ? '#EF4444' : col1;
+        s.setData({
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            properties: {
+              col1: col1,
+              col2: col2,
+              r1: 10 + p1 * 50,
+              o1: (1 - p1) * 0.22,
+              so1: (1 - p1) * 0.90,
+              r2: 10 + p2 * 50,
+              o2: (1 - p2) * 0.22,
+              so2: (1 - p2) * 0.90
+            },
+            geometry: { type: 'Point', coordinates: [state.wave.lon, state.wave.lat] }
+          }]
+        });
+      }
+      state.wave.raf = requestAnimationFrame(tickWave);
+    }
+    state.wave.raf = requestAnimationFrame(tickWave);
+  }
+
+  function desiredPitch() {
+    return (state.view3d && !state.overview) ? Math.max(0, Math.min(60, state.tiltAngle || 45)) : 0;
+  }
+
+  function applyCameraFollow(dur) {
+    var map = state.map;
+    if (!map || !state.following || state.overview || state.preview || !state.hasFix) return;
+    var pitch = desiredPitch();
+    var br = (state.headingUp && !isNaN(state.carBearing)) ? state.carBearing : 0;
+    var h = map.getContainer().clientHeight || 400;
+    map.easeTo({
+      center: [state.carLon, state.carLat],
+      pitch: pitch,
+      bearing: br,
+      padding: pitch > 0 ? { top: Math.round(h * 0.25), bottom: 20, left: 0, right: 0 } : { top: 0, bottom: 0, left: 0, right: 0 },
+      duration: dur || 450,
+      essential: true
+    });
+  }
+
+  function initMap() {
+    if (!hasWebGL() || typeof maplibregl === 'undefined') {
+      notifyFail('no_webgl_or_lib');
+      return;
+    }
+    try {
+      document.body.style.background = state.isLight ? '#E8EBF0' : '#15171C';
+      var map = new maplibregl.Map({
+        container: 'map',
+        style: styleUrlFor(state.isLight, state.rasterFallback),
+        center: [state.initLon, state.initLat],
+        zoom: state.initZoom,
+        pitch: desiredPitch(),
+        bearing: 0,
+        attributionControl: true
+      });
+      state.map = map;
+
+      map.on('style.load', function() {
+        state.styleLoaded = true;
+        setupDataLayers(map);
+      });
+
+      map.on('error', function(ev) {
+        if (!state.styleLoaded && !state.rasterFallback) {
+          state.rasterFallback = true;
+          try { map.setStyle(styleUrlFor(state.isLight, true)); } catch (e) { notifyFail('style_err'); }
+        }
+      });
+
+      function onManualMove(e) {
+        if (e && e.originalEvent) {
+          if (state.following || state.overview) {
+            state.following = false;
+            state.overview = false;
+            notifyFollow(false);
+          }
+        }
+      }
+      map.on('dragstart', onManualMove);
+      map.on('rotatestart', onManualMove);
+      map.on('pitchstart', onManualMove);
+
+      map.on('moveend', function() {
+        var c = map.getCenter();
+        notifyCamera(c.lat, c.lng, map.getZoom());
+      });
+
+      map.on('click', function(e) {
+        if (e && e.lngLat) notifyPick(e.lngLat.lat, e.lngLat.lng);
+      });
+      map.on('contextmenu', function(e) {
+        if (e && e.lngLat) notifyPick(e.lngLat.lat, e.lngLat.lng);
+      });
+
+      // Touch long-press helper for Android WebViews where contextmenu is suppressed
+      var holdTimer = null, holdStart = null;
+      var canvas = map.getCanvas();
+      canvas.addEventListener('touchstart', function(ev) {
+        if (ev.touches && ev.touches.length === 1) {
+          var t = ev.touches[0];
+          holdStart = { x: t.clientX, y: t.clientY };
+          clearTimeout(holdTimer);
+          holdTimer = setTimeout(function() {
+            if (!holdStart || !state.map) return;
+            var rect = canvas.getBoundingClientRect();
+            var ll = state.map.unproject([holdStart.x - rect.left, holdStart.y - rect.top]);
+            notifyPick(ll.lat, ll.lng);
+            holdStart = null;
+          }, 520);
+        } else {
+          clearTimeout(holdTimer);
+          holdStart = null;
+        }
+      }, { passive: true });
+      canvas.addEventListener('touchmove', function(ev) {
+        if (!holdStart || !ev.touches || !ev.touches.length) return;
+        var t = ev.touches[0];
+        if (Math.hypot(t.clientX - holdStart.x, t.clientY - holdStart.y) > 12) {
+          clearTimeout(holdTimer);
+          holdStart = null;
+        }
+      }, { passive: true });
+      canvas.addEventListener('touchend', function() { clearTimeout(holdTimer); holdStart = null; }, { passive: true });
+      canvas.addEventListener('touchcancel', function() { clearTimeout(holdTimer); holdStart = null; }, { passive: true });
+
+      notifyReady();
+    } catch (err) {
+      notifyFail(err && err.message ? err.message : 'map_init_err');
+    }
+  }
+
+  window.StradaMap = {
+    setTheme: function(isLight, accentHex) {
+      var changed = state.isLight !== !!isLight;
+      state.isLight = !!isLight;
+      if (accentHex) state.accent = accentHex;
+      document.body.style.background = state.isLight ? '#E8EBF0' : '#15171C';
+      if (state.map && changed) {
+        state.styleLoaded = false;
+        state.map.setStyle(styleUrlFor(state.isLight, state.rasterFallback));
+      }
+    },
+    setInitialCenter: function(lat, lon, zoom) {
+      if (isNaN(lat) || isNaN(lon)) return;
+      state.initLat = lat; state.initLon = lon;
+      if (zoom) state.initZoom = zoom;
+      if (state.map && !state.hasFix && !state.preview) {
+        state.map.jumpTo({ center: [lon, lat], zoom: state.initZoom });
+      }
+    },
+    setTiltConfig: function(view3d, tiltAngle) {
+      state.view3d = !!view3d;
+      state.tiltAngle = tiltAngle || 45;
+      if (!state.map) return;
+      if (state.map.getLayer('strada-3d-buildings')) {
+        state.map.setLayoutProperty('strada-3d-buildings', 'visibility', state.view3d ? 'visible' : 'none');
+      }
+      if (!state.overview) {
+        state.map.easeTo({ pitch: desiredPitch(), duration: 380 });
+      }
+    },
+    setHeadingUp: function(h) {
+      state.headingUp = !!h;
+      if (state.following && !state.overview) applyCameraFollow(380);
+    },
+    setPosition: function(lat, lon, bearing, speedKmh, hasFix) {
+      state.hasFix = !!hasFix;
+      if (isNaN(lat) || isNaN(lon)) return;
+      state.carLat = lat;
+      state.carLon = lon;
+      if (!isNaN(bearing)) state.carBearing = bearing;
+      syncCarLayer();
+      if (state.following && !state.overview && !state.preview) {
+        var zoom = state.map ? state.map.getZoom() : 15.8;
+        if (!state.userZoomed && speedKmh > 0) {
+          var targetZ = speedKmh > 70 ? 14.8 : speedKmh > 35 ? 15.7 : 16.5;
+          if (Math.abs(zoom - targetZ) > 0.35 && state.map) state.map.setZoom(targetZ);
+        }
+        applyCameraFollow(420);
+      }
+    },
+    setPreviewPlace: function(lat, lon, name) {
+      state.preview = { lat: lat, lon: lon, name: name || '' };
+      state.following = false;
+      state.overview = false;
+      notifyFollow(false);
+      syncPreviewLayer();
+      if (state.map) {
+        state.map.flyTo({
+          center: [lon, lat],
+          zoom: Math.max(15.2, state.map.getZoom() || 15.5),
+          pitch: desiredPitch(),
+          bearing: 0,
+          duration: 600
+        });
+      }
+    },
+    clearPreview: function(snapBack) {
+      state.preview = null;
+      syncPreviewLayer();
+      if (snapBack) this.recenter();
+    },
+    setRoute: function(rd) {
+      state.routeData = rd;
+      syncRouteLayers();
+    },
+    setOverview: function(enabled) {
+      state.overview = !!enabled;
+      if (!state.map) return;
+      if (state.overview && state.routeData && state.routeData.pts && state.routeData.pts.length >= 4) {
+        state.following = false;
+        notifyFollow(false);
+        var pts = state.routeData.pts;
+        var minLa = 90, maxLa = -90, minLo = 180, maxLo = -180;
+        for (var i = 0; i < pts.length; i += 2) {
+          var la = pts[i], lo = pts[i + 1];
+          if (la < minLa) minLa = la; if (la > maxLa) maxLa = la;
+          if (lo < minLo) minLo = lo; if (lo > maxLo) maxLo = lo;
+        }
+        if (state.hasFix && !isNaN(state.carLat) && !isNaN(state.carLon)) {
+          if (state.carLat < minLa) minLa = state.carLat; if (state.carLat > maxLa) maxLa = state.carLat;
+          if (state.carLon < minLo) minLo = state.carLon; if (state.carLon > maxLo) maxLo = state.carLon;
+        }
+        state.map.fitBounds([[minLo, minLa], [maxLo, maxLa]], {
+          padding: { top: 90, bottom: 110, left: 44, right: 56 },
+          pitch: 0,
+          bearing: 0,
+          maxZoom: 16,
+          duration: 550
+        });
+      } else {
+        this.recenter();
+      }
+    },
+    recenter: function() {
+      state.preview = null;
+      state.overview = false;
+      state.following = true;
+      state.userZoomed = false;
+      syncPreviewLayer();
+      notifyFollow(true);
+      if (!state.map) return;
+      if (state.hasFix && !isNaN(state.carLat) && !isNaN(state.carLon)) {
+        state.map.easeTo({
+          center: [state.carLon, state.carLat],
+          zoom: 16.0,
+          pitch: desiredPitch(),
+          bearing: state.headingUp ? state.carBearing : 0,
+          duration: 500
+        });
+      } else {
+        state.map.easeTo({
+          center: [state.initLon, state.initLat],
+          zoom: 14.5,
+          pitch: desiredPitch(),
+          bearing: 0,
+          duration: 500
+        });
+      }
+    },
+    focusPoint: function(lat, lon, zoom) {
+      if (!state.map || isNaN(lat) || isNaN(lon)) return;
+      state.following = false;
+      state.overview = false;
+      notifyFollow(false);
+      state.map.flyTo({
+        center: [lon, lat],
+        zoom: zoom || 16.2,
+        pitch: desiredPitch(),
+        duration: 500
+      });
+    },
+    zoomBy: function(delta) {
+      if (!state.map) return;
+      state.userZoomed = true;
+      state.map.easeTo({ zoom: Math.max(3, Math.min(19, state.map.getZoom() + delta)), duration: 220 });
+    },
+    setWaveAlert: function(active, kind, lat, lon) {
+      state.wave.active = !!active;
+      state.wave.kind = kind || 'radar';
+      state.wave.lat = isNaN(lat) ? NaN : lat;
+      state.wave.lon = isNaN(lon) ? NaN : lon;
+      syncWaveLoop();
+    },
+    setPoliceReports: function(list) {
+      state.policeReports = Array.isArray(list) ? list : [];
+      syncPoliceLayer();
+    }
+  };
+
+  function loadScript(src, onOk, onErr) {
+    var sc = document.createElement('script');
+    sc.src = src;
+    sc.async = true;
+    sc.onload = onOk;
+    sc.onerror = onErr;
+    document.head.appendChild(sc);
+  }
+
+  if (!hasWebGL()) {
+    notifyFail('webgl_unsupported');
+    return;
+  }
+
+  var css = document.getElementById('ml-css');
+  css.onerror = function() {
+    var altCss = document.createElement('link');
+    altCss.rel = 'stylesheet';
+    altCss.href = 'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css';
+    document.head.appendChild(altCss);
+  };
+
+  loadScript('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js', initMap, function() {
+    loadScript('https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js', initMap, function() {
+      notifyFail('cdn_load_failed');
+    });
+  });
+})();
+</script>
+</body>
+</html>

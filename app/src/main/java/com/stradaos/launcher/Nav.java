@@ -80,6 +80,7 @@ public class Nav {
 
     public static class Incident {
         public double lat, lon;
+        public double alongM = -1;
         public int category, delayS;
         public String desc;
     }
@@ -87,6 +88,12 @@ public class Nav {
     public static class Camera {
         public double lat, lon, alongM;
         public int maxSpeedKmh;
+    }
+
+    public static class PoliceReport {
+        public String id, label;
+        public double lat, lon, alongM = -1;
+        public long reportedAtMs;
     }
 
     public static class Step {
@@ -130,6 +137,19 @@ public class Nav {
     public static volatile boolean speedingAlert;
     public static volatile Camera nearbyCamera;
     public static volatile double nearbyCameraDistM;
+    public static volatile Incident nearbyIncident;
+    public static volatile double nearbyIncidentDistM;
+    public static volatile PoliceReport nearbyPolice;
+    public static volatile double nearbyPoliceDistM;
+    public static final long POLICE_TTL_MS = 45L * 60L * 1000L;
+    public static final List<PoliceReport> policeReports = new ArrayList<PoliceReport>();
+    private static boolean policeLoaded;
+    private static String lastPoliceId;
+    private static long lastPoliceChimeAt;
+    public static volatile boolean previewMode;
+    public static volatile boolean simulating;
+    public static volatile boolean simPaused;
+    public static volatile double simSpeedMult = 1.0;
     public static boolean savedHeadingUp;
 
     private static volatile int routeGen;
@@ -142,9 +162,14 @@ public class Nav {
     private static long lastSpeedChimeAt;
     private static long lastCamChimeAt;
     private static int lastCamIdx = -1;
+    private static long lastIncChimeAt;
+    private static int lastIncIdx = -1;
     private static volatile boolean osrmNoMaxspeed;
     private static volatile boolean osrmNoExclude;
     private static final Handler UI = new Handler(Looper.getMainLooper());
+    private static int simPtIdx;
+    private static double simSegProgress;
+    private static Runnable simTicker;
 
     private static TextToSpeech tts;
     private static boolean ttsReady;
@@ -212,9 +237,18 @@ public class Nav {
                     }
                     if (out == null || out.isEmpty()) {
                         try {
-                            List<Place> nom = searchNominatim(app, q);
+                            List<Place> nom = searchNominatim(app, q, biasLat, biasLon);
                             if (nom != null && !nom.isEmpty()) { out = nom; err = null; }
                             else if (out == null) out = nom;
+                        } catch (Throwable e) {
+                            if (err == null) err = shortErr(e);
+                        }
+                    }
+                    if (out == null || out.isEmpty()) {
+                        try {
+                            List<Place> om = searchOpenMeteo(app, q, biasLat, biasLon);
+                            if (om != null && !om.isEmpty()) { out = om; err = null; }
+                            else if (out == null) out = om;
                         } catch (Throwable e) {
                             if (err == null) err = shortErr(e);
                         }
@@ -235,9 +269,55 @@ public class Nav {
 
     public static void searchCategory(final String cat, final double biasLat, final double biasLon,
                                       final boolean mph, final SearchCb cb) {
+        searchCategory(null, cat, biasLat, biasLon, mph, cb);
+    }
+
+    public static void searchCategory(final Context c, final String cat, final double biasLat, final double biasLon,
+                                      final boolean mph, final SearchCb cb) {
+        final Context app = c != null ? c.getApplicationContext() : null;
         new Thread(new Runnable() {
             public void run() {
-                final List<Place> out = searchOfflineMap(null, cat, biasLat, biasLon, mph, 12);
+                if (app != null) Net.init(app);
+                List<Place> out = searchOfflineMap(null, cat, biasLat, biasLon, mph, 12);
+                String err = null;
+                if ((out == null || out.isEmpty()) && hasNetwork(app) && !Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
+                    try {
+                        List<Place> online = searchOnlineCategory(app, cat, biasLat, biasLon);
+                        if (online != null && !online.isEmpty()) out = online;
+                    } catch (Throwable e) {
+                        err = shortErr(e);
+                    }
+                }
+                final List<Place> fout = out;
+                final String ferr = fout == null ? err : null;
+                UI.post(new Runnable() {
+                    public void run() { cb.onResult(fout, ferr); }
+                });
+            }
+        }).start();
+    }
+
+    public static void reverseGeocode(final Context c, final double lat, final double lon, final SearchCb cb) {
+        final Context app = c != null ? c.getApplicationContext() : null;
+        new Thread(new Runnable() {
+            public void run() {
+                if (app != null) Net.init(app);
+                Place resolved = null;
+                if (hasNetwork(app)) {
+                    try { resolved = reversePhoton(app, lat, lon); } catch (Throwable ignored) { }
+                    if (resolved == null) {
+                        try { resolved = reverseNominatim(app, lat, lon); } catch (Throwable ignored) { }
+                    }
+                }
+                if (resolved == null) {
+                    resolved = new Place();
+                    resolved.lat = lat;
+                    resolved.lon = lon;
+                    resolved.name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
+                    resolved.sub = I18n.t("Punto en el mapa");
+                }
+                final List<Place> out = new ArrayList<Place>(1);
+                out.add(resolved);
                 UI.post(new Runnable() {
                     public void run() { cb.onResult(out, null); }
                 });
@@ -304,7 +384,7 @@ public class Nav {
     }
 
     private static List<Place> searchPhoton(Context c, String q, double biasLat, double biasLon) throws Exception {
-        StringBuilder url = new StringBuilder("https://photon.komoot.io/api/?limit=6&q=");
+        StringBuilder url = new StringBuilder("https://photon.komoot.io/api/?limit=8&q=");
         url.append(URLEncoder.encode(q, "UTF-8"));
         if ("en".equals(I18n.lang) || "de".equals(I18n.lang) || "fr".equals(I18n.lang) || "it".equals(I18n.lang)) {
             url.append("&lang=").append(I18n.lang);
@@ -312,7 +392,7 @@ public class Nav {
         if (!Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
             url.append(String.format(Locale.US, "&lat=%.4f&lon=%.4f", biasLat, biasLon));
         }
-        String raw = new String(navGet(c, url.toString(), 10000), "UTF-8");
+        String raw = new String(navGet(c, url.toString(), 9000), "UTF-8");
         JSONObject root = new JSONObject(raw);
         JSONArray feats = root.optJSONArray("features");
         List<Place> out = new ArrayList<Place>();
@@ -327,33 +407,66 @@ public class Nav {
             double lat = coords.optDouble(1, Double.NaN);
             if (Double.isNaN(lat) || Double.isNaN(lon)) continue;
             JSONObject pr = f.optJSONObject("properties");
-            String name = pr != null ? pr.optString("name", "").trim() : "";
-            String street = pr != null ? pr.optString("street", "").trim() : "";
-            String num = pr != null ? pr.optString("housenumber", "").trim() : "";
-            if (name.length() == 0 && street.length() > 0) {
-                name = num.length() > 0 ? street + " " + num : street;
-                street = "";
-            }
-            if (name.length() == 0) name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
-            StringBuilder sub = new StringBuilder();
-            if (street.length() > 0 && !street.equals(name)) sub.append(num.length() > 0 ? street + " " + num : street);
-            appendPart(sub, pr != null ? firstNonEmpty(pr.optString("city", ""), pr.optString("town", ""), pr.optString("village", ""), pr.optString("county", "")) : "");
-            appendPart(sub, pr != null ? pr.optString("state", "") : "");
-            appendPart(sub, pr != null ? pr.optString("country", "") : "");
-            Place p = new Place();
-            p.name = name;
-            p.sub = sub.toString();
-            p.lat = lat;
-            p.lon = lon;
+            Place p = placeFromPhotonProps(pr, lat, lon);
             if (!dupPlace(out, p)) out.add(p);
         }
         return out;
     }
 
-    private static List<Place> searchNominatim(Context c, String q) throws Exception {
-        String url = "https://nominatim.openstreetmap.org/search?format=json&limit=6&addressdetails=1&q="
-                + URLEncoder.encode(q, "UTF-8") + "&accept-language=" + URLEncoder.encode(I18n.lang, "UTF-8");
-        String raw = new String(navGet(c, url, 10000), "UTF-8");
+    private static Place placeFromPhotonProps(JSONObject pr, double lat, double lon) {
+        String name = pr != null ? pr.optString("name", "").trim() : "";
+        String street = pr != null ? pr.optString("street", "").trim() : "";
+        String num = pr != null ? pr.optString("housenumber", "").trim() : "";
+        if (name.length() == 0 && street.length() > 0) {
+            name = num.length() > 0 ? street + " " + num : street;
+            street = "";
+        }
+        if (name.length() == 0) name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
+        StringBuilder sub = new StringBuilder();
+        if (street.length() > 0 && !street.equals(name)) sub.append(num.length() > 0 ? street + " " + num : street);
+        appendPart(sub, pr != null ? firstNonEmpty(pr.optString("city", ""), pr.optString("town", ""), pr.optString("village", ""), pr.optString("county", "")) : "");
+        appendPart(sub, pr != null ? pr.optString("state", "") : "");
+        appendPart(sub, pr != null ? pr.optString("country", "") : "");
+        Place p = new Place();
+        p.name = name;
+        p.sub = sub.toString();
+        p.lat = lat;
+        p.lon = lon;
+        return p;
+    }
+
+    private static List<Place> searchNominatim(Context c, String q, double biasLat, double biasLon) throws Exception {
+        StringBuilder url = new StringBuilder("https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&addressdetails=1&q=");
+        url.append(URLEncoder.encode(q, "UTF-8")).append("&accept-language=").append(URLEncoder.encode(I18n.lang, "UTF-8"));
+        if (!Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
+            url.append(String.format(Locale.US, "&viewbox=%.4f,%.4f,%.4f,%.4f",
+                    biasLon - 0.55, biasLat + 0.55, biasLon + 0.55, biasLat - 0.55));
+        }
+        String raw = new String(navGet(c, url.toString(), 9500), "UTF-8");
+        return parseNominatimArray(raw);
+    }
+
+    private static List<Place> searchOnlineCategory(Context c, String cat, double lat, double lon) throws Exception {
+        String term = "gas station";
+        if ("health".equals(cat)) term = "hospital";
+        else if ("parking".equals(cat)) term = "parking";
+        else if ("food".equals(cat)) term = "restaurant";
+        String url = String.format(Locale.US,
+                "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=12&addressdetails=1&bounded=1&viewbox=%.4f,%.4f,%.4f,%.4f&q=%s&accept-language=%s",
+                lon - 0.14, lat + 0.14, lon + 0.14, lat - 0.14,
+                URLEncoder.encode(term, "UTF-8"),
+                URLEncoder.encode(I18n.lang, "UTF-8"));
+        String raw = new String(navGet(c, url, 9500), "UTF-8");
+        List<Place> list = parseNominatimArray(raw);
+        Collections.sort(list, new Comparator<Place>() {
+            public int compare(Place a, Place b) {
+                return Double.compare(approxDist(lat, lon, a.lat, a.lon), approxDist(lat, lon, b.lat, b.lon));
+            }
+        });
+        return list;
+    }
+
+    private static List<Place> parseNominatimArray(String raw) throws Exception {
         JSONArray arr = new JSONArray(raw);
         List<Place> out = new ArrayList<Place>();
         for (int i = 0; i < arr.length(); i++) {
@@ -361,25 +474,89 @@ public class Nav {
             if (o == null) continue;
             double lat = Double.parseDouble(o.getString("lat"));
             double lon = Double.parseDouble(o.getString("lon"));
-            String disp = o.optString("display_name", "");
+            Place p = placeFromNominatimObj(o, lat, lon);
+            if (!dupPlace(out, p)) out.add(p);
+        }
+        return out;
+    }
+
+    private static Place placeFromNominatimObj(JSONObject o, double lat, double lon) {
+        String disp = o.optString("display_name", "");
+        String name = o.optString("name", "").trim();
+        String sub = "";
+        int comma = disp.indexOf(',');
+        if (name.length() == 0) {
+            name = comma > 0 ? disp.substring(0, comma).trim() : disp;
+            sub = comma > 0 ? disp.substring(comma + 1).trim() : "";
+        } else {
+            sub = disp.startsWith(name) && comma > 0 ? disp.substring(comma + 1).trim() : disp;
+        }
+        if (name.length() == 0) name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
+        Place p = new Place();
+        p.name = name;
+        p.sub = sub;
+        p.lat = lat;
+        p.lon = lon;
+        return p;
+    }
+
+    private static List<Place> searchOpenMeteo(Context c, String q, double biasLat, double biasLon) throws Exception {
+        String url = "https://geocoding-api.open-meteo.com/v1/search?count=8&format=json&language="
+                + URLEncoder.encode(I18n.lang != null ? I18n.lang : "en", "UTF-8")
+                + "&name=" + URLEncoder.encode(q, "UTF-8");
+        String raw = new String(navGet(c, url, 8500), "UTF-8");
+        JSONObject root = new JSONObject(raw);
+        JSONArray res = root.optJSONArray("results");
+        List<Place> out = new ArrayList<Place>();
+        if (res == null) return out;
+        for (int i = 0; i < res.length(); i++) {
+            JSONObject o = res.optJSONObject(i);
+            if (o == null) continue;
+            double lat = o.optDouble("latitude", Double.NaN);
+            double lon = o.optDouble("longitude", Double.NaN);
+            if (Double.isNaN(lat) || Double.isNaN(lon)) continue;
             String name = o.optString("name", "").trim();
-            String sub = "";
-            int comma = disp.indexOf(',');
-            if (name.length() == 0) {
-                name = comma > 0 ? disp.substring(0, comma).trim() : disp;
-                sub = comma > 0 ? disp.substring(comma + 1).trim() : "";
-            } else {
-                sub = disp.startsWith(name) && comma > 0 ? disp.substring(comma + 1).trim() : disp;
-            }
-            if (name.length() == 0) name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
+            if (name.length() == 0) continue;
+            StringBuilder sub = new StringBuilder();
+            appendPart(sub, o.optString("admin2", ""));
+            appendPart(sub, o.optString("admin1", ""));
+            appendPart(sub, o.optString("country", ""));
             Place p = new Place();
             p.name = name;
-            p.sub = sub;
+            p.sub = sub.toString();
             p.lat = lat;
             p.lon = lon;
             if (!dupPlace(out, p)) out.add(p);
         }
+        if (!Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
+            Collections.sort(out, new Comparator<Place>() {
+                public int compare(Place a, Place b) {
+                    return Double.compare(approxDist(biasLat, biasLon, a.lat, a.lon), approxDist(biasLat, biasLon, b.lat, b.lon));
+                }
+            });
+        }
         return out;
+    }
+
+    private static Place reversePhoton(Context c, double lat, double lon) throws Exception {
+        String url = String.format(Locale.US, "https://photon.komoot.io/reverse?lat=%.6f&lon=%.6f", lat, lon);
+        String raw = new String(navGet(c, url, 6500), "UTF-8");
+        JSONObject root = new JSONObject(raw);
+        JSONArray feats = root.optJSONArray("features");
+        if (feats == null || feats.length() == 0) return null;
+        JSONObject f = feats.optJSONObject(0);
+        if (f == null) return null;
+        return placeFromPhotonProps(f.optJSONObject("properties"), lat, lon);
+    }
+
+    private static Place reverseNominatim(Context c, double lat, double lon) throws Exception {
+        String url = String.format(Locale.US,
+                "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=%.6f&lon=%.6f&accept-language=%s",
+                lat, lon, URLEncoder.encode(I18n.lang, "UTF-8"));
+        String raw = new String(navGet(c, url, 6500), "UTF-8");
+        JSONObject o = new JSONObject(raw);
+        if (o.has("error")) return null;
+        return placeFromNominatimObj(o, lat, lon);
     }
 
     private static String firstNonEmpty(String... vals) {
@@ -567,7 +744,23 @@ public class Nav {
         nearbyCamera = null;
         nearbyCameraDistM = 0;
         lastCamIdx = -1;
+        nearbyIncident = null;
+        nearbyIncidentDistM = 0;
+        lastIncIdx = -1;
+        nearbyPolice = null;
+        nearbyPoliceDistM = 0;
+        lastPoliceId = null;
+        synchronized (policeReports) {
+            for (int pi = 0; pi < policeReports.size(); pi++) policeReports.get(pi).alongM = -1;
+        }
         spokenMask = r != null ? new int[r.steps.size()] : null;
+        if (r != null) {
+            ensureIncidentAlongM(r);
+            updateProximityAlerts(c, r, 0, SystemClock.elapsedRealtime(), false);
+            if (r.pts != null && r.pts.length >= 2) {
+                checkPoliceProximity(c, r.pts[0], r.pts[1], 0, true, SystemClock.elapsedRealtime(), false);
+            }
+        }
         if (c != null && r != null) {
             final Context app = c.getApplicationContext();
             new Thread(new Runnable() {
@@ -609,10 +802,108 @@ public class Nav {
         nearbyCamera = null;
         nearbyCameraDistM = 0;
         lastCamIdx = -1;
+        nearbyIncident = null;
+        nearbyIncidentDistM = 0;
+        lastIncIdx = -1;
+        nearbyPolice = null;
+        nearbyPoliceDistM = 0;
+        lastPoliceId = null;
         spokenMask = null;
+        previewMode = false;
+        stopSimulation();
         abandonNavFocus();
         if (c != null) {
             try { new File(c.getFilesDir(), "nav_active.json").delete(); } catch (Throwable ignored) { }
+        }
+    }
+
+    public interface SimListener {
+        void onSimLocation(Location loc);
+        void onSimEnded();
+    }
+
+    public static void startSimulation(final Context c, final boolean mph, final SimListener ls) {
+        final Route r = active;
+        if (r == null || r.pts == null || r.pts.length < 4) return;
+        stopSimulation();
+        simulating = true;
+        simPaused = false;
+        simPtIdx = Math.max(0, Math.min(r.pts.length / 2 - 2, curPtIdx));
+        simSegProgress = 0;
+        final long tickMs = 450L;
+        simTicker = new Runnable() {
+            public void run() {
+                Route cur = active;
+                if (!simulating || cur == null || cur.pts == null || cur.pts.length < 4) {
+                    stopSimulation();
+                    if (ls != null) ls.onSimEnded();
+                    return;
+                }
+                if (simPaused) {
+                    UI.postDelayed(this, tickMs);
+                    return;
+                }
+                int nPts = cur.pts.length / 2;
+                if (simPtIdx >= nPts - 1) simPtIdx = nPts - 2;
+                double limitKmh = cur.segMaxSpeedKmh != null && simPtIdx < cur.segMaxSpeedKmh.length && cur.segMaxSpeedKmh[simPtIdx] > 0
+                        ? cur.segMaxSpeedKmh[simPtIdx] : 52.0;
+                double simMs = Math.max(8.0, (limitKmh / 3.6) * simSpeedMult);
+                double advanceM = simMs * (tickMs / 1000.0);
+
+                while (advanceM > 0 && simPtIdx < nPts - 1) {
+                    double segLen = Math.max(1.0, cur.cumDistM[simPtIdx + 1] - cur.cumDistM[simPtIdx]);
+                    double remOnSeg = segLen * (1.0 - simSegProgress);
+                    if (advanceM < remOnSeg) {
+                        simSegProgress += advanceM / segLen;
+                        advanceM = 0;
+                    } else {
+                        advanceM -= remOnSeg;
+                        simPtIdx++;
+                        simSegProgress = 0;
+                    }
+                }
+                int seg = Math.min(simPtIdx, nPts - 2);
+                double t = simPtIdx >= nPts - 1 ? 1.0 : simSegProgress;
+                double la1 = cur.pts[seg * 2], lo1 = cur.pts[seg * 2 + 1];
+                double la2 = cur.pts[(seg + 1) * 2], lo2 = cur.pts[(seg + 1) * 2 + 1];
+                double lat = la1 + (la2 - la1) * t;
+                double lon = lo1 + (lo2 - lo1) * t;
+                double kx = Math.cos(Math.toRadians((la1 + la2) * 0.5));
+                float br = (float) ((Math.toDegrees(Math.atan2((lo2 - lo1) * kx, la2 - la1)) + 360.0) % 360.0);
+
+                Location loc = new Location("sim");
+                loc.setLatitude(lat);
+                loc.setLongitude(lon);
+                loc.setBearing(br);
+                loc.setSpeed((float) (limitKmh / 3.6));
+                loc.setAccuracy(5f);
+                loc.setTime(System.currentTimeMillis());
+
+                onLocation(c, loc, mph, new Runnable() {
+                    public void run() {
+                        if (active == null) {
+                            stopSimulation();
+                            if (ls != null) ls.onSimEnded();
+                        }
+                    }
+                });
+                if (ls != null) ls.onSimLocation(loc);
+                if (simulating && active != null) UI.postDelayed(this, tickMs);
+            }
+        };
+        UI.post(simTicker);
+    }
+
+    public static void toggleSimPause() {
+        if (simulating) simPaused = !simPaused;
+    }
+
+    public static void stopSimulation() {
+        simulating = false;
+        simPaused = false;
+        if (simTicker != null) {
+            UI.removeCallbacks(simTicker);
+            simTicker = null;
         }
     }
 
@@ -653,6 +944,16 @@ public class Nav {
             nearbyCamera = null;
             nearbyCameraDistM = 0;
             lastCamIdx = -1;
+            nearbyIncident = null;
+            nearbyIncidentDistM = 0;
+            lastIncIdx = -1;
+            nearbyPolice = null;
+            nearbyPoliceDistM = 0;
+            lastPoliceId = null;
+            ensureIncidentAlongM(r);
+            updateProximityAlerts(c, r, along, SystemClock.elapsedRealtime(), false);
+            int pIdx = Math.min(curPtIdx, (r.pts.length / 2) - 1);
+            checkPoliceProximity(c, r.pts[pIdx * 2], r.pts[pIdx * 2 + 1], along, true, SystemClock.elapsedRealtime(), false);
             return true;
         } catch (Throwable e) {
             return false;
@@ -696,8 +997,8 @@ public class Nav {
                 boolean avoidTolls = sp != null && sp.getBoolean("nav_avoid_tolls", false);
                 boolean avoidHighways = sp != null && sp.getBoolean("nav_avoid_motorways", false);
                 boolean useTraffic = sp != null && sp.getBoolean("map_traffic", false);
-                boolean checkIncidents = sp != null && sp.getBoolean("nav_incidents", false);
-                boolean checkCameras = sp != null && sp.getBoolean("nav_speed_cams", false);
+                boolean checkIncidents = sp == null || sp.getBoolean("nav_incidents", true);
+                boolean checkCameras = sp == null || sp.getBoolean("nav_speed_cams", true);
                 String ttKey = sp != null ? sp.getString("tomtom_key", "").trim() : "";
                 String customOsrm = sp != null ? normalizeOsrmBase(sp.getString("nav_route_url", "")) : null;
 
@@ -968,7 +1269,8 @@ public class Nav {
         if (conn instanceof HttpsURLConnection && f != null) ((HttpsURLConnection) conn).setSSLSocketFactory(f);
         conn.setConnectTimeout(timeoutMs);
         conn.setReadTimeout(timeoutMs);
-        conn.setRequestProperty("User-Agent", "StradaOS/2.1 (Android head unit launcher)");
+        conn.setRequestProperty("User-Agent", "StradaOS/2.32 (Android car launcher; https://github.com/ierfansagi-debug/StradaOS)");
+        conn.setRequestProperty("Accept", "application/json, */*;q=0.8");
         try {
             int code = conn.getResponseCode();
             if (code != 200) throw new Exception("HTTP " + code);
@@ -1862,7 +2164,19 @@ public class Nav {
                 for (Incident inc : all) {
                     if (r.incidents.size() >= 8) break;
                     double[] cl = closestOnRange(r.pts, inc.lat, inc.lon, 0, np - 2);
-                    if (cl[0] <= 150.0) r.incidents.add(inc);
+                    if (cl[0] <= 150.0) {
+                        int seg = (int) cl[1];
+                        Incident copy = new Incident();
+                        copy.lat = inc.lat;
+                        copy.lon = inc.lon;
+                        copy.category = inc.category;
+                        copy.delayS = inc.delayS;
+                        copy.desc = inc.desc;
+                        if (r.cumDistM != null && seg + 1 < r.cumDistM.length) {
+                            copy.alongM = r.cumDistM[seg] + (r.cumDistM[seg + 1] - r.cumDistM[seg]) * cl[2];
+                        }
+                        r.incidents.add(copy);
+                    }
                 }
             }
         } catch (Throwable ignored) { }
@@ -2149,7 +2463,7 @@ public class Nav {
         // límite de velocidad y radar de velocidad cercano
         SharedPreferences sp = c != null ? c.getSharedPreferences("launcher", 0) : null;
         curSpeedLimitKmh = r.segMaxSpeedKmh != null && segIdx < r.segMaxSpeedKmh.length ? r.segMaxSpeedKmh[segIdx] : 0;
-        boolean spAlertOn = sp != null && sp.getBoolean("nav_speed_alert", false);
+        boolean spAlertOn = sp == null || sp.getBoolean("nav_speed_alert", true);
         if (spAlertOn && curSpeedLimitKmh > 0 && l.hasSpeed()) {
             int tolKmh = sp != null ? sp.getInt("nav_speed_tol", 8) : 8;
             double curKmh = l.getSpeed() * 3.6;
@@ -2165,29 +2479,7 @@ public class Nav {
             speedingAlert = false;
         }
 
-        Camera foundCam = null;
-        int foundCamIdx = -1;
-        double foundCamDist = 0;
-        boolean camOn = sp != null && sp.getBoolean("nav_speed_cams", false);
-        if (camOn && !r.cameras.isEmpty()) {
-            for (int ci = 0; ci < r.cameras.size(); ci++) {
-                Camera cam = r.cameras.get(ci);
-                if (cam.alongM >= alongM - 25 && cam.alongM - alongM <= 350) {
-                    foundCam = cam;
-                    foundCamIdx = ci;
-                    foundCamDist = Math.max(0, cam.alongM - alongM);
-                    break;
-                }
-            }
-        }
-        nearbyCamera = foundCam;
-        nearbyCameraDistM = foundCamDist;
-        if (foundCam != null && (foundCamIdx != lastCamIdx || nowSp - lastCamChimeAt > 35000L)) {
-            lastCamIdx = foundCamIdx;
-            lastCamChimeAt = nowSp;
-            playAlertTone(ToneGenerator.TONE_PROP_ACK, 260);
-            if (c != null) speakRaw(c, I18n.t("Radar de velocidad adelante"));
-        }
+        updateProximityAlerts(c, r, alongM, nowSp, true);
 
         // desvío de ruta -> recalcular (conservando paradas aún pendientes)
         boolean goodFix = !l.hasAccuracy() || l.getAccuracy() <= 55;
@@ -2238,6 +2530,310 @@ public class Nav {
         }
     }
 
+    private static void ensureIncidentAlongM(Route r) {
+        if (r == null || r.incidents.isEmpty() || r.pts == null || r.pts.length < 4 || r.cumDistM == null) return;
+        int nPts = r.pts.length / 2;
+        if (nPts < 2) return;
+        for (int i = 0; i < r.incidents.size(); i++) {
+            Incident inc = r.incidents.get(i);
+            if (inc != null && inc.alongM < 0) {
+                double[] cl = closestOnRange(r.pts, inc.lat, inc.lon, 0, nPts - 2);
+                int sg = (int) cl[1];
+                if (sg + 1 < r.cumDistM.length) {
+                    inc.alongM = r.cumDistM[sg] + (r.cumDistM[sg + 1] - r.cumDistM[sg]) * cl[2];
+                }
+            }
+        }
+    }
+
+    private static void updateProximityAlerts(Context c, Route r, double alongM, long nowSp, boolean announce) {
+        if (r == null) return;
+        SharedPreferences sp = c != null ? c.getSharedPreferences("launcher", 0) : null;
+
+        Camera foundCam = null;
+        int foundCamIdx = -1;
+        double foundCamDist = 0;
+        boolean camOn = sp == null || sp.getBoolean("nav_speed_cams", true);
+        if (camOn && !r.cameras.isEmpty()) {
+            for (int ci = 0; ci < r.cameras.size(); ci++) {
+                Camera cam = r.cameras.get(ci);
+                if (cam.alongM >= alongM - 25 && cam.alongM - alongM <= 350) {
+                    foundCam = cam;
+                    foundCamIdx = ci;
+                    foundCamDist = Math.max(0, cam.alongM - alongM);
+                    break;
+                }
+            }
+        }
+        nearbyCamera = foundCam;
+        nearbyCameraDistM = foundCamDist;
+        if (announce && foundCam != null && (foundCamIdx != lastCamIdx || nowSp - lastCamChimeAt > 35000L)) {
+            lastCamIdx = foundCamIdx;
+            lastCamChimeAt = nowSp;
+            playAlertTone(ToneGenerator.TONE_PROP_ACK, 260);
+            if (c != null) speakRaw(c, I18n.t("Radar de velocidad adelante"));
+        }
+
+        Incident foundInc = null;
+        int foundIncIdx = -1;
+        double foundIncDist = 0;
+        boolean incOn = sp == null || sp.getBoolean("nav_inc_alerts", true);
+        if (incOn && !r.incidents.isEmpty()) {
+            double bestDist = Double.MAX_VALUE;
+            for (int ii = 0; ii < r.incidents.size(); ii++) {
+                Incident inc = r.incidents.get(ii);
+                if (inc == null || inc.alongM < 0) continue;
+                if (inc.alongM >= alongM - 30 && inc.alongM - alongM <= 500) {
+                    double dAhead = Math.max(0, inc.alongM - alongM);
+                    if (dAhead < bestDist) {
+                        bestDist = dAhead;
+                        foundInc = inc;
+                        foundIncIdx = ii;
+                        foundIncDist = dAhead;
+                    }
+                }
+            }
+        }
+        nearbyIncident = foundInc;
+        nearbyIncidentDistM = foundIncDist;
+        if (announce && foundInc != null && (foundIncIdx != lastIncIdx || nowSp - lastIncChimeAt > 45000L)) {
+            lastIncIdx = foundIncIdx;
+            lastIncChimeAt = nowSp;
+            playAlertTone(ToneGenerator.TONE_PROP_BEEP, 220);
+            if (c != null) {
+                String msg = foundInc.desc != null && foundInc.desc.length() > 0 ? foundInc.desc : incidentLabel(foundInc.category);
+                speakRaw(c, msg);
+            }
+        }
+
+        double pLat = r.pts != null && curPtIdx * 2 + 1 < r.pts.length ? r.pts[curPtIdx * 2] : r.destLat;
+        double pLon = r.pts != null && curPtIdx * 2 + 1 < r.pts.length ? r.pts[curPtIdx * 2 + 1] : r.destLon;
+        checkPoliceProximity(c, pLat, pLon, alongM, true, nowSp, announce);
+    }
+
+    public static void loadPoliceReports(Context c) {
+        if (c == null) return;
+        synchronized (policeReports) {
+            if (!policeLoaded) {
+                policeLoaded = true;
+                try {
+                    File f = new File(c.getFilesDir(), "police_reports.json");
+                    if (f.isFile() && f.length() > 0) {
+                        JSONArray arr = new JSONArray(readUtf8(f));
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject o = arr.optJSONObject(i);
+                            if (o == null) continue;
+                            PoliceReport pr = new PoliceReport();
+                            pr.id = o.optString("id", "");
+                            pr.lat = o.optDouble("lat", Double.NaN);
+                            pr.lon = o.optDouble("lon", Double.NaN);
+                            pr.label = o.optString("label", "");
+                            pr.reportedAtMs = o.optLong("at", 0L);
+                            if (pr.id.length() > 0 && !Double.isNaN(pr.lat) && !Double.isNaN(pr.lon)) {
+                                policeReports.add(pr);
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) { }
+            }
+            pruneExpiredPoliceLocked();
+        }
+    }
+
+    private static boolean pruneExpiredPoliceLocked() {
+        long now = System.currentTimeMillis();
+        boolean changed = false;
+        for (int i = policeReports.size() - 1; i >= 0; i--) {
+            PoliceReport pr = policeReports.get(i);
+            if (pr == null || now - pr.reportedAtMs > POLICE_TTL_MS || pr.reportedAtMs <= 0) {
+                policeReports.remove(i);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private static void savePoliceReports(Context c) {
+        if (c == null) return;
+        final Context app = c.getApplicationContext();
+        final String payload;
+        synchronized (policeReports) {
+            JSONArray arr = new JSONArray();
+            for (int i = 0; i < policeReports.size(); i++) {
+                PoliceReport pr = policeReports.get(i);
+                try {
+                    JSONObject o = new JSONObject();
+                    o.put("id", pr.id);
+                    o.put("lat", pr.lat);
+                    o.put("lon", pr.lon);
+                    o.put("label", pr.label != null ? pr.label : "");
+                    o.put("at", pr.reportedAtMs);
+                    arr.put(o);
+                } catch (Throwable ignored) { }
+            }
+            payload = arr.toString();
+        }
+        new Thread(new Runnable() {
+            public void run() {
+                FileOutputStream os = null;
+                try {
+                    os = new FileOutputStream(new File(app.getFilesDir(), "police_reports.json"));
+                    os.write(payload.getBytes("UTF-8"));
+                } catch (Throwable ignored) { } finally {
+                    if (os != null) try { os.close(); } catch (Throwable ignored) { }
+                }
+            }
+        }).start();
+    }
+
+    public static List<PoliceReport> getPoliceReports(Context c) {
+        if (c != null) loadPoliceReports(c);
+        synchronized (policeReports) {
+            if (pruneExpiredPoliceLocked() && c != null) savePoliceReports(c);
+            return new ArrayList<PoliceReport>(policeReports);
+        }
+    }
+
+    public static PoliceReport reportPolice(Context c, double lat, double lon, String label) {
+        if (Double.isNaN(lat) || Double.isNaN(lon)) return null;
+        if (c != null) loadPoliceReports(c);
+        long now = System.currentTimeMillis();
+        PoliceReport saved = null;
+        synchronized (policeReports) {
+            pruneExpiredPoliceLocked();
+            for (int i = 0; i < policeReports.size(); i++) {
+                PoliceReport ex = policeReports.get(i);
+                if (approxDist(lat, lon, ex.lat, ex.lon) <= 120.0) {
+                    ex.reportedAtMs = now;
+                    if (label != null && label.length() > 0) ex.label = label;
+                    saved = ex;
+                    break;
+                }
+            }
+            if (saved == null) {
+                if (policeReports.size() >= 32) policeReports.remove(0);
+                saved = new PoliceReport();
+                saved.id = "pol_" + now + "_" + policeReports.size();
+                saved.lat = lat;
+                saved.lon = lon;
+                saved.label = label != null ? label : "";
+                saved.reportedAtMs = now;
+                policeReports.add(saved);
+            }
+            Route r = active;
+            if (r != null && r.pts != null && r.pts.length >= 4 && r.cumDistM != null) {
+                int np = r.pts.length / 2;
+                double[] cl = closestOnRange(r.pts, saved.lat, saved.lon, 0, np - 2);
+                int sg = (int) cl[1];
+                if (cl[0] <= 140.0 && sg + 1 < r.cumDistM.length) {
+                    saved.alongM = r.cumDistM[sg] + (r.cumDistM[sg + 1] - r.cumDistM[sg]) * cl[2];
+                } else {
+                    saved.alongM = -1;
+                }
+            }
+        }
+        if (c != null) savePoliceReports(c);
+        checkPoliceAtCurrentState(c, lat, lon);
+        return saved;
+    }
+
+    public static void confirmPolice(Context c, PoliceReport pr) {
+        if (pr == null) return;
+        synchronized (policeReports) {
+            pr.reportedAtMs = System.currentTimeMillis();
+        }
+        if (c != null) savePoliceReports(c);
+    }
+
+    public static void clearPolice(Context c, PoliceReport pr) {
+        if (pr == null) return;
+        synchronized (policeReports) {
+            for (int i = policeReports.size() - 1; i >= 0; i--) {
+                PoliceReport item = policeReports.get(i);
+                if (item == pr || (pr.id != null && pr.id.equals(item.id))) {
+                    policeReports.remove(i);
+                }
+            }
+        }
+        if (nearbyPolice == pr || (nearbyPolice != null && pr.id != null && pr.id.equals(nearbyPolice.id))) {
+            nearbyPolice = null;
+            nearbyPoliceDistM = 0;
+        }
+        if (c != null) savePoliceReports(c);
+    }
+
+    private static void checkPoliceAtCurrentState(Context c, double refLat, double refLon) {
+        Route r = active;
+        if (r != null && r.pts != null && r.pts.length >= 4 && r.cumDistM != null) {
+            int idx = Math.max(0, Math.min((r.pts.length / 2) - 1, curPtIdx));
+            double along = idx < r.cumDistM.length ? r.cumDistM[idx] : 0;
+            checkPoliceProximity(c, r.pts[idx * 2], r.pts[idx * 2 + 1], along, true, SystemClock.elapsedRealtime(), false);
+        } else {
+            checkPoliceProximity(c, refLat, refLon, 0, false, SystemClock.elapsedRealtime(), false);
+        }
+    }
+
+    public static void onFreeLocation(Context c, Location l) {
+        if (l == null || active != null) return;
+        checkPoliceProximity(c, l.getLatitude(), l.getLongitude(), 0, false, SystemClock.elapsedRealtime(), true);
+    }
+
+    public static void checkPoliceProximity(Context c, double lat, double lon, double alongM,
+                                            boolean hasActiveRoute, long nowSp, boolean announce) {
+        if (c != null) loadPoliceReports(c);
+        SharedPreferences sp = c != null ? c.getSharedPreferences("launcher", 0) : null;
+        boolean polOn = sp == null || sp.getBoolean("nav_police_alerts", true);
+        if (!polOn) {
+            nearbyPolice = null;
+            nearbyPoliceDistM = 0;
+            return;
+        }
+        Route r = hasActiveRoute ? active : null;
+        int nPts = r != null && r.pts != null ? r.pts.length / 2 : 0;
+
+        PoliceReport found = null;
+        double bestDist = Double.MAX_VALUE;
+        boolean pruned;
+        synchronized (policeReports) {
+            pruned = pruneExpiredPoliceLocked();
+            for (int i = 0; i < policeReports.size(); i++) {
+                PoliceReport pr = policeReports.get(i);
+                if (pr == null) continue;
+                double d = Double.MAX_VALUE;
+                if (r != null && nPts >= 2 && r.cumDistM != null) {
+                    if (pr.alongM < 0) {
+                        double[] cl = closestOnRange(r.pts, pr.lat, pr.lon, 0, nPts - 2);
+                        int sg = (int) cl[1];
+                        if (cl[0] <= 140.0 && sg + 1 < r.cumDistM.length) {
+                            pr.alongM = r.cumDistM[sg] + (r.cumDistM[sg + 1] - r.cumDistM[sg]) * cl[2];
+                        }
+                    }
+                    if (pr.alongM >= 0 && pr.alongM >= alongM - 30 && pr.alongM - alongM <= 500) {
+                        d = Math.max(0, pr.alongM - alongM);
+                    }
+                }
+                if (d == Double.MAX_VALUE && !Double.isNaN(lat) && !Double.isNaN(lon)) {
+                    double rad = approxDist(lat, lon, pr.lat, pr.lon);
+                    if (rad <= (r != null ? 300.0 : 550.0)) d = rad;
+                }
+                if (d < bestDist) {
+                    bestDist = d;
+                    found = pr;
+                }
+            }
+        }
+        if (pruned && c != null) savePoliceReports(c);
+
+        nearbyPolice = found;
+        nearbyPoliceDistM = found != null ? bestDist : 0;
+        if (announce && found != null && (lastPoliceId == null || !lastPoliceId.equals(found.id) || nowSp - lastPoliceChimeAt > 45000L)) {
+            lastPoliceId = found.id;
+            lastPoliceChimeAt = nowSp;
+            playAlertTone(ToneGenerator.TONE_PROP_BEEP2, 240);
+            if (c != null) speakRaw(c, I18n.t("Policía reportada adelante"));
+        }
+    }
+
     private static void playAlertTone(final int tone, final int ms) {
         try {
             final ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 75);
@@ -2269,7 +2865,7 @@ public class Nav {
         return new double[]{bestD, bestI, bestT};
     }
 
-    private static double approxDist(double lat1, double lon1, double lat2, double lon2) {
+    public static double approxDist(double lat1, double lon1, double lat2, double lon2) {
         double ky = 111320.0;
         double kx = ky * Math.cos(Math.toRadians((lat1 + lat2) * 0.5));
         double dy = (lat2 - lat1) * ky, dx = (lon2 - lon1) * kx;

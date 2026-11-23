@@ -534,6 +534,7 @@ sin permiso para leer el archivo	no permission to read the file
 no es un mapa de mapsforge (.map)	not a mapsforge map (.map)
 el archivo está incompleto (¿se copió entero?)	the file is incomplete (was it copied completely?)
 1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa se usa en el inicio incluso con internet. Para actualizarlo, descarga uno nuevo y reemplaza el archivo.	1. On a computer or phone, download your country's map (mapsforge format, free):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Copy it to a USB drive or to the screen's Download folder.\n\n3. In Settings → Map & weather → Offline map, tap “Map file” and choose it.\n\nThe map is used on the home screen even with internet. To update it, download a new one and replace the file.
+1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa sin conexión se activa automáticamente si no hay internet, o cuando eliges OSM en el mapa. Para actualizarlo, descarga uno nuevo y reemplaza el archivo.	1. On a computer or phone, download your country's map (mapsforge format, free):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Copy it to a USB drive or to the screen's Download folder.\n\n3. In Settings → Map & weather → Offline map, tap “Map file” and choose it.\n\nThe offline map activates automatically when internet is unavailable, or when you switch to OSM on the map. To update it, download a new one and replace the file.
 Toca para dejar de usarlo o borrarlo	Tap to stop using or delete it
 Descargar un mapa	Download a map
 Elige tu país: se descarga gratis de OpenStreetMap (mapsforge) y se usa sin internet	Choose your country: it downloads free from OpenStreetMap (mapsforge) and works without internet
@@ -1845,3 +1846,59 @@ leída: «{}» — {} · {}/{} s · {}	read: «{}» — {} · {}/{} s · {}
 sonando	playing
 en pausa	paused
 estado ?	state ?
+
+# Mapa 2D/3D, ángulo y búsqueda en el mapa
+Modo del mapa	Map mode
+3D: vista inclinada en perspectiva automática	3D: auto-tilted perspective view
+Ángulo del mapa	Map angle
+Inclinación de la cámara en modo 3D	Camera tilt in 3D mode
+Se aplica al activar el modo 3D	Applies when 3D mode is enabled
+Buscar lugar…	Search place…
+Buscar dirección, lugar o coordenadas…	Search address, place or coordinates…
+Ver en el mapa	Show on map
+Iniciar ruta	Start route
++ Parada	+ Stop
+
+# MapLibre GL JS y controles de navegación
+Motor del mapa	Map engine
+MapLibre GL JS ofrece 3D fluido; OpenStreetMap funciona como respaldo y automáticamente sin internet si tienes un archivo .map	MapLibre GL JS provides smooth 3D; OpenStreetMap works as fallback and automatically offline when a .map file is loaded
+Cambiar motor del mapa	Switch map engine
+Motor: MapLibre	Engine: MapLibre
+Motor: OpenStreetMap	Engine: OpenStreetMap
+MapLibre seleccionado (sin internet: usando OSM)	MapLibre selected (offline: using OSM)
+MapLibre 3D	MapLibre 3D
+OpenStreetMap	OpenStreetMap
+Modo clásico de mapa activado	Classic map mode enabled
+Mapa 3D	3D Map
+Buscando dirección…	Looking up address…
+Punto en el mapa	Map pin
+Vista general	Overview
+Vista general de ruta	Route overview
+Seguir mi ubicación	Follow my location
+Lista de pasos	Turn-by-turn steps
+Instrucciones paso a paso	Turn-by-turn directions
+Simular ruta	Simulate route
+Simulación de ruta iniciada	Route simulation started
+Simulación en pausa	Simulation paused
+Simulación en curso	Simulation running
+Simulación detenida	Simulation stopped
+Pausar simulación	Pause simulation
+Reanudar simulación	Resume simulation
+Detener simulación	Stop simulation
+Vista previa	Preview
+Vista previa de ruta (sin GPS)	Route preview (no GPS)
+Vista 2D	2D view
+Vista 3D	3D view
+Alertas de radares, policía e incidentes	Speed camera, police & hazard alerts
+Ondas y avisos al acercarse a radares, policía o incidentes	Waves and alerts when approaching speed cameras, police, or hazards
+Policía	Police
+Reportar policía	Report police
+Policía reportada adelante	Police reported ahead
+Policía reportada en el mapa	Police reported on map
+Alerta de policía	Police alert
+Hace un momento	Just now
+Reportado hace {} min	Reported {} min ago
+Sigue ahí	Still there
+Ya no está	Gone
+Alerta confirmada	Alert confirmed
+Alerta eliminada	Alert cleared

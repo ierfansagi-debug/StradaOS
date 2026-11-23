@@ -3,11 +3,15 @@ package com.stradaos.launcher;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Camera;
 import android.graphics.Canvas;
+import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Shader;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -117,7 +121,39 @@ public class LiveMapView extends View {
     private final Paint routeIn = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routeBack = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint destPin = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint wavePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint previewText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint previewBg = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint horizonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path corners = new Path();
+    private final Camera cam3d = new Camera();
+    private final Matrix tiltM = new Matrix();
+    private final Matrix invTiltM = new Matrix();
+    private final float[] cornerPts = new float[8];
+    private final float[] tmpPt = new float[2];
+    private final RectF tmpRect = new RectF();
+    private float curTilt;
+    private int horizonH = -1;
+    private boolean horizonLight;
+    private Nav.Place previewPlace;
+    private int previewZoom = 16;
+    public interface Listener {
+        void onFollowChanged(boolean following);
+        void onMapPick(double lat, double lon);
+    }
+    private Listener listener;
+    private boolean following = true;
+    private boolean overviewMode;
+    private double panLat = 4.7110, panLon = -74.0721;
+    private boolean hasCenter;
+    private final android.view.ScaleGestureDetector scaleDet;
+    private final android.view.GestureDetector gestDet;
+    private boolean pinchActive;
+    private int lastDrawZoom = 16;
+    private float lastCx, lastCy;
+    private double lastFx, lastFy;
+    private boolean lastTilted, lastRot;
+    private float lastBr;
     // Tema Aurora (2.24): el fondo de la pantalla detrás del mapa. Con él se tapan las esquinas (en vez del color
     // liso, que en Aurora se veía como puntas) y las teselas se dibujan un poco transparentes encima. Barato: es un
     // rectángulo con un BitmapShader del fondo ya pintado; no hay capas por software ni clipPath.
@@ -218,10 +254,17 @@ public class LiveMapView extends View {
         routeBack.setStrokeCap(Paint.Cap.ROUND);
         routeBack.setStrokeWidth(3.5f * s);
         routeBack.setPathEffect(new android.graphics.DashPathEffect(new float[]{10 * s, 8 * s}, 0));
+        destPin.setStyle(Paint.Style.FILL);
+        previewText.setTextSize(12.5f * s);
+        previewText.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        previewBg.setStyle(Paint.Style.FILL);
         // Sin capa por software: el mapa se dibuja con la GPU (mucho más fluido). Las esquinas redondeadas no se
         // recortan (clipPath no funciona con GPU antes de Android 4.3): se tapan con el color del fondo.
         Net.init(c);
         sp = c.getSharedPreferences("launcher", 0);
+        view3d = sp.getBoolean("map_3d", false);
+        tiltAngle = sp.getInt("map_angle", 45);
+        curTilt = view3d ? Math.max(0f, Math.min(65f, tiltAngle)) : 0f;
         String custom = sp.getString("map_url", "").trim();
         URLS[0] = custom;
         if (custom.length() > 0) provider = 0;
@@ -231,6 +274,39 @@ public class LiveMapView extends View {
             if (saved > 0 && saved < URLS.length) provider = saved;
         }
         loadFile(c);
+        scaleDet = new android.view.ScaleGestureDetector(c, new android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            float acc = 1f;
+            public boolean onScaleBegin(android.view.ScaleGestureDetector d) { pinchActive = true; acc = 1f; return true; }
+            public boolean onScale(android.view.ScaleGestureDetector d) {
+                acc *= d.getScaleFactor();
+                if (acc > 1.25f) { zoomBy(1); acc = 1f; }
+                else if (acc < 0.80f) { zoomBy(-1); acc = 1f; }
+                return true;
+            }
+            public void onScaleEnd(android.view.ScaleGestureDetector d) { pinchActive = false; }
+        });
+        gestDet = new android.view.GestureDetector(c, new android.view.GestureDetector.SimpleOnGestureListener() {
+            public boolean onDown(android.view.MotionEvent e) { return true; }
+            public boolean onSingleTapConfirmed(android.view.MotionEvent e) {
+                if (listener != null && hasCenter) {
+                    performClick();
+                } else {
+                    cycleZoom();
+                }
+                return true;
+            }
+            public void onLongPress(android.view.MotionEvent e) {
+                if (listener != null && hasCenter) {
+                    double[] ll = screenToLatLon(e.getX(), e.getY());
+                    if (ll != null) listener.onMapPick(ll[0], ll[1]);
+                }
+            }
+            public boolean onScroll(android.view.MotionEvent e1, android.view.MotionEvent e2, float dx, float dy) {
+                if (pinchActive) return false;
+                panBy(dx, dy);
+                return true;
+            }
+        });
     }
 
     private final android.content.SharedPreferences sp;
@@ -242,6 +318,7 @@ public class LiveMapView extends View {
         corners.setFillType(Path.FillType.EVEN_ODD);
         corners.addRect(-2, -2, w + 2, h + 2, Path.Direction.CW);
         corners.addRoundRect(new RectF(0, 0, w, h), radius, radius, Path.Direction.CW);
+        horizonH = -1;
     }
 
     private File tileFile(int pv, int layer, int z, int x, int y) {
@@ -387,22 +464,213 @@ public class LiveMapView extends View {
     private boolean userZoom;
     /** true: el mapa gira según la dirección del carro (arriba = hacia donde vas). false: norte arriba. */
     static boolean headingUp;
+    /** true: vista 3D con inclinación automática según tiltAngle. */
+    static boolean view3d;
+    /** Ángulo de inclinación de cámara en modo 3D (grados: 30, 45, 60). */
+    static int tiltAngle = 45;
+
+    public void setListener(Listener l) { listener = l; }
+    public boolean isFollowing() { return following && !overviewMode; }
+    public boolean isOverview() { return overviewMode; }
+
+    public double getCenterLat() { return previewPlace != null ? previewPlace.lat : (!following || !hasFix()) ? panLat : dLat; }
+    public double getCenterLon() { return previewPlace != null ? previewPlace.lon : (!following || !hasFix()) ? panLon : dLon; }
+    public int getZoomLevel() { return previewPlace != null ? previewZoom : zoom; }
+
+    public void setInitialCenter(double la, double lo) {
+        if (!Double.isNaN(la) && !Double.isNaN(lo)) {
+            panLat = la;
+            panLon = lo;
+            hasCenter = true;
+            invalidate();
+        }
+    }
+
+    public void focusPoint(double la, double lo, int z) {
+        if (Double.isNaN(la) || Double.isNaN(lo)) return;
+        panLat = la;
+        panLon = lo;
+        hasCenter = true;
+        overviewMode = false;
+        setFollowingInternal(false);
+        userZoom = true;
+        if (z > 0) zoom = Math.max(10, Math.min(18, z));
+        invalidate();
+    }
+
+    public void setOverview(boolean ov) {
+        if (ov && Nav.active != null && Nav.active.pts != null && Nav.active.pts.length >= 4) {
+            overviewMode = true;
+            setFollowingInternal(false);
+            double[] pts = Nav.active.pts;
+            double minLa = 90, maxLa = -90, minLo = 180, maxLo = -180;
+            for (int i = 0; i < pts.length; i += 2) {
+                double la = pts[i], lo = pts[i + 1];
+                if (la < minLa) minLa = la; if (la > maxLa) maxLa = la;
+                if (lo < minLo) minLo = lo; if (lo > maxLo) maxLo = lo;
+            }
+            if (!Double.isNaN(dLat) && !Double.isNaN(dLon)) {
+                if (dLat < minLa) minLa = dLat; if (dLat > maxLa) maxLa = dLat;
+                if (dLon < minLo) minLo = dLon; if (dLon > maxLo) maxLo = dLon;
+            }
+            panLat = (minLa + maxLa) * 0.5;
+            panLon = (minLo + maxLo) * 0.5;
+            hasCenter = true;
+            float w = Math.max(200f, getWidth());
+            float h = Math.max(200f, getHeight());
+            double dLonSpan = Math.max(0.004, (maxLo - minLo) * 1.45);
+            double dLatSpan = Math.max(0.004, (maxLa - minLa) * 1.55);
+            int fitZ = 16;
+            for (int z = 16; z >= 5; z--) {
+                double pxW = (dLonSpan / 360.0) * (1 << z) * (256 * s);
+                double pxH = (dLatSpan / 180.0) * (1 << z) * (256 * s) / Math.max(0.25, Math.cos(Math.toRadians(panLat)));
+                if (pxW <= w * 0.88 && pxH <= h * 0.72) { fitZ = z; break; }
+                fitZ = z;
+            }
+            userZoom = true;
+            zoom = fitZ;
+            invalidate();
+        } else {
+            overviewMode = false;
+            recenter();
+        }
+    }
+
+    public void recenter() {
+        previewPlace = null;
+        overviewMode = false;
+        userZoom = false;
+        zoom = 16;
+        if (hasFix()) {
+            panLat = tLat;
+            panLon = tLon;
+        }
+        setFollowingInternal(true);
+        invalidate();
+    }
+
+    private void setFollowingInternal(boolean f) {
+        if (following != f) {
+            following = f;
+            if (listener != null) listener.onFollowChanged(isFollowing());
+        }
+    }
+
+    public void onTiltConfigChanged() {
+        invalidate();
+    }
+
+    public void setPreviewPlace(Nav.Place p) {
+        previewPlace = p;
+        overviewMode = false;
+        if (p != null) {
+            previewZoom = 16;
+            panLat = p.lat;
+            panLon = p.lon;
+            hasCenter = true;
+            setFollowingInternal(false);
+        }
+        invalidate();
+    }
+
+    public Nav.Place getPreviewPlace() {
+        return previewPlace;
+    }
+
+    private void panBy(float dx, float dy) {
+        if (previewPlace != null) previewPlace = null;
+        if (overviewMode) overviewMode = false;
+        if (!hasCenter && hasFix()) { panLat = dLat; panLon = dLon; hasCenter = true; }
+        else if (!hasCenter) { hasCenter = true; }
+        if (following && hasFix()) { panLat = dLat; panLon = dLon; }
+        setFollowingInternal(false);
+
+        int n = 1 << lastDrawZoom;
+        double ts = 256.0 * s;
+        double rx = dx, ry = dy;
+        if (lastRot && !Float.isNaN(lastBr)) {
+            double rad = Math.toRadians(lastBr);
+            double c = Math.cos(rad), sn = Math.sin(rad);
+            rx = dx * c - dy * sn;
+            ry = dx * sn + dy * c;
+        }
+        if (lastTilted) ry /= Math.max(0.35, Math.cos(Math.toRadians(curTilt)));
+        panLon += (rx / ts) * (360.0 / n);
+        if (panLon > 180) panLon -= 360;
+        if (panLon < -180) panLon += 360;
+        double latR = Math.toRadians(Math.max(-85.0, Math.min(85.0, panLat)));
+        double fy = (1.0 - Math.log(Math.tan(latR) + 1.0 / Math.cos(latR)) / Math.PI) / 2.0 * n;
+        fy += ry / ts;
+        double nLatR = Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * fy / n)));
+        panLat = Math.max(-85.0, Math.min(85.0, Math.toDegrees(nLatR)));
+        invalidate();
+    }
+
+    private double[] screenToLatLon(float sx, float sy) {
+        if (lastDrawZoom <= 0 || lastCx <= 0) return null;
+        float[] pt = new float[]{sx, sy};
+        if (lastTilted) invTiltM.mapPoints(pt);
+        float dx = pt[0] - lastCx, dy = pt[1] - lastCy;
+        if (lastRot && !Float.isNaN(lastBr)) {
+            double rad = Math.toRadians(lastBr);
+            double c = Math.cos(rad), sn = Math.sin(rad);
+            float ndx = (float) (dx * c - dy * sn);
+            float ndy = (float) (dx * sn + dy * c);
+            dx = ndx; dy = ndy;
+        }
+        double ts = 256.0 * s;
+        int n = 1 << lastDrawZoom;
+        double fx = lastFx + dx / ts;
+        double fy = lastFy + dy / ts;
+        double lon = (fx / n) * 360.0 - 180.0;
+        double latR = Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * fy / n)));
+        double lat = Math.max(-85.0, Math.min(85.0, Math.toDegrees(latR)));
+        return new double[]{lat, lon};
+    }
+
+    @Override
+    public boolean onTouchEvent(android.view.MotionEvent e) {
+        boolean handled = scaleDet.onTouchEvent(e);
+        if (!scaleDet.isInProgress()) handled |= gestDet.onTouchEvent(e);
+        if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+            getParent().requestDisallowInterceptTouchEvent(true);
+        } else if (e.getActionMasked() == android.view.MotionEvent.ACTION_UP || e.getActionMasked() == android.view.MotionEvent.ACTION_CANCEL) {
+            getParent().requestDisallowInterceptTouchEvent(false);
+        }
+        return handled || super.onTouchEvent(e);
+    }
 
     /** Toque: cambia el nivel de zoom (14→17). */
     public void cycleZoom() {
+        if (previewPlace != null) {
+            previewZoom = previewZoom >= 17 ? 14 : previewZoom + 1;
+            invalidate();
+            return;
+        }
         userZoom = true;
         zoom = zoom >= 17 ? 14 : zoom + 1;
         invalidate();
     }
 
     /** Faro: acercar (+1) o alejar (-1) con los botones del mapa. */
-    void zoomBy(int d) { userZoom = true; zoom = Math.max(11, Math.min(18, zoom + d)); invalidate(); }
+    void zoomBy(int d) {
+        if (previewPlace != null) {
+            previewZoom = Math.max(11, Math.min(18, previewZoom + d));
+            invalidate();
+            return;
+        }
+        userZoom = true;
+        zoom = Math.max(5, Math.min(18, zoom + d));
+        invalidate();
+    }
 
-    /** Faro: botón de centrar: vuelve al zoom automático según la velocidad. */
-    void autoZoom() { userZoom = false; zoom = 16; invalidate(); }
+    /** Faro: botón de centrar: vuelve al zoom automático según la velocidad (y sale de vista previa si hay). */
+    void autoZoom() {
+        recenter();
+    }
 
     /** Pruebas: fija el zoom (14–18). */
-    void setZoom(int z) { userZoom = true; zoom = Math.max(10, Math.min(18, z)); invalidate(); }
+    void setZoom(int z) { userZoom = true; zoom = Math.max(5, Math.min(18, z)); invalidate(); }
 
     @Override
     protected void onDraw(Canvas c) {
@@ -412,26 +680,99 @@ public class LiveMapView extends View {
         else c.drawColor(Main.LIGHT ? 0xFFE8EBF0 : 0xFF15171C);
         boolean moving = step(SystemClock.uptimeMillis());
 
-        if (!Double.isNaN(dLat)) {
+        float targetTilt = view3d ? Math.max(0f, Math.min(65f, tiltAngle)) : 0f;
+        if (Math.abs(curTilt - targetTilt) > 0.35f) {
+            curTilt += (targetTilt - curTilt) * 0.25f;
+            moving = true;
+        } else {
+            curTilt = targetTilt;
+        }
+
+        Nav.Place pvPlace = previewPlace;
+        boolean hasPreview = pvPlace != null;
+        double cLat = hasPreview ? pvPlace.lat : (!following || !hasFix()) ? panLat : dLat;
+        double cLon = hasPreview ? pvPlace.lon : (!following || !hasFix()) ? panLon : dLon;
+        if (hasPreview || !following || !hasFix()) hasCenter = true;
+        else if (hasFix()) { panLat = dLat; panLon = dLon; hasCenter = true; }
+
+        if (!Double.isNaN(cLat) && !Double.isNaN(cLon)) {
+            int activeZoom = hasPreview ? previewZoom : zoom;
             OfflineMap fm = fileMap;
-            boolean fileHere = fm != null && fm.contains(dLat, dLon);
-            if (!fileHere && zoom > MAXZ[provider]) zoom = MAXZ[provider];
-            int n = 1 << zoom;
-            double fx = (dLon + 180.0) / 360.0 * n;
-            double latR = Math.toRadians(dLat);
+            boolean fileHere = fm != null && fm.contains(cLat, cLon);
+            if (!fileHere && activeZoom > MAXZ[provider]) activeZoom = MAXZ[provider];
+            int n = 1 << activeZoom;
+            double fx = (cLon + 180.0) / 360.0 * n;
+            double latR = Math.toRadians(cLat);
             double fy = (1.0 - Math.log(Math.tan(latR) + 1.0 / Math.cos(latR)) / Math.PI) / 2.0 * n;
             float ts = 256 * s;                                    // tamaño de tesela en pantalla
-            boolean rot = headingUp && !Float.isNaN(dBr);
-            float cx = w / 2f, cy = Nav.active != null ? (rot ? h * 0.54f : h * 0.50f) : h * 0.42f;
-            int tx0 = (int) Math.floor(fx - cx / ts) - 1, tx1 = (int) Math.floor(fx + (w - cx) / ts) + 1;
-            int ty0 = (int) Math.floor(fy - cy / ts) - 1, ty1 = (int) Math.floor(fy + (h - cy) / ts) + 1;
-            if (rot) {
+            boolean rot = !hasPreview && !overviewMode && following && headingUp && !Float.isNaN(dBr);
+            boolean tilted = curTilt > 0.5f && !overviewMode;
+            float cx = w / 2f;
+            float cy = (hasPreview || overviewMode || !following) ? h * 0.45f
+                    : tilted ? h * 0.64f
+                    : (Nav.active != null ? (rot ? h * 0.54f : h * 0.50f) : h * 0.42f);
+            lastDrawZoom = activeZoom; lastCx = cx; lastCy = cy;
+            lastFx = fx; lastFy = fy; lastTilted = tilted; lastRot = rot; lastBr = dBr;
+
+            int tx0, tx1, ty0, ty1;
+            if (tilted) {
+                cam3d.save();
+                float camDistPx = Math.max(576f, Math.max(w, h) * 1.35f);
+                cam3d.setLocation(0f, 0f, -camDistPx / 72f);
+                cam3d.rotateX(curTilt);
+                cam3d.getMatrix(tiltM);
+                cam3d.restore();
+                tiltM.preTranslate(-cx, -cy);
+                tiltM.postTranslate(cx, cy);
+                if (tiltM.invert(invTiltM)) {
+                    cornerPts[0] = 0; cornerPts[1] = 0;
+                    cornerPts[2] = w; cornerPts[3] = 0;
+                    cornerPts[4] = w; cornerPts[5] = h;
+                    cornerPts[6] = 0; cornerPts[7] = h;
+                    invTiltM.mapPoints(cornerPts);
+                    float maxSpan = Math.max(w, h) * 3.2f;
+                    float minDx = 0, maxDx = 0, minDy = 0, maxDy = 0;
+                    for (int i = 0; i < 8; i += 2) {
+                        float dx = Math.max(-maxSpan, Math.min(maxSpan, cornerPts[i] - cx));
+                        float dy = Math.max(-maxSpan, Math.min(maxSpan, cornerPts[i + 1] - cy));
+                        if (i == 0 || dx < minDx) minDx = dx;
+                        if (i == 0 || dx > maxDx) maxDx = dx;
+                        if (i == 0 || dy < minDy) minDy = dy;
+                        if (i == 0 || dy > maxDy) maxDy = dy;
+                    }
+                    if (rot) {
+                        float rr = (float) Math.hypot(Math.max(Math.abs(minDx), Math.abs(maxDx)), Math.max(Math.abs(minDy), Math.abs(maxDy))) / ts;
+                        rr = Math.min(rr, 6f);
+                        tx0 = (int) Math.floor(fx - rr) - 1; tx1 = (int) Math.floor(fx + rr) + 1;
+                        ty0 = (int) Math.floor(fy - rr) - 1; ty1 = (int) Math.floor(fy + rr) + 1;
+                    } else {
+                        tx0 = (int) Math.floor(fx + minDx / ts) - 1; tx1 = (int) Math.floor(fx + maxDx / ts) + 1;
+                        ty0 = (int) Math.floor(fy + minDy / ts) - 1; ty1 = (int) Math.floor(fy + maxDy / ts) + 1;
+                    }
+                } else {
+                    float rr = (float) Math.hypot(w, h) / ts;
+                    tx0 = (int) Math.floor(fx - rr) - 1; tx1 = (int) Math.floor(fx + rr) + 1;
+                    ty0 = (int) Math.floor(fy - rr) - 1; ty1 = (int) Math.floor(fy + rr) + 1;
+                }
+            } else if (rot) {
                 // al girar hacen falta teselas en un círculo alrededor de la posición (hasta la esquina más lejana)
                 float rr = (float) Math.sqrt(Math.max(cx, w - cx) * Math.max(cx, w - cx) + Math.max(cy, h - cy) * Math.max(cy, h - cy)) / ts;
                 tx0 = (int) Math.floor(fx - rr); tx1 = (int) Math.floor(fx + rr);
                 ty0 = (int) Math.floor(fy - rr); ty1 = (int) Math.floor(fy + rr);
+            } else {
+                tx0 = (int) Math.floor(fx - cx / ts) - 1; tx1 = (int) Math.floor(fx + (w - cx) / ts) + 1;
+                ty0 = (int) Math.floor(fy - cy / ts) - 1; ty1 = (int) Math.floor(fy + (h - cy) / ts) + 1;
+            }
+
+            // Límite de seguridad para evitar bucles enormes en GPUs antiguas
+            int cFx = (int) Math.floor(fx), cFy = (int) Math.floor(fy);
+            tx0 = Math.max(tx0, cFx - 6); tx1 = Math.min(tx1, cFx + 6);
+            ty0 = Math.max(ty0, cFy - 6); ty1 = Math.min(ty1, cFy + 6);
+
+            if (tilted || rot) {
                 c.save();
-                c.rotate(-dBr, cx, cy);
+                if (tilted) c.concat(tiltM);
+                if (rot) c.rotate(-dBr, cx, cy);
             }
             boolean anyFile = false;
             String trTpl = trafficTpl();
@@ -442,20 +783,20 @@ public class LiveMapView extends View {
                     int wx = ((tx % n) + n) % n;
                     float left = cx + (float) ((tx - fx) * ts), top = cy + (float) ((ty - fy) * ts);
                     dst.set(Math.round(left), Math.round(top), Math.round(left + ts) + 1, Math.round(top + ts) + 1);
-                    boolean fromFile = fm != null && fm.coversFast(zoom, wx, ty);
-                    Bitmap b = get(zoom, wx, ty, fromFile ? L_FILE : L_BASE);
+                    boolean fromFile = fm != null && fm.coversFast(activeZoom, wx, ty);
+                    Bitmap b = get(activeZoom, wx, ty, fromFile ? L_FILE : L_BASE);
                     if (b != null) {
-                        tile.setFilterBitmap(rot || b.getWidth() != dst.width());
+                        tile.setFilterBitmap(rot || tilted || b.getWidth() != dst.width());
                         Paint tp = tile;
                         if (toned) { tileTone.setAlpha(tile.getAlpha()); tileTone.setFilterBitmap(tile.isFilterBitmap()); tp = tileTone; }
                         c.drawBitmap(b, null, dst, tp);
-                        if (trTpl != null && zoom >= 11) {
-                            Bitmap tr = getTraffic(zoom, wx, ty, trPv);
+                        if (trTpl != null && activeZoom >= 11) {
+                            Bitmap tr = getTraffic(activeZoom, wx, ty, trPv);
                             if (tr != null) c.drawBitmap(tr, null, dst, tile);
                         }
                         if (fromFile) anyFile = true;
                         else if (LABELS[provider] != null) {
-                            Bitmap l = get(zoom, wx, ty, L_LABELS);
+                            Bitmap l = get(activeZoom, wx, ty, L_LABELS);
                             if (l != null) c.drawBitmap(l, null, dst, toned ? tileTone : tile);
                         }
                     } else {
@@ -464,9 +805,36 @@ public class LiveMapView extends View {
                     }
                 }
             }
-            drawRoute(c, fx, fy, cx, cy, ts, n);
-            if (rot) c.restore();
-            drawMarker(c, cx, cy, rot);
+            drawRoute(c, fx, fy, cx, cy, ts, n, hasPreview);
+            drawPoliceReports(c, fx, fy, cx, cy, ts, n);
+            if (tilted || rot) c.restore();
+
+            if (tilted && !bd && h > 0) {
+                int hh = Math.round(h * 0.16f);
+                if (hh != horizonH || horizonLight != Main.LIGHT) {
+                    horizonH = hh;
+                    horizonLight = Main.LIGHT;
+                    int hc = Main.LIGHT ? 0xFFE8EBF0 : 0xFF15171C;
+                    horizonPaint.setShader(new LinearGradient(0, 0, 0, hh, hc, hc & 0x00FFFFFF, Shader.TileMode.CLAMP));
+                }
+                horizonPaint.setAlpha(Math.min(200, Math.round(curTilt * 3.0f)));
+                c.drawRect(0, 0, w, horizonH, horizonPaint);
+            }
+
+            if (hasPreview || !following || overviewMode || !hasFix()) {
+                if (!Double.isNaN(dLat) && !Double.isNaN(dLon)) {
+                    tmpPt[0] = mapX(dLon, fx, cx, ts, n);
+                    tmpPt[1] = mapY(dLat, fy, cy, ts, n);
+                    if (tilted) tiltM.mapPoints(tmpPt);
+                    if (tmpPt[0] > -40 && tmpPt[0] < w + 40 && tmpPt[1] > -40 && tmpPt[1] < h + 40) {
+                        drawMarker(c, tmpPt[0], tmpPt[1], false, tilted ? curTilt * 0.45f : 0f);
+                    }
+                }
+                if (hasPreview) drawPreviewPin(c, cx, cy, pvPlace.name);
+            } else {
+                drawMarker(c, cx, cy, rot, tilted ? curTilt * 0.55f : 0f);
+            }
+
             if (bd) drawFade(c, w, h);
             String attr = anyFile ? I18n.t("© colaboradores de OpenStreetMap") + " · mapsforge"
                     : provider == 5 ? "© Esri, HERE, Garmin, © OpenStreetMap" : provider == 4 ? "© OpenStreetMap, SRTM · © OpenTopoMap" : I18n.t("© colaboradores de OpenStreetMap");
@@ -485,10 +853,15 @@ public class LiveMapView extends View {
             corner.setColor(Main.BG);
             c.drawPath(corners, corner);
         }
+        if (Nav.nearbyPolice != null || (Nav.active != null && (Nav.nearbyCamera != null || Nav.nearbyIncident != null))) moving = true;
         if (moving) postInvalidateDelayed(FRAME_MS);
     }
 
-    private void drawMarker(Canvas c, float x, float y, boolean rotated) {
+    private void drawMarker(Canvas c, float x, float y, boolean rotated, float tiltForeshorten) {
+        c.save();
+        if (tiltForeshorten > 0.5f) {
+            c.scale(1f, Math.max(0.55f, (float) Math.cos(Math.toRadians(tiltForeshorten))), x, y);
+        }
         halo.setColor((Main.RED & 0x00FFFFFF) | 0x40000000);
         c.drawCircle(x, y, 22 * s, halo);
         c.save();
@@ -507,6 +880,46 @@ public class LiveMapView extends View {
         arrow.setColor(0xFFFFFFFF);
         c.drawPath(tri, arrow);
         c.restore();
+        c.restore();
+    }
+
+    private void drawPreviewPin(Canvas c, float x, float y, String label) {
+        halo.setColor((Main.RED & 0x00FFFFFF) | 0x48000000);
+        c.drawCircle(x, y, 18 * s, halo);
+        halo.setColor(0x55000000);
+        tmpRect.set(x - 8 * s, y - 3 * s, x + 8 * s, y + 3 * s);
+        c.drawOval(tmpRect, halo);
+        // Alfiler elevado con punta en (x, y)
+        float cyPin = y - 20 * s;
+        float rPin = 12 * s;
+        tri.reset();
+        tri.moveTo(x, y);
+        tri.lineTo(x - rPin * 0.72f, cyPin + rPin * 0.45f);
+        tri.lineTo(x + rPin * 0.72f, cyPin + rPin * 0.45f);
+        tri.close();
+        destPin.setStyle(Paint.Style.FILL);
+        destPin.setColor(Main.RED);
+        c.drawPath(tri, destPin);
+        c.drawCircle(x, cyPin, rPin, destPin);
+        arrow.setStyle(Paint.Style.STROKE);
+        arrow.setStrokeWidth(2.2f * s);
+        arrow.setColor(0xFFFFFFFF);
+        c.drawCircle(x, cyPin, rPin, arrow);
+        destPin.setColor(0xFFFFFFFF);
+        c.drawCircle(x, cyPin, 4.2f * s, destPin);
+
+        if (label != null && label.length() > 0) {
+            String txt = label.length() > 28 ? label.substring(0, 27) + "…" : label;
+            float tw = previewText.measureText(txt);
+            float pw = tw + 18 * s, ph = 24 * s;
+            float px = Math.max(8 * s, Math.min(getWidth() - pw - 8 * s, x - pw / 2f));
+            float py = Math.max(6 * s, cyPin - rPin - ph - 6 * s);
+            previewBg.setColor(Main.LIGHT ? 0xF2FFFFFF : 0xEB181B22);
+            tmpRect.set(px, py, px + pw, py + ph);
+            c.drawRoundRect(tmpRect, 12 * s, 12 * s, previewBg);
+            previewText.setColor(Main.LIGHT ? 0xFF14161B : 0xFFF2F3F5);
+            c.drawText(txt, px + 9 * s, py + 16.5f * s, previewText);
+        }
     }
 
     private float mapX(double lon, double fx, float cx, float ts, int n) {
@@ -523,7 +936,7 @@ public class LiveMapView extends View {
         return cy + (float) ((py - fy) * ts);
     }
 
-    private void drawRoute(Canvas c, double fx, double fy, float cx, float cy, float ts, int n) {
+    private void drawRoute(Canvas c, double fx, double fy, float cx, float cy, float ts, int n, boolean hasPreview) {
         java.util.List<Nav.Route> alts = Nav.altRoutes;
         if (alts != null && alts.size() > 1) {
             routeBack.setColor(Main.LIGHT ? 0x554A5568 : 0x779AA2B1);
@@ -550,10 +963,10 @@ public class LiveMapView extends View {
         if (r == null || r.pts == null || r.pts.length < 4) return;
         int nPts = r.pts.length / 2;
         int start = Math.max(0, Math.min(nPts - 1, Nav.curPtIdx));
-        boolean offRoute = Nav.offlineOffRoute;
+        boolean offRoute = Nav.offlineOffRoute || hasPreview;
         float startX = offRoute ? mapX(r.pts[start * 2 + 1], fx, cx, ts, n) : cx;
         float startY = offRoute ? mapY(r.pts[start * 2], fy, cy, ts, n) : cy;
-        if (offRoute) {
+        if (Nav.offlineOffRoute && !hasPreview) {
             routePath.reset();
             routePath.moveTo(cx, cy);
             routePath.lineTo(startX, startY);
@@ -610,6 +1023,7 @@ public class LiveMapView extends View {
                 Nav.Camera cam = r.cameras.get(ci);
                 float kx = mapX(cam.lon, fx, cx, ts, n);
                 float ky = mapY(cam.lat, fy, cy, ts, n);
+                if (cam == Nav.nearbyCamera) drawWaveRipple(c, kx, ky, 0xFFEF4444);
                 destPin.setColor(0xFFFFFFFF);
                 c.drawCircle(kx, ky, 6f * s, destPin);
                 destPin.setColor(0xFFE63946);
@@ -624,6 +1038,7 @@ public class LiveMapView extends View {
                 Nav.Incident inc = r.incidents.get(ii);
                 float ix = mapX(inc.lon, fx, cx, ts, n);
                 float iy = mapY(inc.lat, fy, cy, ts, n);
+                if (inc == Nav.nearbyIncident) drawWaveRipple(c, ix, iy, 0xFFF59E0B);
                 destPin.setColor(0xFF1A1D24);
                 c.drawCircle(ix, iy, 7f * s, destPin);
                 destPin.setColor(inc.category == 8 || inc.category == 1 ? 0xFFE63946 : 0xFFF5A623);
@@ -639,6 +1054,65 @@ public class LiveMapView extends View {
         c.drawCircle(dxS, dyS, 10 * s, destPin);
         destPin.setColor(Main.RED);
         c.drawCircle(dxS, dyS, 6.5f * s, destPin);
+    }
+
+    private void drawPoliceReports(Canvas c, double fx, double fy, float cx, float cy, float ts, int n) {
+        java.util.List<Nav.PoliceReport> list = Nav.getPoliceReports(getContext());
+        if (list == null || list.isEmpty()) return;
+        Nav.PoliceReport near = Nav.nearbyPolice;
+        destPin.setStyle(Paint.Style.FILL);
+        for (int i = 0; i < list.size(); i++) {
+            Nav.PoliceReport pr = list.get(i);
+            if (pr == null) continue;
+            float px = mapX(pr.lon, fx, cx, ts, n);
+            float py = mapY(pr.lat, fy, cy, ts, n);
+            if (near != null && (near == pr || (near.id != null && near.id.equals(pr.id)))) {
+                drawPoliceWaveRipple(c, px, py);
+            }
+            destPin.setColor(0xFFFFFFFF);
+            c.drawCircle(px, py, 8f * s, destPin);
+            destPin.setColor(0xFF2563EB);
+            c.drawCircle(px, py, 5.5f * s, destPin);
+        }
+    }
+
+    private void drawWaveRipple(Canvas c, float x, float y, int rgbColor) {
+        long period = 1700L;
+        long now = SystemClock.uptimeMillis();
+        int rgb = rgbColor & 0x00FFFFFF;
+        for (int ring = 0; ring < 2; ring++) {
+            float p = ((now + (ring == 1 ? period / 2 : 0L)) % period) / (float) period;
+            float r = (10f + p * 38f) * s;
+            int fillAlpha = Math.max(0, Math.min(255, Math.round((1f - p) * 52f)));
+            int strokeAlpha = Math.max(0, Math.min(255, Math.round((1f - p) * 215f)));
+            wavePaint.setStyle(Paint.Style.FILL);
+            wavePaint.setColor(rgb | (fillAlpha << 24));
+            c.drawCircle(x, y, r, wavePaint);
+            wavePaint.setStyle(Paint.Style.STROKE);
+            wavePaint.setStrokeWidth(2.4f * s);
+            wavePaint.setColor(rgb | (strokeAlpha << 24));
+            c.drawCircle(x, y, r, wavePaint);
+        }
+    }
+
+    private void drawPoliceWaveRipple(Canvas c, float x, float y) {
+        long period = 1400L;
+        long now = SystemClock.uptimeMillis();
+        int[] cols = new int[]{0x002563EB, 0x00EF4444};
+        for (int ring = 0; ring < 2; ring++) {
+            float p = ((now + (ring == 1 ? period / 2 : 0L)) % period) / (float) period;
+            float r = (11f + p * 40f) * s;
+            int rgb = cols[ring];
+            int fillAlpha = Math.max(0, Math.min(255, Math.round((1f - p) * 56f)));
+            int strokeAlpha = Math.max(0, Math.min(255, Math.round((1f - p) * 225f)));
+            wavePaint.setStyle(Paint.Style.FILL);
+            wavePaint.setColor(rgb | (fillAlpha << 24));
+            c.drawCircle(x, y, r, wavePaint);
+            wavePaint.setStyle(Paint.Style.STROKE);
+            wavePaint.setStrokeWidth(2.6f * s);
+            wavePaint.setColor(rgb | (strokeAlpha << 24));
+            c.drawCircle(x, y, r, wavePaint);
+        }
     }
 
     // ── teselas ──
@@ -784,7 +1258,7 @@ public class LiveMapView extends View {
                         if (b != null && DARKEN[pv] && layer == 0 && !Main.LIGHT) b = darken(b, bright);
                     }
                 } catch (Throwable e) {
-                    if (layer != L_FILE && layer != L_TRAFFIC) { netErrors++; netOffline = netErrors >= 3; }
+                    if (layer != L_FILE && layer != L_TRAFFIC) { netErrors++; netOffline = netErrors >= 8; }
                     else if (layer == L_FILE) lastError = "[archivo] " + e;
                 }
                 final long fk = k;
