@@ -16,6 +16,10 @@ captures/
 !app/src/main/assets/roots.pem
 keystore.properties
 
+# Secrets & Firebase CLI logs
+.env
+*-debug.log
+
 # Sistema
 .DS_Store
 Thumbs.db

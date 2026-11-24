@@ -1,0 +1,166 @@
+# name	category	subtitle	lat	lon	alt_tokens
+Kuala Lumpur	city	Wilayah Persekutuan, Malaysia	3.1390	101.6869	kl ibu kota capital
+Putrajaya	city	Wilayah Persekutuan, Malaysia	2.9264	101.6964	cyberjaya govt administrative
+Petaling Jaya	city	Selangor, Malaysia	3.1073	101.6067	pj damansara ss2
+Shah Alam	city	Selangor, Malaysia	3.0733	101.5185	i-city seksyen
+Subang Jaya	city	Selangor, Malaysia	3.0449	101.5851	usj ss15 sunway
+Klang	city	Selangor, Malaysia	3.0449	101.4456	port klang pelabuhan
+Cyberjaya	town	Selangor, Malaysia	2.9213	101.6559	mmu dpulze tamarind
+Kajang	town	Selangor, Malaysia	2.9935	101.7874	satay bangi sungai jelok
+Bandar Baru Bangi	town	Selangor, Malaysia	2.9631	101.7510	bangi ukm evo
+Puchong	town	Selangor, Malaysia	3.0327	101.6188	ioi puchong prima kinrara
+Cheras	suburb	Kuala Lumpur / Selangor, Malaysia	3.0833	101.7410	maluri taman connaught
+Ampang	town	Selangor, Malaysia	3.1494	101.7623	ampang point pandan
+Rawang	town	Selangor, Malaysia	3.3213	101.5767	selayang kundang
+Sepang	town	Selangor, Malaysia	2.6933	101.7497	klia sic sepang circuit
+Seremban	city	Negeri Sembilan, Malaysia	2.7258	101.9424	seremban 2 senawang
+Nilai	town	Negeri Sembilan, Malaysia	2.8167	101.7972	usim aeon nilai
+Port Dickson	town	Negeri Sembilan, Malaysia	2.5225	101.7963	pd teluk kemang beach
+Melaka	city	Melaka, Malaysia	2.1896	102.2501	malacca bandar hilir jonker
+Ayer Keroh	town	Melaka, Malaysia	2.2654	102.2801	mitc melaka zoo
+Muar	town	Johor, Malaysia	2.0442	102.5689	bandar maharani
+Batu Pahat	town	Johor, Malaysia	1.8548	102.9325	bp mall
+Kluang	town	Johor, Malaysia	2.0301	103.3185	kluang rail
+Johor Bahru	city	Johor, Malaysia	1.4927	103.7414	jb skudai larkin ciq
+Pasir Gudang	town	Johor, Malaysia	1.4703	103.9029	masai johor port
+Senai	town	Johor, Malaysia	1.6006	103.6419	kulai senai airport
+Iskandar Puteri	city	Johor, Malaysia	1.4237	103.6317	nusajaya legoland puteri harbour
+Ipoh	city	Perak, Malaysia	4.5975	101.0901	perak tambun lost world
+Taiping	town	Perak, Malaysia	4.8500	100.7333	kamunting lake gardens
+Lumut	town	Perak, Malaysia	4.2333	100.6300	pangkor sitiawan
+Teluk Intan	town	Perak, Malaysia	4.0222	101.0208	leaning tower perak
+Tanjung Malim	town	Perak, Malaysia	3.6816	101.5205	upsi proton city behrang
+George Town	city	Pulau Pinang, Malaysia	5.4141	100.3288	penang pulau pinang komtar
+Butterworth	town	Pulau Pinang, Malaysia	5.3991	100.3638	penang sentral prai seberang
+Bayan Lepas	town	Pulau Pinang, Malaysia	5.2946	100.2591	penang airport fizo spice
+Bukit Mertajam	town	Pulau Pinang, Malaysia	5.3630	100.4667	bm juru auto city
+Sungai Petani	town	Kedah, Malaysia	5.6470	100.4877	sp amanpuri kedah
+Alor Setar	city	Kedah, Malaysia	6.1248	100.3678	kedah menara alor setar
+Langkawi	town	Kedah, Malaysia	6.3500	99.8000	kuah pantai cenang
+Kangar	town	Perlis, Malaysia	6.4414	100.1986	perlis arau
+Kuantan	city	Pahang, Malaysia	3.8077	103.3260	pahang teluk cempedak gebeng
+Temerloh	town	Pahang, Malaysia	3.4506	102.4176	patin lpt
+Bentong	town	Pahang, Malaysia	3.5223	101.9087	karak bukit tinggi
+Genting Highlands	tourism	Pahang, Malaysia	3.4236	101.7932	resorts world skyavenue awana gohtong
+Cameron Highlands	tourism	Pahang, Malaysia	4.4721	101.3801	tanah rata brinchang kea farm
+Kuala Terengganu	city	Terengganu, Malaysia	5.3296	103.1370	drawbridge batu buruk
+Kemaman	town	Terengganu, Malaysia	4.2333	103.4167	chukai kerteh
+Kota Bharu	city	Kelantan, Malaysia	6.1254	102.2381	kelantan wakaf che yeh
+Kuching	city	Sarawak, Malaysia	1.5533	110.3592	sarawak waterfront vivacity
+Miri	city	Sarawak, Malaysia	4.3995	113.9914	sarawak permaisuri
+Bintulu	town	Sarawak, Malaysia	3.1667	113.0333	kidurong tanjung batu
+Sibu	town	Sarawak, Malaysia	2.3000	111.8167	rajang sibu central
+Kota Kinabalu	city	Sabah, Malaysia	5.9804	116.0735	kk sabah suria imago
+Sandakan	city	Sabah, Malaysia	5.8402	118.1179	sepilok sabah
+Tawau	town	Sabah, Malaysia	4.2448	117.8912	semporna sabah
+KLIA Terminal 1	aerodrome	Sepang, Selangor, Malaysia	2.7456	101.7099	kuala lumpur international airport klia1
+KLIA Terminal 2	aerodrome	Sepang, Selangor, Malaysia	2.7433	101.6860	klia2 gateway sepang airport
+Sultan Abdul Aziz Shah Airport	aerodrome	Subang, Selangor, Malaysia	3.1306	101.5493	subang skypark szb airport
+Penang International Airport	aerodrome	Bayan Lepas, Pulau Pinang	5.2971	100.2769	pen airport bayan lepas
+Senai International Airport	aerodrome	Senai, Johor, Malaysia	1.6413	103.6696	jhb johor airport
+Kota Kinabalu International Airport	aerodrome	Kota Kinabalu, Sabah	5.9372	116.0512	bki kkia sabah airport
+Kuching International Airport	aerodrome	Kuching, Sarawak	1.4847	110.3469	kch sarawak airport
+KL Sentral	station	Brickfields, Kuala Lumpur	3.1341	101.6861	stesen sentral ets lrt mrt monorail erl
+Terminal Bersepadu Selatan (TBS)	station	Bandar Tasik Selatan, Kuala Lumpur	3.0772	101.7106	tbs bts express bus terminal
+JB Sentral	station	Johor Bahru, Johor	1.4628	103.7647	ktm ciq woodlans shuttle
+Penang Sentral	station	Butterworth, Pulau Pinang	5.3947	100.3652	ferry ktm bus terminal
+Suria KLCC / Petronas Twin Towers	mall	Jalan Ampang, Kuala Lumpur	3.1579	101.7116	klcc twin towers shopping mall
+Pavilion Kuala Lumpur	mall	Bukit Bintang, Kuala Lumpur	3.1489	101.7133	pavilion kl bukit bintang mall
+Mid Valley Megamall	mall	Lingkaran Syed Putra, Kuala Lumpur	3.1177	101.6774	midvalley gardens mall
+Sunway Pyramid	mall	Bandar Sunway, Selangor	3.0730	101.6075	sunway lagoon mall subang
+1 Utama Shopping Centre	mall	Bandar Utama, Petaling Jaya	3.1502	101.6156	one utama 1u bu mall
+IOI City Mall	mall	Putrajaya / Sepang, Selangor	2.9708	101.7137	ioi resort city putrajaya mall
+The Exchange TRX	mall	Tun Razak Exchange, Kuala Lumpur	3.1422	101.7191	trx mall seibu bukit bintang
+MyTOWN / IKEA Cheras	mall	Cheras, Kuala Lumpur	3.1353	101.7224	mytown ikea cochrane
+Pavilion Bukit Jalil	mall	Bukit Jalil, Kuala Lumpur	3.0504	101.6717	bukit jalil stadium mall
+Batu Caves	tourism	Gombak, Selangor, Malaysia	3.2379	101.6840	temple murugan caves
+Dataran Merdeka	tourism	Kuala Lumpur, Malaysia	3.1486	101.6937	merdeka square sultan abdul samad
+Menara Kuala Lumpur (KL Tower)	tourism	Bukit Nanas, Kuala Lumpur	3.1528	101.7038	kl tower menara kl
+Hospital Kuala Lumpur (HKL)	hospital	Jalan Pahang, Kuala Lumpur	3.1715	101.7016	hkl general hospital
+Pusat Perubatan Universiti Malaya (PPUM)	hospital	Lembah Pantai, Petaling Jaya	3.1128	101.6537	ummc ppum university malaya hospital
+Hospital Canselor Tuanku Muhriz (HUKM)	hospital	Cheras, Kuala Lumpur	3.0991	101.7254	hukm ukm hospital cheras
+Hospital Sultan Idris Shah Serdang	hospital	Serdang, Selangor	2.9765	101.7195	hospital serdang upm
+Hospital Sungai Buloh	hospital	Sungai Buloh, Selangor	3.2197	101.5831	sg buloh hospital
+Hospital Shah Alam	hospital	Seksyen 7, Shah Alam	3.0715	101.4894	shah alam hospital
+Hospital Tengku Ampuan Rahimah	hospital	Klang, Selangor	3.0205	101.4408	htar klang hospital
+Hospital Putrajaya	hospital	Presint 7, Putrajaya	2.9293	101.6743	putrajaya hospital
+Hospital Tuanku Jaafar Seremban	hospital	Seremban, Negeri Sembilan	2.7086	101.9453	htj seremban hospital
+Hospital Melaka	hospital	Melaka Tengah, Melaka	2.2165	102.2614	general hospital melaka
+Hospital Sultanah Aminah JB	hospital	Johor Bahru, Johor	1.4586	103.7458	hsa jb hospital
+Hospital Raja Permaisuri Bainun	hospital	Ipoh, Perak	4.6038	101.0901	hrpb ipoh hospital
+Hospital Pulau Pinang	hospital	George Town, Pulau Pinang	5.4170	100.3112	hpp penang general hospital
+R&R Sungai Buloh (Southbound / Overhead Bridge)	services	PLUS North-South Expressway (E1)	3.1886	101.5844	rnr sungai buloh rest area fuel food
+R&R Rawang (Northbound)	services	PLUS North-South Expressway (E1)	3.3372	101.5529	rnr rawang rest area fuel food
+R&R Tapah (Northbound / Southbound)	services	PLUS North-South Expressway (E1)	4.1731	101.2817	rnr tapah rest area petronas shell kfc
+R&R Sungai Perak	services	PLUS North-South Expressway (E1)	4.7037	100.9585	rnr sg perak kuala kangsar rest area
+R&R Dengkil (ELITE)	services	ELITE Expressway (E6)	2.8712	101.6443	rnr dengkil cyberjaya klia fuel food
+R&R USJ (ELITE)	services	ELITE Expressway (E6)	3.0169	101.5798	rnr usj subang rest area petronas
+R&R Seremban (Northbound / Southbound)	services	PLUS North-South Expressway (E2)	2.7621	101.8748	rnr seremban rest area nilai labu
+R&R Ayer Keroh (Overhead Bridge)	services	PLUS North-South Expressway (E2)	2.3982	102.2305	rnr ayer keroh melaka overhead rest area
+R&R Pagoh	services	PLUS North-South Expressway (E2)	2.1558	102.7717	rnr pagoh muar rest area
+R&R Machap	services	PLUS North-South Expressway (E2)	1.8691	103.2711	rnr machap simpang renggam rest area
+R&R Skudai	services	PLUS North-South Expressway (E2)	1.5646	103.6579	rnr skudai johor rest area
+R&R Genting Sempah	services	Karak Highway (E8)	3.3489	101.7713	rnr genting sempah bentong rest area
+R&R Temerloh (LPT1)	services	East Coast Expressway (E8)	3.4892	102.4563	rnr temerloh lpt rest area
+R&R Gambang (LPT1)	services	East Coast Expressway (E8)	3.7024	103.0954	rnr gambang kuantan lpt rest area
+R&R Gurun	services	PLUS North-South Expressway (E1)	5.8257	100.4914	rnr gurun kedah rest area
+Plaza Tol Jalan Duta	toll	NKVE / PLUS (E1), Kuala Lumpur	3.1806	101.6621	jalan duta toll plaza
+Plaza Tol Sungai Besi	toll	PLUS (E2), Kuala Lumpur	3.0472	101.7038	sungai besi toll plaza
+Plaza Tol Skudai	toll	PLUS (E2), Johor Bahru	1.5515	103.6632	skudai toll plaza
+Plaza Tol Gombak	toll	Karak / LPT (E8), Selangor	3.2498	101.7248	gombak toll plaza karak
+Plaza Tol Juru	toll	PLUS (E1), Pulau Pinang	5.3207	100.4319	juru toll plaza
+Petronas Twin Towers Fuel / KLCC Area	fuel	Jalan Ampang / Jalan Tun Razak, KL	3.1544	101.7165	petronas petrol fuel klcc
+Petronas Sungai Besi Highway	fuel	Lebuhraya Sungai Besi, KL	3.0631	101.7052	petronas kfc petrol fuel tbs
+Shell Federal Highway PJ	fuel	Lebuhraya Persekutuan, Petaling Jaya	3.1032	101.6442	shell petrol fuel pj
+Petronas NKVE Damansara	fuel	NKVE / Kota Damansara, Selangor	3.1518	101.5892	petronas damansara petrol fuel
+BHPetrol Kesas Highway	fuel	Shah Alam Expressway (KESAS)	3.0389	101.5761	bhp kesas petrol fuel
+Universiti Malaya (UM)	university	Lembah Pantai, Kuala Lumpur	3.1209	101.6538	um university malaya
+Universiti Putra Malaysia (UPM)	university	Serdang, Selangor	2.9992	101.7079	upm serdang
+Universiti Kebangsaan Malaysia (UKM)	university	Bangi, Selangor	2.9277	101.7782	ukm bangi
+Universiti Teknologi Malaysia (UTM)	university	Skudai, Johor Bahru	1.5596	103.6382	utm skudai
+Universiti Sains Malaysia (USM)	university	Gelugor, Pulau Pinang	5.3554	100.3025	usm penang
+Masjid Negara	mosque	Jalan Perdana, Kuala Lumpur	3.1419	101.6917	national mosque kl
+Masjid Putra	mosque	Presint 1, Putrajaya	2.9361	101.6894	putra mosque pink mosque putrajaya
+Masjid Sultan Salahuddin Abdul Aziz Shah	mosque	Seksyen 14, Shah Alam	3.0789	101.5207	blue mosque masjid negeri shah alam
+Singapore	city	Singapore	1.3521	103.8198	sg singapura changi
+Changi Airport (SIN)	aerodrome	Singapore	1.3644	103.9915	sin changi singapore airport
+Bangkok	city	Thailand	13.7563	100.5018	bkk suvarnabhumi thailand
+Jakarta	city	Indonesia	-6.2088	106.8456	cgk indonesia
+Bogotá	city	Cundinamarca, Colombia	4.7110	-74.0721	bogota distrito capital colombia
+Medellín	city	Antioquia, Colombia	6.2442	-75.5812	medellin valle aburra antioquia
+Cali	city	Valle del Cauca, Colombia	3.4516	-76.5320	santiago de cali valle
+Barranquilla	city	Atlántico, Colombia	10.9685	-74.7813	baq atlantico caribe
+Cartagena	city	Bolívar, Colombia	10.3910	-75.4794	cartagena de indias bolivar
+Bucaramanga	city	Santander, Colombia	7.1193	-73.1227	santander bucaramanga
+Pereira	city	Risaralda, Colombia	4.8087	-75.6906	eje cafetero risaralda
+Manizales	city	Caldas, Colombia	5.0703	-75.5138	caldas eje cafetero
+Armenia	city	Quindío, Colombia	4.5339	-75.6811	quindio eje cafetero
+Santa Marta	city	Magdalena, Colombia	11.2404	-74.2110	rodadero magdalena
+Cúcuta	city	Norte de Santander, Colombia	7.8891	-72.4967	cucuta norte santander
+Ibagué	city	Tolima, Colombia	4.4389	-75.2322	ibague tolima
+Villavicencio	city	Meta, Colombia	4.1420	-73.6266	llanos meta
+Pasto	city	Nariño, Colombia	1.2136	-77.2811	san juan de pasto narino
+Montería	city	Córdoba, Colombia	8.7480	-75.8814	monteria cordoba
+Neiva	city	Huila, Colombia	2.9273	-75.2819	neiva huila
+Aeropuerto El Dorado (BOG)	aerodrome	Engativá, Bogotá, Colombia	4.7016	-74.1469	el dorado bog airport bogota
+Aeropuerto José María Córdova (MDE)	aerodrome	Rionegro, Antioquia, Colombia	6.1645	-75.4231	mde rionegro medellin airport
+Aeropuerto Alfonso Bonilla Aragón (CLO)	aerodrome	Palmira / Cali, Valle del Cauca	3.5432	-76.3816	clo palmira cali airport
+Aeropuerto Rafael Núñez (CTG)	aerodrome	Cartagena, Bolívar, Colombia	10.4424	-75.5130	ctg cartagena airport
+Aeropuerto Ernesto Cortissoz (BAQ)	aerodrome	Soledad / Barranquilla, Colombia	10.8896	-74.7808	baq barranquilla airport
+Terminal de Transporte Salitre	station	Fontibón, Bogotá, Colombia	4.6534	-74.1152	terminal salitre bogota buses
+Hospital Universitario San Ignacio	hospital	Chapinero, Bogotá, Colombia	4.6283	-74.0642	husi javeriana hospital bogota
+Fundación Santa Fe de Bogotá	hospital	Usaquén, Bogotá, Colombia	4.6946	-74.0342	fsfb hospital bogota
+Hospital Pablo Tobón Uribe	hospital	Robledo, Medellín, Colombia	6.2768	-75.5819	pablo tobon hospital medellin
+Centro Comercial Andino	mall	Zona T, Bogotá, Colombia	4.6669	-74.0528	andino zona t mall bogota
+Centro Comercial Santafé	mall	Suba / Usaquén, Bogotá, Colombia	4.7631	-74.0462	santafe bogota mall
+Centro Comercial Viva Envigado	mall	Envigado, Antioquia, Colombia	6.1783	-75.5919	viva envigado medellin mall
+Ciudad de México	city	CDMX, México	19.4326	-99.1332	cdmx mexico city df
+Buenos Aires	city	Argentina	-34.6037	-58.3816	caba ezeiza argentina
+Santiago	city	Región Metropolitana, Chile	-33.4489	-70.6693	scl chile
+Lima	city	Perú	-12.0464	-77.0428	lim peru
+Madrid	city	España	40.4168	-3.7038	mad barajas spain
+Barcelona	city	Cataluña, España	41.3874	2.1686	bcn catalonia spain
+London	city	United Kingdom	51.5072	-0.1276	lhr uk london
+New York	city	New York, United States	40.7128	-74.0060	nyc manhattan jfk usa
+Tokyo	city	Japan	35.6762	139.6503	tyo hnd nrt japan
+Dubai	city	United Arab Emirates	25.2048	55.2708	dxb uae dubai

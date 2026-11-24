@@ -91,11 +91,14 @@ final class Faro {
         return l ? 0xFF22A447 : 0xFF30D158;                  // lejos
     }
 
-    static final String[] CAR_COLORS = {"silver", "white", "black", "red", "blue"};
-    static final String[] CAR_NAMES = {"Plata", "Blanco", "Negro", "Rojo", "Azul"};
+    static final String CAR_ALMERA_N17 = "almera_n17";
+    static final String CAR_ALMERA_N17_REAR = "almera_n17_rear";
+    static final String CAR_ALMERA_N17_FRONT = "almera_n17_front";
+    static final String[] CAR_COLORS = {CAR_ALMERA_N17, "silver", "white", "black", "red", "blue"};
+    static final String[] CAR_NAMES = {"Nissan Almera N17 (Blanco)", "Plata", "Blanco", "Negro", "Rojo", "Azul"};
     static String car(String pref) {
         for (String c : CAR_COLORS) if (c.equals(pref)) return c;
-        return "silver";
+        return CAR_ALMERA_N17;
     }
 
     // ── fondo ──
@@ -405,16 +408,39 @@ final class Faro {
 
     // ── carro en vista cenital ──
 
-    static final float CAR_ASPECT = 279f / 640f;          // ancho / alto de las imágenes
+    static final float CAR_ASPECT = 279f / 640f;          // ancho / alto de las imágenes cenitales
     static final float LAMP_X = 0.21f, LAMP_Y = 0.066f;   // faros (fracción del recuadro del carro)
     static final float TAIL_X = 0.24f, TAIL_Y = 0.955f;   // luces traseras
+    static float carAspect(String col) {
+        if (CAR_ALMERA_N17_REAR.equals(col)) return 608f / 719f;
+        if (CAR_ALMERA_N17_FRONT.equals(col)) return 618f / 787f;
+        return CAR_ASPECT;
+    }
+    static boolean isAngled(String col) {
+        return CAR_ALMERA_N17_REAR.equals(col) || CAR_ALMERA_N17_FRONT.equals(col);
+    }
+    static float lampX(String col) { return CAR_ALMERA_N17.equals(col) ? 0.22f : LAMP_X; }
+    static float lampY(String col) { return CAR_ALMERA_N17.equals(col) ? 0.118f : LAMP_Y; }
+    static float tailX(String col) { return CAR_ALMERA_N17.equals(col) ? 0.138f : TAIL_X; }
+    static float tailY(String col) { return CAR_ALMERA_N17.equals(col) ? 0.865f : TAIL_Y; }
 
     /**
-     * Recuadro del carro dentro de una vista de vw×vh px. La sombra (difuminada, corrida a la derecha y abajo) queda
-     * entera DENTRO de la vista: así nunca se ve cortada en la base ni a los lados.
+     * Recuadro del carro dentro de una vista de vw×vh px. La sombra queda entera DENTRO de la vista.
      */
     static RectF carRect(float vw, float vh) {
-        float ch = Math.min(vh / 1.16f, vw / 1.62f / CAR_ASPECT), cw = ch * CAR_ASPECT;
+        return carRect(vw, vh, CAR_ALMERA_N17);
+    }
+
+    static RectF carRect(float vw, float vh, String col) {
+        float asp = carAspect(col);
+        if (isAngled(col)) {
+            float ch = Math.min(vh * 0.62f, vw * 0.72f / asp);
+            float cw = ch * asp;
+            float l = (vw - cw) / 2f;
+            float t = Math.max(4f, (vh - ch) * 0.48f);
+            return new RectF(l, t, l + cw, t + ch);
+        }
+        float ch = Math.min(vh / 1.16f, vw / 1.62f / asp), cw = ch * asp;
         float slack = Math.max(0, vh - ch * 1.16f);
         float l = (vw - cw) / 2, t = ch * 0.045f + slack * 0.3f;
         return new RectF(l, t, l + cw, t + ch);
@@ -489,12 +515,18 @@ final class Faro {
     static final class Car extends View {
         private final String color;
         private final boolean light;
+        private final int tailColor;
         private Bitmap frame;
 
         Car(Context c, String color, boolean light) {
+            this(c, color, light, 0xFFFF2A2A);
+        }
+
+        Car(Context c, String color, boolean light, int tailColor) {
             super(c);
             this.color = color;
             this.light = light;
+            this.tailColor = tailColor;
         }
 
         @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
@@ -504,27 +536,60 @@ final class Faro {
             try {
                 frame = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
                 Canvas cv = new Canvas(frame);
-                RectF r = carRect(w, h);
-                Bitmap sh = asset(getContext(), "faro/shadow.png");
-                if (sh != null) {
-                    float px = r.width() * 0.174f, py = r.height() * 0.076f;
-                    RectF sr = new RectF(r.left - px, r.top - py, r.right + px, r.bottom + py);
-                    sr.offset(light ? r.width() * 0.13f : 0, light ? r.height() * 0.035f : r.height() * 0.015f);
-                    float op = light ? 0.34f : 0.62f;
-                    Paint ps = new Paint(Paint.FILTER_BITMAP_FLAG);
-                    ps.setColorFilter(new ColorMatrixColorFilter(new float[]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, op, 0, 0, 0, 0}));
-                    cv.drawBitmap(sh, null, sr, ps);
-                    sh.recycle();
+                RectF r = carRect(w, h, color);
+                if (isAngled(color)) {
+                    // Sombra de estudio elíptica y limpia en el suelo bajo las ruedas
+                    Paint ps = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    boolean front = CAR_ALMERA_N17_FRONT.equals(color);
+                    float sx = r.centerX() + (light ? r.width() * 0.02f : 0f);
+                    float sy = r.bottom - r.height() * (front ? 0.07f : 0.06f);
+                    float rxOuter = r.width() * 0.58f;
+                    float ryOuter = Math.max(8f, r.height() * 0.14f);
+                    cv.save();
+                    cv.scale(1f, ryOuter / Math.max(1f, rxOuter), sx, sy);
+                    float aOuter = light ? 0.24f : 0.72f;
+                    ps.setShader(new RadialGradient(sx, sy, rxOuter,
+                        new int[]{Aurora.a(0xFF000000, aOuter), Aurora.a(0xFF000000, aOuter * 0.42f), 0},
+                        new float[]{0f, 0.56f, 1f}, Shader.TileMode.CLAMP));
+                    cv.drawCircle(sx, sy, rxOuter, ps);
+                    cv.restore();
+
+                    // Sombra de contacto nítida justo debajo del chasis y neumáticos
+                    float rxCore = r.width() * 0.42f;
+                    float ryCore = Math.max(5f, r.height() * 0.075f);
+                    cv.save();
+                    cv.scale(1f, ryCore / Math.max(1f, rxCore), sx, sy);
+                    float aCore = light ? 0.32f : 0.86f;
+                    ps.setShader(new RadialGradient(sx, sy, rxCore,
+                        new int[]{Aurora.a(0xFF000000, aCore), Aurora.a(0xFF000000, aCore * 0.35f), 0},
+                        new float[]{0f, 0.52f, 1f}, Shader.TileMode.CLAMP));
+                    cv.drawCircle(sx, sy, rxCore, ps);
+                    cv.restore();
+                    ps.setShader(null);
+                } else {
+                    Bitmap sh = asset(getContext(), "faro/shadow.png");
+                    if (sh != null) {
+                        float px = r.width() * 0.174f, py = r.height() * 0.076f;
+                        RectF sr = new RectF(r.left - px, r.top - py, r.right + px, r.bottom + py);
+                        sr.offset(light ? r.width() * 0.13f : 0, light ? r.height() * 0.035f : r.height() * 0.015f);
+                        float op = light ? 0.34f : 0.62f;
+                        Paint ps = new Paint(Paint.FILTER_BITMAP_FLAG);
+                        ps.setColorFilter(new ColorMatrixColorFilter(new float[]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, op, 0, 0, 0, 0}));
+                        cv.drawBitmap(sh, null, sr, ps);
+                        sh.recycle();
+                    }
                 }
                 Bitmap car = carBitmap(getContext(), color, Math.round(r.width()), Math.round(r.height()), !light);
                 if (car != null) cv.drawBitmap(car, Math.round(r.left), Math.round(r.top), new Paint(Paint.FILTER_BITMAP_FLAG));
-                if (!light) {
-                    // luces traseras rojas encendidas
+                if (!light && !isAngled(color)) {
+                    // luces traseras encendidas en vista cenital
                     Paint pt = new Paint(Paint.ANTI_ALIAS_FLAG);
                     float tr = r.width() * 0.17f;
+                    float tax = tailX(color), tay = tailY(color);
+                    int tc99 = Aurora.a(tailColor, 0.62f), tc33 = Aurora.a(tailColor, 0.22f);
                     for (int i = 0; i < 2; i++) {
-                        float tx = r.left + r.width() * (i == 0 ? TAIL_X : 1 - TAIL_X), ty = r.top + r.height() * TAIL_Y;
-                        pt.setShader(new RadialGradient(tx, ty, tr, new int[]{0x99FF2A2A, 0x33FF2A2A, 0}, new float[]{0f, 0.45f, 1f}, Shader.TileMode.CLAMP));
+                        float tx = r.left + r.width() * (i == 0 ? tax : 1 - tax), ty = r.top + r.height() * tay;
+                        pt.setShader(new RadialGradient(tx, ty, tr, new int[]{tc99, tc33, 0}, new float[]{0f, 0.45f, 1f}, Shader.TileMode.CLAMP));
                         cv.drawCircle(tx, ty, tr, pt);
                     }
                 }
@@ -539,7 +604,7 @@ final class Faro {
     }
 
     /**
-     * Capa de los faros: dos conos de luz cálida que suben desde los faros hacia el velocímetro, un pozo de luz suave
+     * Capa de los faros: dos conos de luz que suben desde los faros hacia el velocímetro, un pozo de luz suave
      * en la base del aro y el destello de cada faro. Se pinta una vez (con desenfoque por software sobre una imagen)
      * y luego solo cambia la opacidad de la vista para encender o apagar.
      */
@@ -547,9 +612,14 @@ final class Faro {
         private final float k;
         private final float[] lamps;       // x1, y1, x2, y2 (px de la vista)
         private final float topY, poolX, poolY, poolR;
+        private final int beamColor, poolColor;
         private Bitmap frame;
 
         Beams(Context c, float scale, float[] lamps, float topY, float poolX, float poolY, float poolR) {
+            this(c, scale, lamps, topY, poolX, poolY, poolR, WARM, LAVENDER);
+        }
+
+        Beams(Context c, float scale, float[] lamps, float topY, float poolX, float poolY, float poolR, int beamColor, int poolColor) {
             super(c);
             k = scale;
             this.lamps = lamps;
@@ -557,6 +627,8 @@ final class Faro {
             this.poolX = poolX;
             this.poolY = poolY;
             this.poolR = poolR;
+            this.beamColor = beamColor;
+            this.poolColor = poolColor;
         }
 
         @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
@@ -573,7 +645,7 @@ final class Faro {
                 float rx = Math.max(8, Math.min(poolR * 1.35f, Math.min(poolX, w - poolX) - 6 * k));
                 c.save();
                 c.scale(rx / ry, 1f, poolX, poolY);
-                p.setShader(new RadialGradient(poolX, poolY, ry, new int[]{Aurora.a(LAVENDER, 0.24f), Aurora.a(LAVENDER, 0.08f), 0},
+                p.setShader(new RadialGradient(poolX, poolY, ry, new int[]{Aurora.a(poolColor, 0.24f), Aurora.a(poolColor, 0.08f), 0},
                     new float[]{0f, 0.5f, 1f}, Shader.TileMode.CLAMP));
                 c.drawCircle(poolX, poolY, ry, p);
                 c.restore();
@@ -588,14 +660,14 @@ final class Faro {
                     cone.lineTo(left ? lx + in : lx + out, topY);
                     cone.lineTo(lx + half, ly);
                     cone.close();
-                    p.setShader(new LinearGradient(0, ly, 0, topY, new int[]{Aurora.a(WARM, 0.55f), Aurora.a(WARM, 0.17f), 0},
+                    p.setShader(new LinearGradient(0, ly, 0, topY, new int[]{Aurora.a(beamColor, 0.58f), Aurora.a(beamColor, 0.18f), 0},
                         new float[]{0f, 0.42f, 1f}, Shader.TileMode.CLAMP));
                     p.setMaskFilter(new BlurMaskFilter(blur, BlurMaskFilter.Blur.NORMAL));
                     c.drawPath(cone, p);
                     // destello del faro
                     p.setShader(null);
                     p.setMaskFilter(new BlurMaskFilter(Math.max(1, 6 * k), BlurMaskFilter.Blur.NORMAL));
-                    p.setColor(Aurora.a(WARM, 0.85f));
+                    p.setColor(Aurora.a(beamColor, 0.85f));
                     c.drawOval(new RectF(lx - 8 * k, ly - 3.5f * k, lx + 8 * k, ly + 3.5f * k), p);
                     p.setMaskFilter(null);
                     p.setColor(0xFFFFFFFF);
@@ -779,7 +851,7 @@ final class Faro {
             RectF cr = carRect(w, ch);
             int cw = Math.max(1, Math.round(cr.width())), chh = Math.max(1, Math.round(cr.height()));
             if (car == null || car.getWidth() != cw || car.getHeight() != chh)
-                car = carBitmap(getContext(), "silver", cw, chh, !light);
+                car = carBitmap(getContext(), CAR_ALMERA_N17, cw, chh, !light);
             if (car != null) c.drawBitmap(car, x + cr.left, ct + cr.top, null);
         }
 

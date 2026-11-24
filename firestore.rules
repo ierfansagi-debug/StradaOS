@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null && request.auth.uid.size() > 0;
+    }
+
+    function isValidId(id) {
+      return id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRoadAlert(data) {
+      return data.keys().hasOnly([
+        'userId', 'category', 'subtype', 'street', 'description', 'country',
+        'lat', 'lon', 'confirmCount', 'dismissCount', 'status', 'createdAt', 'updatedAt'
+      ]) &&
+      data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+      data.category in ['police', 'accident', 'emergency'] &&
+      data.subtype is string && data.subtype.size() >= 1 && data.subtype.size() <= 40 &&
+      (!('street' in data) || (data.street is string && data.street.size() <= 120)) &&
+      (!('description' in data) || (data.description is string && data.description.size() <= 240)) &&
+      (!('country' in data) || (data.country is string && data.country.size() <= 8)) &&
+      data.lat is number && data.lat >= -90.0 && data.lat <= 90.0 &&
+      data.lon is number && data.lon >= -180.0 && data.lon <= 180.0 &&
+      data.confirmCount is int && data.confirmCount >= 1 && data.confirmCount <= 10000 &&
+      data.dismissCount is int && data.dismissCount >= 0 && data.dismissCount <= 10000 &&
+      data.status in ['active', 'cleared'] &&
+      data.createdAt is timestamp && data.createdAt <= request.time &&
+      data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidAlertVote(data, voteUid) {
+      return data.keys().hasOnly(['userId', 'vote', 'updatedAt']) &&
+      data.userId is string && data.userId == voteUid &&
+      data.vote in ['confirm', 'gone'] &&
+      data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /road_alerts/{alertId} {
+      allow get, list: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+        isValidId(alertId) &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.confirmCount == 1 &&
+        request.resource.data.dismissCount == 0 &&
+        request.resource.data.status == 'active' &&
+        isValidRoadAlert(request.resource.data);
+
+      allow update: if isSignedIn() &&
+        isValidRoadAlert(request.resource.data) &&
+        request.resource.data.userId == resource.data.userId &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.category == resource.data.category &&
+        request.resource.data.subtype == resource.data.subtype &&
+        request.resource.data.lat == resource.data.lat &&
+        request.resource.data.lon == resource.data.lon &&
+        (
+          resource.data.userId == request.auth.uid ||
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['confirmCount', 'dismissCount', 'status', 'updatedAt']) &&
+            request.resource.data.confirmCount >= resource.data.confirmCount &&
+            request.resource.data.confirmCount <= resource.data.confirmCount + 1 &&
+            request.resource.data.dismissCount >= resource.data.dismissCount &&
+            request.resource.data.dismissCount <= resource.data.dismissCount + 1 &&
+            (
+              request.resource.data.status == resource.data.status ||
+              (request.resource.data.status == 'cleared' &&
+               request.resource.data.dismissCount >= 3 &&
+               request.resource.data.dismissCount > request.resource.data.confirmCount)
+            )
+          )
+        );
+
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      match /votes/{voteUid} {
+        allow get, list: if isSignedIn() && request.auth.uid == voteUid;
+        allow create, update: if isSignedIn() &&
+          request.auth.uid == voteUid &&
+          isValidId(voteUid) &&
+          exists(/databases/$(database)/documents/road_alerts/$(alertId)) &&
+          isValidAlertVote(request.resource.data, voteUid);
+        allow delete: if isSignedIn() && request.auth.uid == voteUid;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

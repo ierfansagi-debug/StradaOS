@@ -1841,3 +1841,161 @@ leída: «{}» — {} · {}/{} s · {}	dibaca: «{}» — {} · {}/{} s · {}
 sonando	sedang dimainkan
 en pausa	dijeda
 estado ?	keadaan ?
+
+# Peta, navigasi & amaran jalan Malaysia (Waze for Cities + komuniti)
+Alertas de radares e incidentes	Amaran perangkap had laju & insiden
+Ondas y avisos al acercarse a radares o incidentes	Gelombang dan amaran semasa menghampiri kamera had laju atau insiden
+Silenciar o activar sonido	Senyapkan atau aktifkan bunyi
+Sonido activado	Bunyi dihidupkan
+Sonido silenciado	Bunyi disenyapkan
+Mapa: Norte arriba	Peta: Utara di atas
+Mapa: Según tu dirección	Peta: Ikut arah anda
+Orientación: Norte arriba	Orientasi: Utara di atas
+Orientación: Según tu dirección	Orientasi: Ikut arah anda
+Reportar alerta vial	Lapor amaran jalan
+Control policial	Sekatan polis
+Accidente	Kemalangan
+Emergencia / peligro	Kecemasan / bahaya
+Control policial (SJR)	Sekatan Jalan Raya (SJR)
+Radar / control móvil	Perangkap had laju / penguatkuasaan
+Accidente grave	Kemalangan serius
+Inundación en la vía	Banjir kilat di jalan
+Vía cerrada	Jalan ditutup
+Emergencia vial	Kecemasan jalan raya
+Peligro en la vía	Bahaya di jalan raya
+Congestión severa / bloqueo	Kesesakan teruk / laluan disekat
+Clave personalizada configurada	Kunci tersuai ditetapkan
+Configurada desde AI Studio Secrets	Ditetapkan dari AI Studio Secrets
+Sin clave configurada	Tiada kunci ditetapkan
+Ingresa la URL del feed de Waze	Masukkan URL suapan Waze
+Respuesta vacía del servidor	Respons pelayan kosong
+Formato JSON/GeoJSON no reconocido	Format JSON/GeoJSON tidak dikenali
+Sin sesión iniciada	Belum log masuk
+Firebase Auth no está listo	Firebase Auth belum bersedia
+Falta configuración de Google Sign-In	Konfigurasi Google Sign-In tiada
+Tipo de credencial inesperado	Jenis kelayakan tidak dijangka
+Inicia sesión con Google para reportar	Log masuk dengan Google untuk melapor
+Base de datos no disponible	Pangkalan data tidak tersedia
+Ubicación GPS inválida	Lokasi GPS tidak sah
+Esperando ubicación GPS	Menunggu lokasi GPS
+Inicio de sesión cancelado	Log masuk dibatalkan
+Error al iniciar sesión	Ralat log masuk
+Alerta publicada	Amaran diterbitkan
+No se pudo publicar la alerta	Tidak dapat menerbitkan amaran
+Conductor	Pemandu
+Toca una categoría para enviar en 1 toque	Ketik kategori untuk laporan 1-ketik
+Inicia sesión con Google para publicar reportes en la nube	Log masuk dengan Google untuk menerbitkan laporan awan
+Sesión iniciada	Telah log masuk
+Nota o vía opcional (p. ej. PLUS KM 28, SJR)	Nota atau jalan pilihan (cth. PLUS KM 28, SJR)
+REPORTES RÁPIDOS (MALASIA)	LAPORAN PANTAS (MALAYSIA)
+Alerta expirada	Amaran telah tamat tempoh
+Distancia	Jarak
+Reporte comunitario	Laporan komuniti
+Confirmaciones	Pengesahan
+Enfocar	Fokus peta
+Sigue ahí	Masih ada
+Ya no está	Sudah tiada
+Confirmación enviada	Pengesahan dihantar
+Alerta despejada	Amaran telah selesai
+URL del feed Waze for Cities	URL suapan Waze for Cities
+La URL debe empezar con http:// o https://	URL mesti bermula dengan http:// atau https://
+Sincronizando feed de Waze…	Menyegerak suapan Waze…
+Error de sincronización	Ralat penyegerakan
+alertas	amaran
+Clave API de Waze	Kunci API Waze
+Vacío = usar clave de Secrets	Kosong = guna kunci Secrets
+Alertas viales y Waze for Cities	Amaran jalan & Waze for Cities
+Alertas viales en el mapa	Amaran jalan pada peta
+Muestra controles policiales, accidentes, emergencias y atascos de Waze	Memaparkan sekatan polis, kemalangan, bahaya dan kesesakan Waze
+Cuenta comunitaria (Google)	Akaun komuniti (Google)
+Necesaria para publicar y confirmar reportes en la nube	Diperlukan untuk melapor dan mengesahkan laporan awan
+¿Deseas cerrar sesión o cambiar de cuenta de Google?	Log keluar atau tukar akaun Google?
+Cambiar cuenta	Tukar akaun
+Cerrar sesión	Log keluar
+Sesión cerrada	Telah log keluar
+Acepta endpoints JSON (alerts/jams) o GeoJSON en tiempo real	Menyokong titik hujung JSON (alerts/jams) atau GeoJSON masa nyata
+Clave API de Waze (override)	Kunci API Waze (gantian)
+Opcional: reemplaza la clave configurada en Secrets	Pilihan: menggantikan kunci dari Secrets
+Modo de autenticación API	Mod pengesahan API
+Cómo se envía la clave API al servidor del feed	Cara kunci API dihantar ke pelayan suapan
+Frecuencia del feed	Kekerapan suapan
+Cada cuánto actualizar alertas de Waze/GeoJSON	Kekerapan mengemas kini amaran Waze/GeoJSON
+Controles policiales	Sekatan polis
+Sekatan Jalan Raya (SJR), controles y radares móviles	Sekatan Jalan Raya (SJR), sekatan dan perangkap had laju
+Accidentes de tránsito	Kemalangan jalan raya
+Colisiones y choques reportados en la vía	Pelanggaran dan kemalangan yang dilaporkan di jalan
+Emergencias y peligros	Kecemasan & bahaya
+Inundaciones (banjir), vías cerradas y obstáculos	Banjir kilat, jalan ditutup dan halangan
+Último error	Ralat terakhir
+comunidad	komuniti
+alertas comunitarias en línea	amaran komuniti dalam talian
+Probar y sincronizar feed ahora	Uji & segerakkan suapan sekarang
+Sincronizando…	Menyegerak…
+Error	Ralat
+
+# Pemperibadian: NightPulse & Nissan Almera N17
+NightPulse	NightPulse
+Futurista · Oscuro · Deportivo. Paneles de vidrio negro, acentos azul eléctrico, barra lateral derecha de apps, mapa central amplio y tu Nissan Almera N17 Impul blanco en vista elevada trasera con pilotos LED.	Futuristik · Gelap · Sporty. Panel kaca hitam, aksen biru elektrik, bar aplikasi di sebelah kanan, peta tengah yang luas dan Nissan Almera N17 Impul putih anda dari sudut atas belakang dengan lampu belakang LED.
+Nissan Almera N17 (Blanco)	Nissan Almera N17 (Putih)
+Edificios 3D siempre activos	Bangunan 3D sentiasa aktif
+Ángulo automático en navegación	Sudut automatik dalam navigasi
+En navegación paso a paso inclina a 60°; al detenerse vuelve al ángulo elegido	Condong ke 60° semasa navigasi belokan demi belokan; kembali ke sudut pilihan apabila berhenti
+Zoom automático en navegación	Zum automatik dalam navigasi
+Acercamiento automático al iniciar ruta y ajuste según la velocidad	Zum masuk automatik apabila laluan bermula dan laraskan ikut kelajuan
+Mapa sin conexión en MapLibre	Peta luar talian MapLibre
+Usa el archivo .map local dentro de MapLibre sin internet	Guna fail .map tempatan dalam MapLibre tanpa internet
+1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa sin conexión se activa en MapLibre automáticamente si no hay internet o desde la opción «Mapa sin conexión en MapLibre». Para actualizarlo, descarga uno nuevo y reemplaza el archivo.	1. Di komputer atau telefon, muat turun peta negara anda (format mapsforge, percuma):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Salin ke pemacu USB atau ke folder Download skrin.\n\n3. Dalam Tetapan → Peta & cuaca → Peta luar talian, ketik «Fail peta» dan pilihnya.\n\nPeta luar talian diaktifkan dalam MapLibre secara automatik apabila tiada internet atau daripada pilihan «Peta luar talian MapLibre». Untuk mengemas kini, muat turun yang baharu dan gantikan fail.
+
+# Carian Tempat & Indeks POI Luar Talian
+Índice sin conexión · Buscando en línea…	Indeks luar talian · Mencari dalam talian…
+Sin conexión · Índice local	Luar talian · Indeks tempatan
+Índice local	Indeks tempatan
+Caché local	Cache tempatan
+Área de servicio	Kawasan rehat (R&R)
+Centro comercial	Pusat beli-belah
+Peaje	Plaza tol
+Universidad	Universiti
+Mezquita	Masjid
+Turismo	Pelancongan
+Terminal	Terminal
+Índice POI sin conexión	Indeks POI luar talian
+Indexando…	Mengindeks…
+{} lugares	{} tempat
+Base: {} · Caché: {} · Mapa .map: {}	Asas: {} · Cache: {} · .map: {}
+Reindexar archivo .map	Indeks semula fail .map
+Limpiar caché de búsquedas	Kosongkan cache carian
+Indexando POIs del mapa…	Mengindeks POI peta…
+Caché de búsquedas limpia	Cache carian dikosongkan
+
+# Amaran Bahaya Jalan Masa Nyata (waze-scraper)
+Radar	Kamera had laju
+{} activas	{} aktif
+Bache en la vía	Jalan berlubang di hadapan
+Obras en la vía	Kerja jalan di hadapan
+Vehículo detenido	Kenderaan rosak di bahu jalan
+Ingresa la URL del servidor o feed GeoJSON	Masukkan URL pelayan atau suapan GeoJSON
+Alertas viales cercanas	Amaran jalan berdekatan
+No hay alertas viales activas	Tiada amaran jalan aktif
+Alertas viales en tiempo real	Amaran jalan masa nyata
+Muestra accidentes, baches, peligros, atascos e iconos en tiempo real	Memaparkan kemalangan, jalan berlubang, bahaya, kesesakan dan ikon masa nyata
+Servidor waze-scraper o feed GeoJSON	Pelayan waze-scraper atau suapan GeoJSON
+URL base (ej. http://192.168.1.50:8000) o feed .geojson/.json	URL asas (cth. http://192.168.1.50:8000) atau suapan .geojson/.json
+URL waze-scraper (http://IP:8000) o GeoJSON	URL waze-scraper (http://IP:8000) atau GeoJSON
+Frecuencia de actualización	Kekerapan kemas kini
+Cada cuánto consultar alertas y tráfico cercanos	Kekerapan menyemak amaran dan trafik berdekatan
+1 min	1 min
+2 min	2 min
+5 min	5 min
+Manual	Manual
+Voz y tono de proximidad	Suara & bunyi jarak dekat
+Anuncio hablado y tono de aviso al acercarse a un peligro	Amaran suara dan nada apabila menghampiri bahaya
+Accidentes y cierres	Kemalangan & penutupan jalan
+Colisiones y cierres de vía reportados	Pelanggaran dan penutupan jalan yang dilaporkan
+Baches y peligros viales	Jalan berlubang & bahaya
+Baches, obras, vehículos detenidos e inundaciones	Jalan berlubang, kerja jalan, kenderaan rosak dan banjir
+Policía y radares móviles	Polis & perangkap had laju
+Controles policiales y cámaras reportadas	Sekatan polis dan kamera yang dilaporkan
+{} alertas · {} tramos	{} amaran · {} laluan sesak
+Toca para actualizar ahora	Ketik untuk muat semula sekarang
+Toca para consultar /alerts/search y /jams/search	Ketik untuk semak /alerts/search dan /jams/search
+Probar y sincronizar ahora	Uji & segerakkan sekarang

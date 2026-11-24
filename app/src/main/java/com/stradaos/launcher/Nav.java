@@ -8,9 +8,12 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
 import android.location.Location;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -27,6 +30,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.Socket;
@@ -45,6 +49,10 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
@@ -90,12 +98,6 @@ public class Nav {
         public int maxSpeedKmh;
     }
 
-    public static class PoliceReport {
-        public String id, label;
-        public double lat, lon, alongM = -1;
-        public long reportedAtMs;
-    }
-
     public static class Step {
         public double lat, lon, distM, durS;
         /** 0 recto, 1 derecha suave, 2 derecha, 3 derecha cerrada, 4 retorno, 5 izquierda cerrada, 6 izquierda, 7 izquierda suave, 8 rotonda, 9 llegada. */
@@ -122,6 +124,7 @@ public class Nav {
     }
 
     public interface SearchCb { void onResult(List<Place> places, String error); }
+    public interface SearchCb2 { void onResult(List<Place> places, String error, boolean finalResult, boolean offlineOnly); }
     public interface RouteCb { void onRoute(Route r, String error); }
     public interface RoutesCb { void onRoutes(List<Route> routes, String error); }
 
@@ -139,13 +142,6 @@ public class Nav {
     public static volatile double nearbyCameraDistM;
     public static volatile Incident nearbyIncident;
     public static volatile double nearbyIncidentDistM;
-    public static volatile PoliceReport nearbyPolice;
-    public static volatile double nearbyPoliceDistM;
-    public static final long POLICE_TTL_MS = 45L * 60L * 1000L;
-    public static final List<PoliceReport> policeReports = new ArrayList<PoliceReport>();
-    private static boolean policeLoaded;
-    private static String lastPoliceId;
-    private static long lastPoliceChimeAt;
     public static volatile boolean previewMode;
     public static volatile boolean simulating;
     public static volatile boolean simPaused;
@@ -173,11 +169,15 @@ public class Nav {
 
     private static TextToSpeech tts;
     private static boolean ttsReady;
+    private static volatile boolean ttsInitializing;
+    private static volatile String pendingSpeakText;
     private static String ttsLang;
     private static AudioManager duckAm;
+    private static AudioFocusRequest navFocusReq;
     private static boolean hasAudioFocus;
     private static int speakSeq;
     private static volatile String curUttId;
+    private static final ExecutorService SEARCH_POOL = Executors.newFixedThreadPool(4);
     private static final AudioManager.OnAudioFocusChangeListener FOCUS_LS = new AudioManager.OnAudioFocusChangeListener() {
         public void onAudioFocusChange(int focusChange) {
             if (focusChange == AudioManager.AUDIOFOCUS_LOSS || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
@@ -210,58 +210,150 @@ public class Nav {
 
     public static void search(final Context c, final String query, final double biasLat, final double biasLon,
                               final boolean mph, final SearchCb cb) {
+        searchProgressive(c, query, biasLat, biasLon, mph, new SearchCb2() {
+            public void onResult(List<Place> places, String error, boolean finalResult, boolean offlineOnly) {
+                if (finalResult && cb != null) cb.onResult(places, error);
+            }
+        });
+    }
+
+    public static void searchProgressive(final Context c, final String query, final double biasLat, final double biasLon,
+                                         final boolean mph, final SearchCb2 cb) {
         final String q = query == null ? "" : query.trim();
-        if (q.length() == 0) { cb.onResult(new ArrayList<Place>(), null); return; }
+        if (q.length() == 0) {
+            if (cb != null) cb.onResult(new ArrayList<Place>(), null, true, false);
+            return;
+        }
         Place direct = parseCoords(q);
         if (direct != null) {
             List<Place> one = new ArrayList<Place>();
             one.add(direct);
-            cb.onResult(one, null);
+            if (cb != null) cb.onResult(one, null, true, false);
             return;
         }
         final Context app = c != null ? c.getApplicationContext() : null;
         new Thread(new Runnable() {
             public void run() {
                 if (app != null) Net.init(app);
-                List<Place> out = null;
-                String err = null;
-                boolean tryOfflineFirst = !hasNetwork(app) || LiveMapView.isOffline();
-                if (tryOfflineFirst) {
-                    out = searchOfflineMap(q, null, biasLat, biasLon, mph, 10);
-                }
-                if (out == null || out.isEmpty()) {
-                    try {
-                        out = searchPhoton(app, q, biasLat, biasLon);
-                    } catch (Throwable e) {
-                        err = shortErr(e);
-                    }
-                    if (out == null || out.isEmpty()) {
-                        try {
-                            List<Place> nom = searchNominatim(app, q, biasLat, biasLon);
-                            if (nom != null && !nom.isEmpty()) { out = nom; err = null; }
-                            else if (out == null) out = nom;
-                        } catch (Throwable e) {
-                            if (err == null) err = shortErr(e);
+
+                // Fase 1: coincidencia instantánea en índice SQLite sin conexión + archivo .map local
+                List<Place> idxOff = app != null ? PoiIndex.search(app, q, biasLat, biasLon, mph, 22) : new ArrayList<Place>();
+                List<Place> mapOff = searchOfflineMap(q, null, biasLat, biasLon, mph, 16);
+                final List<Place> offMerged = new ArrayList<Place>(28);
+                mergePlaces(offMerged, idxOff);
+                mergePlaces(offMerged, mapOff);
+                rankAndSortPlaces(offMerged, q, biasLat, biasLon);
+                if (offMerged.size() > 24) offMerged.subList(24, offMerged.size()).clear();
+
+                boolean online = hasNetwork(app);
+                if (!online) {
+                    final List<Place> foutOff = new ArrayList<Place>(offMerged);
+                    UI.post(new Runnable() {
+                        public void run() {
+                            if (cb != null) cb.onResult(foutOff, null, true, true);
                         }
-                    }
-                    if (out == null || out.isEmpty()) {
-                        try {
-                            List<Place> om = searchOpenMeteo(app, q, biasLat, biasLon);
-                            if (om != null && !om.isEmpty()) { out = om; err = null; }
-                            else if (out == null) out = om;
-                        } catch (Throwable e) {
-                            if (err == null) err = shortErr(e);
-                        }
-                    }
+                    });
+                    return;
                 }
-                if ((out == null || out.isEmpty()) && !tryOfflineFirst) {
-                    List<Place> off = searchOfflineMap(q, null, biasLat, biasLon, mph, 10);
-                    if (off != null && !off.isEmpty()) { out = off; err = null; }
-                }
-                final List<Place> fout = out;
-                final String ferr = fout == null ? err : null;
+
+                // Emitir resultados locales al instante mientras corren Photon + Nominatim + Overpass
+                final List<Place> stage1 = new ArrayList<Place>(offMerged);
                 UI.post(new Runnable() {
-                    public void run() { cb.onResult(fout, ferr); }
+                    public void run() {
+                        if (cb != null) cb.onResult(stage1, null, false, false);
+                    }
+                });
+
+                // Fase 2: abanico paralelo en línea (100 km primero + respaldo nacional/global)
+                final List<Place> photonRes = Collections.synchronizedList(new ArrayList<Place>());
+                final List<Place> nomRes = Collections.synchronizedList(new ArrayList<Place>());
+                final List<Place> overpassRes = Collections.synchronizedList(new ArrayList<Place>());
+                final String[] errs = new String[3];
+                final CountDownLatch latch = new CountDownLatch(3);
+
+                SEARCH_POOL.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            List<Place> r = searchPhoton(app, q, biasLat, biasLon);
+                            if (r != null) photonRes.addAll(r);
+                        } catch (Throwable e) {
+                            errs[0] = shortErr(e);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
+                SEARCH_POOL.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            List<Place> r = searchNominatim(app, q, biasLat, biasLon);
+                            if (r != null) nomRes.addAll(r);
+                        } catch (Throwable e) {
+                            errs[1] = shortErr(e);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
+                SEARCH_POOL.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            List<Place> r = searchOverpass(app, q, biasLat, biasLon);
+                            if (r != null) overpassRes.addAll(r);
+                        } catch (Throwable e) {
+                            errs[2] = shortErr(e);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
+
+                try { latch.await(8000L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) { }
+
+                List<Place> phSnap, nmSnap, ovSnap;
+                synchronized (photonRes) { phSnap = new ArrayList<Place>(photonRes); }
+                synchronized (nomRes) { nmSnap = new ArrayList<Place>(nomRes); }
+                synchronized (overpassRes) { ovSnap = new ArrayList<Place>(overpassRes); }
+
+                List<Place> merged = new ArrayList<Place>(44);
+                mergePlaces(merged, offMerged);
+                mergePlaces(merged, phSnap);
+                mergePlaces(merged, nmSnap);
+                mergePlaces(merged, ovSnap);
+
+                List<Place> om = null;
+                if (merged.size() < 4) {
+                    try {
+                        om = searchOpenMeteo(app, q, biasLat, biasLon);
+                        if (om != null) mergePlaces(merged, om);
+                    } catch (Throwable ignored) { }
+                }
+
+                // Guardar resultados en línea en la caché del índice sin conexión
+                if (app != null) {
+                    List<Place> toCache = new ArrayList<Place>();
+                    toCache.addAll(phSnap);
+                    toCache.addAll(nmSnap);
+                    toCache.addAll(ovSnap);
+                    if (om != null) toCache.addAll(om);
+                    PoiIndex.recordResults(app, toCache);
+                }
+
+                rankAndSortPlaces(merged, q, biasLat, biasLon);
+                if (merged.size() > 36) merged = new ArrayList<Place>(merged.subList(0, 36));
+
+                String err = null;
+                if (merged.isEmpty()) {
+                    for (String e : errs) {
+                        if (e != null && e.length() > 0) { err = e; break; }
+                    }
+                }
+                final List<Place> fout = merged;
+                final String ferr = fout.isEmpty() ? err : null;
+                UI.post(new Runnable() {
+                    public void run() {
+                        if (cb != null) cb.onResult(fout, ferr, true, false);
+                    }
                 });
             }
         }).start();
@@ -274,24 +366,132 @@ public class Nav {
 
     public static void searchCategory(final Context c, final String cat, final double biasLat, final double biasLon,
                                       final boolean mph, final SearchCb cb) {
+        searchCategoryProgressive(c, cat, biasLat, biasLon, mph, new SearchCb2() {
+            public void onResult(List<Place> places, String error, boolean finalResult, boolean offlineOnly) {
+                if (finalResult && cb != null) cb.onResult(places, error);
+            }
+        });
+    }
+
+    public static void searchCategoryProgressive(final Context c, final String cat, final double biasLat, final double biasLon,
+                                                 final boolean mph, final SearchCb2 cb) {
         final Context app = c != null ? c.getApplicationContext() : null;
         new Thread(new Runnable() {
             public void run() {
                 if (app != null) Net.init(app);
-                List<Place> out = searchOfflineMap(null, cat, biasLat, biasLon, mph, 12);
+
+                final List<Place> offMerged = new ArrayList<Place>();
+                if (app != null) mergePlaces(offMerged, PoiIndex.searchCategory(app, cat, biasLat, biasLon, mph, 18));
+                mergePlaces(offMerged, searchOfflineMap(null, cat, biasLat, biasLon, mph, 14));
+                if (!Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
+                    Collections.sort(offMerged, new Comparator<Place>() {
+                        public int compare(Place a, Place b) {
+                            return Double.compare(approxDist(biasLat, biasLon, a.lat, a.lon),
+                                    approxDist(biasLat, biasLon, b.lat, b.lon));
+                        }
+                    });
+                }
+
+                boolean online = hasNetwork(app) && !Double.isNaN(biasLat) && !Double.isNaN(biasLon);
+                if (!online) {
+                    final List<Place> foutOff = offMerged.size() > 24 ? new ArrayList<Place>(offMerged.subList(0, 24)) : new ArrayList<Place>(offMerged);
+                    UI.post(new Runnable() {
+                        public void run() {
+                            if (cb != null) cb.onResult(foutOff, null, true, true);
+                        }
+                    });
+                    return;
+                }
+
+                final List<Place> stage1 = new ArrayList<Place>(offMerged);
+                UI.post(new Runnable() {
+                    public void run() {
+                        if (cb != null) cb.onResult(stage1, null, false, false);
+                    }
+                });
+
+                final List<Place> ovCat = Collections.synchronizedList(new ArrayList<Place>());
+                final List<Place> phCat = Collections.synchronizedList(new ArrayList<Place>());
+                final List<Place> nomCat = Collections.synchronizedList(new ArrayList<Place>());
+                final String[] errs = new String[3];
+                final CountDownLatch latch = new CountDownLatch(3);
+
+                SEARCH_POOL.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            List<Place> r = searchOverpassCategory(app, cat, biasLat, biasLon);
+                            if (r != null) ovCat.addAll(r);
+                        } catch (Throwable e) {
+                            errs[0] = shortErr(e);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
+                SEARCH_POOL.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            List<Place> r = searchPhotonCategory(app, cat, biasLat, biasLon);
+                            if (r != null) phCat.addAll(r);
+                        } catch (Throwable e) {
+                            errs[1] = shortErr(e);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
+                SEARCH_POOL.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            List<Place> r = searchOnlineCategory(app, cat, biasLat, biasLon);
+                            if (r != null) nomCat.addAll(r);
+                        } catch (Throwable e) {
+                            errs[2] = shortErr(e);
+                        } finally {
+                            latch.countDown();
+                        }
+                    }
+                });
+                try { latch.await(7500L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) { }
+
+                List<Place> ovSnap, phSnap, nmSnap;
+                synchronized (ovCat) { ovSnap = new ArrayList<Place>(ovCat); }
+                synchronized (phCat) { phSnap = new ArrayList<Place>(phCat); }
+                synchronized (nomCat) { nmSnap = new ArrayList<Place>(nomCat); }
+
+                List<Place> merged = new ArrayList<Place>(offMerged);
+                mergePlaces(merged, ovSnap);
+                mergePlaces(merged, phSnap);
+                mergePlaces(merged, nmSnap);
+
+                if (app != null) {
+                    List<Place> toCache = new ArrayList<Place>();
+                    toCache.addAll(ovSnap);
+                    toCache.addAll(phSnap);
+                    toCache.addAll(nmSnap);
+                    PoiIndex.recordResults(app, toCache);
+                }
+
+                Collections.sort(merged, new Comparator<Place>() {
+                    public int compare(Place a, Place b) {
+                        return Double.compare(approxDist(biasLat, biasLon, a.lat, a.lon),
+                                approxDist(biasLat, biasLon, b.lat, b.lon));
+                    }
+                });
+                if (merged.size() > 32) merged = new ArrayList<Place>(merged.subList(0, 32));
+
                 String err = null;
-                if ((out == null || out.isEmpty()) && hasNetwork(app) && !Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
-                    try {
-                        List<Place> online = searchOnlineCategory(app, cat, biasLat, biasLon);
-                        if (online != null && !online.isEmpty()) out = online;
-                    } catch (Throwable e) {
-                        err = shortErr(e);
+                if (merged.isEmpty()) {
+                    for (String e : errs) {
+                        if (e != null && e.length() > 0) { err = e; break; }
                     }
                 }
-                final List<Place> fout = out;
-                final String ferr = fout == null ? err : null;
+                final List<Place> fout = merged;
+                final String ferr = fout.isEmpty() ? err : null;
                 UI.post(new Runnable() {
-                    public void run() { cb.onResult(fout, ferr); }
+                    public void run() {
+                        if (cb != null) cb.onResult(fout, ferr, true, false);
+                    }
                 });
             }
         }).start();
@@ -303,11 +503,19 @@ public class Nav {
             public void run() {
                 if (app != null) Net.init(app);
                 Place resolved = null;
+                boolean fromNet = false;
                 if (hasNetwork(app)) {
                     try { resolved = reversePhoton(app, lat, lon); } catch (Throwable ignored) { }
                     if (resolved == null) {
                         try { resolved = reverseNominatim(app, lat, lon); } catch (Throwable ignored) { }
                     }
+                    fromNet = resolved != null;
+                }
+                if (resolved == null && app != null) {
+                    resolved = PoiIndex.nearestPlace(app, lat, lon, 350.0);
+                }
+                if (resolved != null && fromNet && app != null) {
+                    PoiIndex.recordResults(app, Collections.singletonList(resolved));
                 }
                 if (resolved == null) {
                     resolved = new Place();
@@ -346,21 +554,28 @@ public class Nav {
     }
 
     private static String translateTag(String tag) {
+        if (tag == null || tag.length() == 0) return I18n.t("Lugar");
         if ("city".equals(tag)) return I18n.t("Ciudad");
         if ("town".equals(tag) || "village".equals(tag) || "hamlet".equals(tag)) return I18n.t("Pueblo");
         if ("suburb".equals(tag) || "neighbourhood".equals(tag) || "quarter".equals(tag)) return I18n.t("Barrio");
-        if ("street".equals(tag)) return I18n.t("Calle");
-        if ("fuel".equals(tag)) return I18n.t("Estación de servicio");
+        if ("street".equals(tag) || "road".equals(tag)) return I18n.t("Calle");
+        if ("fuel".equals(tag) || "charging_station".equals(tag)) return I18n.t("Estación de servicio");
+        if ("services".equals(tag) || "rest_area".equals(tag)) return I18n.t("Área de servicio");
         if ("hospital".equals(tag)) return I18n.t("Hospital");
         if ("clinic".equals(tag) || "doctors".equals(tag)) return I18n.t("Clínica");
         if ("pharmacy".equals(tag)) return I18n.t("Farmacia");
         if ("parking".equals(tag)) return I18n.t("Parqueadero");
-        if ("restaurant".equals(tag) || "fast_food".equals(tag)) return I18n.t("Restaurante");
+        if ("restaurant".equals(tag) || "fast_food".equals(tag) || "food_court".equals(tag)) return I18n.t("Restaurante");
         if ("cafe".equals(tag)) return I18n.t("Cafetería");
         if ("supermarket".equals(tag) || "convenience".equals(tag)) return I18n.t("Supermercado");
+        if ("mall".equals(tag) || "department_store".equals(tag)) return I18n.t("Centro comercial");
         if ("hotel".equals(tag)) return I18n.t("Hotel");
         if ("aerodrome".equals(tag) || "airport".equals(tag)) return I18n.t("Aeropuerto");
-        if ("station".equals(tag)) return I18n.t("Estación");
+        if ("station".equals(tag) || "bus_station".equals(tag)) return I18n.t("Estación");
+        if ("toll_booth".equals(tag) || "toll".equals(tag)) return I18n.t("Peaje");
+        if ("university".equals(tag) || "college".equals(tag)) return I18n.t("Universidad");
+        if ("mosque".equals(tag) || "place_of_worship".equals(tag)) return I18n.t("Mezquita");
+        if ("attraction".equals(tag) || "viewpoint".equals(tag) || "museum".equals(tag)) return I18n.t("Turismo");
         return I18n.t("Lugar");
     }
 
@@ -384,15 +599,35 @@ public class Nav {
     }
 
     private static List<Place> searchPhoton(Context c, String q, double biasLat, double biasLon) throws Exception {
-        StringBuilder url = new StringBuilder("https://photon.komoot.io/api/?limit=8&q=");
+        boolean hasBias = !Double.isNaN(biasLat) && !Double.isNaN(biasLon);
+        List<Place> out = queryPhotonOnce(c, q, hasBias ? biasLat : Double.NaN, hasBias ? biasLon : Double.NaN, 25);
+        if (hasBias && out.size() < 5) {
+            try {
+                List<Place> glob = queryPhotonOnce(c, q, Double.NaN, Double.NaN, 15);
+                mergePlaces(out, glob);
+            } catch (Throwable ignored) { }
+        }
+        return out;
+    }
+
+    private static List<Place> searchPhotonCategory(Context c, String cat, double lat, double lon) throws Exception {
+        String term = "petrol station";
+        if ("health".equals(cat)) term = "hospital";
+        else if ("parking".equals(cat)) term = "parking";
+        else if ("food".equals(cat)) term = "restaurant";
+        return queryPhotonOnce(c, term, lat, lon, 20);
+    }
+
+    private static List<Place> queryPhotonOnce(Context c, String q, double biasLat, double biasLon, int limit) throws Exception {
+        StringBuilder url = new StringBuilder("https://photon.komoot.io/api/?limit=").append(limit).append("&q=");
         url.append(URLEncoder.encode(q, "UTF-8"));
         if ("en".equals(I18n.lang) || "de".equals(I18n.lang) || "fr".equals(I18n.lang) || "it".equals(I18n.lang)) {
             url.append("&lang=").append(I18n.lang);
         }
         if (!Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
-            url.append(String.format(Locale.US, "&lat=%.4f&lon=%.4f", biasLat, biasLon));
+            url.append(String.format(Locale.US, "&lat=%.4f&lon=%.4f&location_bias_scale=0.35", biasLat, biasLon));
         }
-        String raw = new String(navGet(c, url.toString(), 9000), "UTF-8");
+        String raw = new String(navGet(c, url.toString(), 8000), "UTF-8");
         JSONObject root = new JSONObject(raw);
         JSONArray feats = root.optJSONArray("features");
         List<Place> out = new ArrayList<Place>();
@@ -417,13 +652,20 @@ public class Nav {
         String name = pr != null ? pr.optString("name", "").trim() : "";
         String street = pr != null ? pr.optString("street", "").trim() : "";
         String num = pr != null ? pr.optString("housenumber", "").trim() : "";
+        String osmVal = pr != null ? pr.optString("osm_value", "").trim() : "";
+        String osmKey = pr != null ? pr.optString("osm_key", "").trim() : "";
         if (name.length() == 0 && street.length() > 0) {
             name = num.length() > 0 ? street + " " + num : street;
             street = "";
         }
         if (name.length() == 0) name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
         StringBuilder sub = new StringBuilder();
-        if (street.length() > 0 && !street.equals(name)) sub.append(num.length() > 0 ? street + " " + num : street);
+        if (osmVal.length() > 0 && !"yes".equals(osmVal) && !"place".equals(osmKey)) {
+            String kind = translateTag(osmVal);
+            if (!I18n.t("Lugar").equals(kind)) appendPart(sub, kind);
+        }
+        if (street.length() > 0 && !street.equals(name)) appendPart(sub, num.length() > 0 ? street + " " + num : street);
+        appendPart(sub, pr != null ? firstNonEmpty(pr.optString("district", ""), pr.optString("locality", "")) : "");
         appendPart(sub, pr != null ? firstNonEmpty(pr.optString("city", ""), pr.optString("town", ""), pr.optString("village", ""), pr.optString("county", "")) : "");
         appendPart(sub, pr != null ? pr.optString("state", "") : "");
         appendPart(sub, pr != null ? pr.optString("country", "") : "");
@@ -436,27 +678,222 @@ public class Nav {
     }
 
     private static List<Place> searchNominatim(Context c, String q, double biasLat, double biasLon) throws Exception {
-        StringBuilder url = new StringBuilder("https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&addressdetails=1&q=");
+        StringBuilder url = new StringBuilder("https://nominatim.openstreetmap.org/search?format=jsonv2&limit=20&addressdetails=1&namedetails=1&q=");
         url.append(URLEncoder.encode(q, "UTF-8")).append("&accept-language=").append(URLEncoder.encode(I18n.lang, "UTF-8"));
-        if (!Double.isNaN(biasLat) && !Double.isNaN(biasLon)) {
+        boolean hasBias = !Double.isNaN(biasLat) && !Double.isNaN(biasLon);
+        if (hasBias) {
             url.append(String.format(Locale.US, "&viewbox=%.4f,%.4f,%.4f,%.4f",
-                    biasLon - 0.55, biasLat + 0.55, biasLon + 0.55, biasLat - 0.55));
+                    biasLon - 0.95, biasLat + 0.95, biasLon + 0.95, biasLat - 0.95));
         }
-        String raw = new String(navGet(c, url.toString(), 9500), "UTF-8");
-        return parseNominatimArray(raw);
+        String raw = new String(navGet(c, url.toString(), 8500), "UTF-8");
+        List<Place> out = parseNominatimArray(raw);
+        if (hasBias && out.size() < 5) {
+            try {
+                String globalUrl = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=15&addressdetails=1&namedetails=1&q="
+                        + URLEncoder.encode(q, "UTF-8")
+                        + "&accept-language=" + URLEncoder.encode(I18n.lang, "UTF-8");
+                List<Place> glob = parseNominatimArray(new String(navGet(c, globalUrl, 7000), "UTF-8"));
+                mergePlaces(out, glob);
+            } catch (Throwable ignored) { }
+        }
+        return out;
+    }
+
+    private static List<Place> searchOverpass(Context c, String q, double biasLat, double biasLon) throws Exception {
+        if (Double.isNaN(biasLat) || Double.isNaN(biasLon)) return new ArrayList<Place>();
+        String rx = escapeOverpassRegex(q);
+        if (rx.length() < 2) return new ArrayList<Place>();
+
+        String qNorm = normPlaceName(q);
+        String[] rawToks = qNorm.length() > 0 ? qNorm.split(" ") : new String[0];
+        List<String> toks = new ArrayList<String>();
+        for (String t : rawToks) if (t.length() >= 2) toks.add(escapeOverpassRegex(t));
+
+        String ql;
+        if (toks.size() >= 2) {
+            StringBuilder multiName = new StringBuilder();
+            StringBuilder multiAlt = new StringBuilder();
+            for (int i = 0; i < Math.min(3, toks.size()); i++) {
+                multiName.append("[\"name\"~\"").append(toks.get(i)).append("\",i]");
+                multiAlt.append("[\"name|alt_name|official_name|short_name|brand|operator|int_name\"~\"").append(toks.get(i)).append("\",i]");
+            }
+            ql = String.format(Locale.US,
+                    "[out:json][timeout:6];("
+                            + "nwr(around:100000,%.5f,%.5f)%s;"
+                            + "nwr(around:100000,%.5f,%.5f)[\"name\"~\"%s\",i];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"brand|operator|alt_name|short_name\"~\"%s\",i];"
+                            + "nwr(around:100000,%.5f,%.5f)%s;"
+                            + ");out center 35;",
+                    biasLat, biasLon, multiName.toString(),
+                    biasLat, biasLon, rx,
+                    biasLat, biasLon, rx,
+                    biasLat, biasLon, multiAlt.toString());
+        } else {
+            ql = String.format(Locale.US,
+                    "[out:json][timeout:6];("
+                            + "nwr(around:100000,%.5f,%.5f)[\"name\"~\"%s\",i];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"brand\"~\"%s\",i];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"alt_name|official_name|short_name|operator|int_name|addr:housename\"~\"%s\",i];"
+                            + ");out center 35;",
+                    biasLat, biasLon, rx,
+                    biasLat, biasLon, rx,
+                    biasLat, biasLon, rx);
+        }
+
+        List<Place> out = runOverpassQuery(c, ql);
+        if (out.isEmpty()) {
+            // Ampliar a 250 km para ciudades, pueblos, aeropuertos o áreas de servicio lejanos
+            String wideQl = String.format(Locale.US,
+                    "[out:json][timeout:6];("
+                            + "node(around:250000,%.5f,%.5f)[\"place\"][\"name\"~\"%s\",i];"
+                            + "nwr(around:250000,%.5f,%.5f)[\"highway\"~\"^(services|rest_area)$\"][\"name\"~\"%s\",i];"
+                            + "nwr(around:250000,%.5f,%.5f)[\"aeroway\"=\"aerodrome\"][\"name|iata\"~\"%s\",i];"
+                            + ");out center 25;",
+                    biasLat, biasLon, rx,
+                    biasLat, biasLon, rx,
+                    biasLat, biasLon, rx);
+            try {
+                List<Place> wide = runOverpassQuery(c, wideQl);
+                if (wide != null) mergePlaces(out, wide);
+            } catch (Throwable ignored) { }
+        }
+        return out;
+    }
+
+    private static List<Place> searchOverpassCategory(Context c, String cat, double lat, double lon) throws Exception {
+        if (Double.isNaN(lat) || Double.isNaN(lon)) return new ArrayList<Place>();
+        String ql;
+        if ("health".equals(cat)) {
+            ql = String.format(Locale.US,
+                    "[out:json][timeout:6];nwr(around:100000,%.5f,%.5f)[\"amenity\"~\"^(hospital|clinic|pharmacy|doctors)$\"];out center 35;",
+                    lat, lon);
+        } else if ("parking".equals(cat)) {
+            ql = String.format(Locale.US,
+                    "[out:json][timeout:6];("
+                            + "nwr(around:100000,%.5f,%.5f)[\"amenity\"=\"parking\"];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"highway\"~\"^(services|rest_area)$\"];"
+                            + ");out center 35;",
+                    lat, lon, lat, lon);
+        } else if ("food".equals(cat)) {
+            ql = String.format(Locale.US,
+                    "[out:json][timeout:6];("
+                            + "nwr(around:100000,%.5f,%.5f)[\"amenity\"~\"^(restaurant|fast_food|cafe|food_court)$\"];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"highway\"~\"^(services|rest_area)$\"];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"shop\"~\"^(mall|supermarket|convenience)$\"];"
+                            + ");out center 35;",
+                    lat, lon, lat, lon, lat, lon);
+        } else {
+            ql = String.format(Locale.US,
+                    "[out:json][timeout:6];("
+                            + "nwr(around:100000,%.5f,%.5f)[\"amenity\"~\"^(fuel|charging_station)$\"];"
+                            + "nwr(around:100000,%.5f,%.5f)[\"highway\"~\"^(services|rest_area)$\"];"
+                            + ");out center 35;",
+                    lat, lon, lat, lon);
+        }
+        return runOverpassQuery(c, ql);
+    }
+
+    private static List<Place> runOverpassQuery(Context c, String ql) throws Exception {
+        String body = "data=" + URLEncoder.encode(ql, "UTF-8");
+        String raw = null;
+        String[] endpoints = {
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.kumi.systems/api/interpreter"
+        };
+        Exception lastEx = null;
+        for (String ep : endpoints) {
+            try {
+                raw = new String(navPost(c, ep, body, 6500), "UTF-8");
+                if (raw.trim().startsWith("{")) break;
+                raw = null;
+            } catch (Exception e) {
+                lastEx = e;
+            }
+        }
+        if (raw == null) {
+            if (lastEx != null) throw lastEx;
+            return new ArrayList<Place>();
+        }
+        JSONObject root = new JSONObject(raw);
+        JSONArray els = root.optJSONArray("elements");
+        List<Place> out = new ArrayList<Place>();
+        if (els == null) return out;
+        for (int i = 0; i < els.length(); i++) {
+            JSONObject el = els.optJSONObject(i);
+            if (el == null) continue;
+            double lat = el.optDouble("lat", Double.NaN);
+            double lon = el.optDouble("lon", Double.NaN);
+            if (Double.isNaN(lat) || Double.isNaN(lon)) {
+                JSONObject ctr = el.optJSONObject("center");
+                if (ctr != null) {
+                    lat = ctr.optDouble("lat", Double.NaN);
+                    lon = ctr.optDouble("lon", Double.NaN);
+                }
+            }
+            if (Double.isNaN(lat) || Double.isNaN(lon)) continue;
+            JSONObject tags = el.optJSONObject("tags");
+            if (tags == null) continue;
+            String name = firstNonEmpty(
+                    tags.optString("name", ""),
+                    tags.optString("official_name", ""),
+                    tags.optString("alt_name", ""),
+                    tags.optString("short_name", ""),
+                    tags.optString("brand", ""),
+                    tags.optString("operator", ""),
+                    tags.optString("addr:housename", ""));
+            if (name.length() == 0) continue;
+            StringBuilder sub = new StringBuilder();
+            String tagKind = firstNonEmpty(
+                    tags.optString("amenity", ""),
+                    tags.optString("highway", ""),
+                    tags.optString("shop", ""),
+                    tags.optString("aeroway", ""),
+                    tags.optString("railway", ""),
+                    tags.optString("tourism", ""),
+                    tags.optString("leisure", ""),
+                    tags.optString("craft", ""),
+                    tags.optString("office", ""),
+                    tags.optString("place", ""));
+            if (tagKind.length() > 0) appendPart(sub, translateTag(tagKind));
+            String brand = tags.optString("brand", "").trim();
+            if (brand.length() > 0 && !brand.equalsIgnoreCase(name)) appendPart(sub, brand);
+            String street = tags.optString("addr:street", "").trim();
+            String num = tags.optString("addr:housenumber", "").trim();
+            if (street.length() > 0) appendPart(sub, num.length() > 0 ? street + " " + num : street);
+            appendPart(sub, firstNonEmpty(tags.optString("addr:suburb", ""), tags.optString("addr:city", ""), tags.optString("addr:state", "")));
+            Place p = new Place();
+            p.name = name;
+            p.sub = sub.toString();
+            p.lat = lat;
+            p.lon = lon;
+            if (!dupPlace(out, p)) out.add(p);
+        }
+        return out;
+    }
+
+    private static String escapeOverpassRegex(String q) {
+        if (q == null) return "";
+        StringBuilder sb = new StringBuilder(q.length() + 8);
+        for (int i = 0; i < q.length(); i++) {
+            char ch = q.charAt(i);
+            if ("\\.^$|?*+()[]{}".indexOf(ch) >= 0) sb.append('\\');
+            else if (ch == '"') continue;
+            sb.append(ch);
+        }
+        return sb.toString().trim();
     }
 
     private static List<Place> searchOnlineCategory(Context c, String cat, double lat, double lon) throws Exception {
-        String term = "gas station";
+        String term = "petrol station";
         if ("health".equals(cat)) term = "hospital";
         else if ("parking".equals(cat)) term = "parking";
         else if ("food".equals(cat)) term = "restaurant";
         String url = String.format(Locale.US,
-                "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=12&addressdetails=1&bounded=1&viewbox=%.4f,%.4f,%.4f,%.4f&q=%s&accept-language=%s",
-                lon - 0.14, lat + 0.14, lon + 0.14, lat - 0.14,
+                "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=20&addressdetails=1&namedetails=1&bounded=1&viewbox=%.4f,%.4f,%.4f,%.4f&q=%s&accept-language=%s",
+                lon - 0.90, lat + 0.90, lon + 0.90, lat - 0.90,
                 URLEncoder.encode(term, "UTF-8"),
                 URLEncoder.encode(I18n.lang, "UTF-8"));
-        String raw = new String(navGet(c, url, 9500), "UTF-8");
+        String raw = new String(navGet(c, url, 8500), "UTF-8");
         List<Place> list = parseNominatimArray(raw);
         Collections.sort(list, new Comparator<Place>() {
             public int compare(Place a, Place b) {
@@ -483,13 +920,40 @@ public class Nav {
     private static Place placeFromNominatimObj(JSONObject o, double lat, double lon) {
         String disp = o.optString("display_name", "");
         String name = o.optString("name", "").trim();
+        JSONObject nd = o.optJSONObject("namedetails");
+        if (name.length() == 0 && nd != null) {
+            name = firstNonEmpty(
+                    nd.optString("name:" + I18n.lang, ""),
+                    nd.optString("name:en", ""),
+                    nd.optString("name:ms", ""),
+                    nd.optString("name", ""),
+                    nd.optString("short_name", ""),
+                    nd.optString("alt_name", ""));
+        }
         String sub = "";
         int comma = disp.indexOf(',');
         if (name.length() == 0) {
             name = comma > 0 ? disp.substring(0, comma).trim() : disp;
             sub = comma > 0 ? disp.substring(comma + 1).trim() : "";
         } else {
-            sub = disp.startsWith(name) && comma > 0 ? disp.substring(comma + 1).trim() : disp;
+            JSONObject addr = o.optJSONObject("address");
+            String typeVal = o.optString("type", "").trim();
+            StringBuilder sb = new StringBuilder();
+            if (typeVal.length() > 0 && !"yes".equals(typeVal)) {
+                String kind = translateTag(typeVal);
+                if (!I18n.t("Lugar").equals(kind)) appendPart(sb, kind);
+            }
+            if (addr != null) {
+                String rd = addr.optString("road", "").trim();
+                String hn = addr.optString("house_number", "").trim();
+                if (rd.length() > 0 && !rd.equalsIgnoreCase(name)) appendPart(sb, hn.length() > 0 ? rd + " " + hn : rd);
+                appendPart(sb, firstNonEmpty(addr.optString("suburb", ""), addr.optString("neighbourhood", "")));
+                appendPart(sb, firstNonEmpty(addr.optString("city", ""), addr.optString("town", ""), addr.optString("village", ""), addr.optString("county", "")));
+                appendPart(sb, addr.optString("state", ""));
+                appendPart(sb, addr.optString("country", ""));
+            }
+            if (sb.length() > 0) sub = sb.toString();
+            else sub = disp.startsWith(name) && comma > 0 ? disp.substring(comma + 1).trim() : disp;
         }
         if (name.length() == 0) name = String.format(Locale.US, "%.5f, %.5f", lat, lon);
         Place p = new Place();
@@ -501,7 +965,7 @@ public class Nav {
     }
 
     private static List<Place> searchOpenMeteo(Context c, String q, double biasLat, double biasLon) throws Exception {
-        String url = "https://geocoding-api.open-meteo.com/v1/search?count=8&format=json&language="
+        String url = "https://geocoding-api.open-meteo.com/v1/search?count=10&format=json&language="
                 + URLEncoder.encode(I18n.lang != null ? I18n.lang : "en", "UTF-8")
                 + "&name=" + URLEncoder.encode(q, "UTF-8");
         String raw = new String(navGet(c, url, 8500), "UTF-8");
@@ -573,10 +1037,90 @@ public class Nav {
     }
 
     private static boolean dupPlace(List<Place> list, Place p) {
-        for (Place e : list) {
-            if (e.name.equalsIgnoreCase(p.name) && Math.abs(e.lat - p.lat) < 0.0008 && Math.abs(e.lon - p.lon) < 0.0008) return true;
+        if (p == null || p.name == null) return true;
+        String pn = normPlaceName(p.name);
+        for (int i = 0; i < list.size(); i++) {
+            Place e = list.get(i);
+            String en = normPlaceName(e.name);
+            boolean sameName = en.equals(pn) || (en.length() > 4 && pn.length() > 4 && (en.contains(pn) || pn.contains(en)));
+            boolean veryClose = approxDist(e.lat, e.lon, p.lat, p.lon) < 140.0;
+            if (sameName && veryClose) {
+                if ((p.sub != null ? p.sub.length() : 0) > (e.sub != null ? e.sub.length() : 0) + 6) {
+                    e.sub = p.sub;
+                }
+                if (!p.offline && e.offline) {
+                    // Si llegó versión en línea con mejor subtítulo, mantenerla visible pero sin duplicar fila
+                    if (p.sub != null && p.sub.length() > (e.sub != null ? e.sub.length() : 0)) {
+                        e.sub = p.sub;
+                        e.offline = false;
+                    }
+                }
+                return true;
+            }
+            if (e.name.equalsIgnoreCase(p.name) && Math.abs(e.lat - p.lat) < 0.0014 && Math.abs(e.lon - p.lon) < 0.0014) {
+                return true;
+            }
         }
         return false;
+    }
+
+    private static void mergePlaces(List<Place> dst, List<Place> src) {
+        if (src == null || src.isEmpty()) return;
+        for (int i = 0; i < src.size(); i++) {
+            Place p = src.get(i);
+            if (!dupPlace(dst, p)) dst.add(p);
+        }
+    }
+
+    private static String normPlaceName(String s) {
+        if (s == null) return "";
+        return OfflineMap.fold(s).toLowerCase(Locale.US).replaceAll("[^a-z0-9 ]", " ").replaceAll("\\s+", " ").trim();
+    }
+
+    private static void rankAndSortPlaces(List<Place> list, final String query, final double biasLat, final double biasLon) {
+        if (list == null || list.size() <= 1) return;
+        final String qNorm = normPlaceName(query);
+        final String[] tokens = qNorm.length() > 0 ? qNorm.split(" ") : new String[0];
+        final boolean hasBias = !Double.isNaN(biasLat) && !Double.isNaN(biasLon);
+
+        Collections.sort(list, new Comparator<Place>() {
+            public int compare(Place a, Place b) {
+                double sa = scorePlace(a, qNorm, tokens, hasBias, biasLat, biasLon);
+                double sb = scorePlace(b, qNorm, tokens, hasBias, biasLat, biasLon);
+                return Double.compare(sb, sa);
+            }
+        });
+    }
+
+    private static double scorePlace(Place p, String qNorm, String[] tokens, boolean hasBias, double biasLat, double biasLon) {
+        String n = normPlaceName(p.name);
+        String s = normPlaceName(p.sub);
+        double score = 0;
+        if (n.equals(qNorm)) score += 130;
+        else if (n.startsWith(qNorm)) score += 92;
+        else if (n.contains(qNorm)) score += 65;
+        else if (s.contains(qNorm)) score += 28;
+
+        if (tokens.length > 0) {
+            int matched = 0;
+            for (String tok : tokens) {
+                if (tok.length() == 0) continue;
+                if (n.contains(tok) || s.contains(tok)) matched++;
+            }
+            if (matched == tokens.length) score += 48;
+            else score += matched * 12.0;
+        }
+        if (hasBias) {
+            double km = approxDist(biasLat, biasLon, p.lat, p.lon) / 1000.0;
+            if (km <= 100.0) {
+                score += 40.0 - km * 0.22;
+            } else {
+                score += Math.max(-22.0, 14.0 / (1.0 + (km - 100.0) * 0.015));
+            }
+        }
+        if (p.sub != null && p.sub.length() > 6) score += 5;
+        if (p.offline) score += 2;
+        return score;
     }
 
     // ───────────────────────── destinos recientes, casa/trabajo y favoritos ─────────────────────────
@@ -747,20 +1291,12 @@ public class Nav {
         nearbyIncident = null;
         nearbyIncidentDistM = 0;
         lastIncIdx = -1;
-        nearbyPolice = null;
-        nearbyPoliceDistM = 0;
-        lastPoliceId = null;
-        synchronized (policeReports) {
-            for (int pi = 0; pi < policeReports.size(); pi++) policeReports.get(pi).alongM = -1;
-        }
         spokenMask = r != null ? new int[r.steps.size()] : null;
         if (r != null) {
             ensureIncidentAlongM(r);
             updateProximityAlerts(c, r, 0, SystemClock.elapsedRealtime(), false);
-            if (r.pts != null && r.pts.length >= 2) {
-                checkPoliceProximity(c, r.pts[0], r.pts[1], 0, true, SystemClock.elapsedRealtime(), false);
-            }
         }
+        if (c != null && isSoundOn(c)) prewarmTts(c);
         if (c != null && r != null) {
             final Context app = c.getApplicationContext();
             new Thread(new Runnable() {
@@ -805,9 +1341,6 @@ public class Nav {
         nearbyIncident = null;
         nearbyIncidentDistM = 0;
         lastIncIdx = -1;
-        nearbyPolice = null;
-        nearbyPoliceDistM = 0;
-        lastPoliceId = null;
         spokenMask = null;
         previewMode = false;
         stopSimulation();
@@ -947,13 +1480,8 @@ public class Nav {
             nearbyIncident = null;
             nearbyIncidentDistM = 0;
             lastIncIdx = -1;
-            nearbyPolice = null;
-            nearbyPoliceDistM = 0;
-            lastPoliceId = null;
             ensureIncidentAlongM(r);
             updateProximityAlerts(c, r, along, SystemClock.elapsedRealtime(), false);
-            int pIdx = Math.min(curPtIdx, (r.pts.length / 2) - 1);
-            checkPoliceProximity(c, r.pts[pIdx * 2], r.pts[pIdx * 2 + 1], along, true, SystemClock.elapsedRealtime(), false);
             return true;
         } catch (Throwable e) {
             return false;
@@ -1262,6 +1790,42 @@ public class Nav {
             navTlsFactory = null;
         }
         return navTlsFactory;
+    }
+
+    static byte[] navPost(Context c, String url, String formBody, int timeoutMs) throws Exception {
+        SSLSocketFactory sf = null;
+        if (c != null && url != null && url.startsWith("https://")
+                && c.getSharedPreferences("launcher", 0).getBoolean("nav_tls_compat", false)) {
+            sf = navSocketFactory(c);
+        }
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        if (conn instanceof HttpsURLConnection && sf != null) ((HttpsURLConnection) conn).setSSLSocketFactory(sf);
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setRequestProperty("User-Agent", "StradaOS/2.32 (Android car launcher; https://github.com/ierfansagi-debug/StradaOS)");
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+        conn.setRequestProperty("Accept", "application/json, */*;q=0.8");
+        byte[] payload = formBody.getBytes("UTF-8");
+        conn.setFixedLengthStreamingMode(payload.length);
+        try {
+            OutputStream os = conn.getOutputStream();
+            os.write(payload);
+            os.flush();
+            os.close();
+            int code = conn.getResponseCode();
+            if (code != 200) throw new Exception("HTTP " + code);
+            InputStream in = conn.getInputStream();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            in.close();
+            return out.toByteArray();
+        } finally {
+            conn.disconnect();
+        }
     }
 
     private static byte[] httpGetWithFactory(String url, int timeoutMs, SSLSocketFactory f) throws Exception {
@@ -2471,7 +3035,7 @@ public class Nav {
             if (over && (!speedingAlert || nowSp - lastSpeedChimeAt > 18000L)) {
                 lastSpeedChimeAt = nowSp;
                 if (sp != null && sp.getBoolean("nav_speed_sound", false)) {
-                    playAlertTone(ToneGenerator.TONE_PROP_BEEP2, 240);
+                    playAlertTone(c, ToneGenerator.TONE_PROP_BEEP2, 240);
                 }
             }
             speedingAlert = over;
@@ -2570,7 +3134,7 @@ public class Nav {
         if (announce && foundCam != null && (foundCamIdx != lastCamIdx || nowSp - lastCamChimeAt > 35000L)) {
             lastCamIdx = foundCamIdx;
             lastCamChimeAt = nowSp;
-            playAlertTone(ToneGenerator.TONE_PROP_ACK, 260);
+            playAlertTone(c, ToneGenerator.TONE_PROP_ACK, 260);
             if (c != null) speakRaw(c, I18n.t("Radar de velocidad adelante"));
         }
 
@@ -2599,250 +3163,53 @@ public class Nav {
         if (announce && foundInc != null && (foundIncIdx != lastIncIdx || nowSp - lastIncChimeAt > 45000L)) {
             lastIncIdx = foundIncIdx;
             lastIncChimeAt = nowSp;
-            playAlertTone(ToneGenerator.TONE_PROP_BEEP, 220);
+            playAlertTone(c, ToneGenerator.TONE_PROP_BEEP, 220);
             if (c != null) {
                 String msg = foundInc.desc != null && foundInc.desc.length() > 0 ? foundInc.desc : incidentLabel(foundInc.category);
                 speakRaw(c, msg);
             }
         }
-
-        double pLat = r.pts != null && curPtIdx * 2 + 1 < r.pts.length ? r.pts[curPtIdx * 2] : r.destLat;
-        double pLon = r.pts != null && curPtIdx * 2 + 1 < r.pts.length ? r.pts[curPtIdx * 2 + 1] : r.destLon;
-        checkPoliceProximity(c, pLat, pLon, alongM, true, nowSp, announce);
     }
 
-    public static void loadPoliceReports(Context c) {
+    public static boolean isSoundOn(Context c) {
+        if (c == null) return true;
+        SharedPreferences sp = c.getSharedPreferences("launcher", 0);
+        return sp.contains("nav_sound") ? sp.getBoolean("nav_sound", true) : sp.getBoolean("nav_voice", true);
+    }
+
+    public static void setSoundOn(Context c, boolean on) {
         if (c == null) return;
-        synchronized (policeReports) {
-            if (!policeLoaded) {
-                policeLoaded = true;
-                try {
-                    File f = new File(c.getFilesDir(), "police_reports.json");
-                    if (f.isFile() && f.length() > 0) {
-                        JSONArray arr = new JSONArray(readUtf8(f));
-                        for (int i = 0; i < arr.length(); i++) {
-                            JSONObject o = arr.optJSONObject(i);
-                            if (o == null) continue;
-                            PoliceReport pr = new PoliceReport();
-                            pr.id = o.optString("id", "");
-                            pr.lat = o.optDouble("lat", Double.NaN);
-                            pr.lon = o.optDouble("lon", Double.NaN);
-                            pr.label = o.optString("label", "");
-                            pr.reportedAtMs = o.optLong("at", 0L);
-                            if (pr.id.length() > 0 && !Double.isNaN(pr.lat) && !Double.isNaN(pr.lon)) {
-                                policeReports.add(pr);
-                            }
-                        }
-                    }
-                } catch (Throwable ignored) { }
-            }
-            pruneExpiredPoliceLocked();
+        c.getSharedPreferences("launcher", 0).edit()
+            .putBoolean("nav_sound", on)
+            .putBoolean("nav_voice", on)
+            .apply();
+        if (!on) stopSpeaking();
+    }
+
+    public static void stopSpeaking() {
+        abandonNavFocus();
+        if (tts != null) {
+            try { tts.stop(); } catch (Throwable ignored) { }
         }
     }
 
-    private static boolean pruneExpiredPoliceLocked() {
-        long now = System.currentTimeMillis();
-        boolean changed = false;
-        for (int i = policeReports.size() - 1; i >= 0; i--) {
-            PoliceReport pr = policeReports.get(i);
-            if (pr == null || now - pr.reportedAtMs > POLICE_TTL_MS || pr.reportedAtMs <= 0) {
-                policeReports.remove(i);
-                changed = true;
-            }
-        }
-        return changed;
+    public static void playRoadAlertAudio(Context c, String text, int tone) {
+        if (c == null || !isSoundOn(c)) return;
+        playAlertTone(c, tone, 230);
+        if (text != null && text.trim().length() > 0) speakRaw(c, text);
     }
 
-    private static void savePoliceReports(Context c) {
-        if (c == null) return;
-        final Context app = c.getApplicationContext();
-        final String payload;
-        synchronized (policeReports) {
-            JSONArray arr = new JSONArray();
-            for (int i = 0; i < policeReports.size(); i++) {
-                PoliceReport pr = policeReports.get(i);
-                try {
-                    JSONObject o = new JSONObject();
-                    o.put("id", pr.id);
-                    o.put("lat", pr.lat);
-                    o.put("lon", pr.lon);
-                    o.put("label", pr.label != null ? pr.label : "");
-                    o.put("at", pr.reportedAtMs);
-                    arr.put(o);
-                } catch (Throwable ignored) { }
-            }
-            payload = arr.toString();
-        }
-        new Thread(new Runnable() {
-            public void run() {
-                FileOutputStream os = null;
-                try {
-                    os = new FileOutputStream(new File(app.getFilesDir(), "police_reports.json"));
-                    os.write(payload.getBytes("UTF-8"));
-                } catch (Throwable ignored) { } finally {
-                    if (os != null) try { os.close(); } catch (Throwable ignored) { }
-                }
-            }
-        }).start();
-    }
-
-    public static List<PoliceReport> getPoliceReports(Context c) {
-        if (c != null) loadPoliceReports(c);
-        synchronized (policeReports) {
-            if (pruneExpiredPoliceLocked() && c != null) savePoliceReports(c);
-            return new ArrayList<PoliceReport>(policeReports);
-        }
-    }
-
-    public static PoliceReport reportPolice(Context c, double lat, double lon, String label) {
-        if (Double.isNaN(lat) || Double.isNaN(lon)) return null;
-        if (c != null) loadPoliceReports(c);
-        long now = System.currentTimeMillis();
-        PoliceReport saved = null;
-        synchronized (policeReports) {
-            pruneExpiredPoliceLocked();
-            for (int i = 0; i < policeReports.size(); i++) {
-                PoliceReport ex = policeReports.get(i);
-                if (approxDist(lat, lon, ex.lat, ex.lon) <= 120.0) {
-                    ex.reportedAtMs = now;
-                    if (label != null && label.length() > 0) ex.label = label;
-                    saved = ex;
-                    break;
-                }
-            }
-            if (saved == null) {
-                if (policeReports.size() >= 32) policeReports.remove(0);
-                saved = new PoliceReport();
-                saved.id = "pol_" + now + "_" + policeReports.size();
-                saved.lat = lat;
-                saved.lon = lon;
-                saved.label = label != null ? label : "";
-                saved.reportedAtMs = now;
-                policeReports.add(saved);
-            }
-            Route r = active;
-            if (r != null && r.pts != null && r.pts.length >= 4 && r.cumDistM != null) {
-                int np = r.pts.length / 2;
-                double[] cl = closestOnRange(r.pts, saved.lat, saved.lon, 0, np - 2);
-                int sg = (int) cl[1];
-                if (cl[0] <= 140.0 && sg + 1 < r.cumDistM.length) {
-                    saved.alongM = r.cumDistM[sg] + (r.cumDistM[sg + 1] - r.cumDistM[sg]) * cl[2];
-                } else {
-                    saved.alongM = -1;
-                }
-            }
-        }
-        if (c != null) savePoliceReports(c);
-        checkPoliceAtCurrentState(c, lat, lon);
-        return saved;
-    }
-
-    public static void confirmPolice(Context c, PoliceReport pr) {
-        if (pr == null) return;
-        synchronized (policeReports) {
-            pr.reportedAtMs = System.currentTimeMillis();
-        }
-        if (c != null) savePoliceReports(c);
-    }
-
-    public static void clearPolice(Context c, PoliceReport pr) {
-        if (pr == null) return;
-        synchronized (policeReports) {
-            for (int i = policeReports.size() - 1; i >= 0; i--) {
-                PoliceReport item = policeReports.get(i);
-                if (item == pr || (pr.id != null && pr.id.equals(item.id))) {
-                    policeReports.remove(i);
-                }
-            }
-        }
-        if (nearbyPolice == pr || (nearbyPolice != null && pr.id != null && pr.id.equals(nearbyPolice.id))) {
-            nearbyPolice = null;
-            nearbyPoliceDistM = 0;
-        }
-        if (c != null) savePoliceReports(c);
-    }
-
-    private static void checkPoliceAtCurrentState(Context c, double refLat, double refLon) {
-        Route r = active;
-        if (r != null && r.pts != null && r.pts.length >= 4 && r.cumDistM != null) {
-            int idx = Math.max(0, Math.min((r.pts.length / 2) - 1, curPtIdx));
-            double along = idx < r.cumDistM.length ? r.cumDistM[idx] : 0;
-            checkPoliceProximity(c, r.pts[idx * 2], r.pts[idx * 2 + 1], along, true, SystemClock.elapsedRealtime(), false);
-        } else {
-            checkPoliceProximity(c, refLat, refLon, 0, false, SystemClock.elapsedRealtime(), false);
-        }
-    }
-
-    public static void onFreeLocation(Context c, Location l) {
-        if (l == null || active != null) return;
-        checkPoliceProximity(c, l.getLatitude(), l.getLongitude(), 0, false, SystemClock.elapsedRealtime(), true);
-    }
-
-    public static void checkPoliceProximity(Context c, double lat, double lon, double alongM,
-                                            boolean hasActiveRoute, long nowSp, boolean announce) {
-        if (c != null) loadPoliceReports(c);
-        SharedPreferences sp = c != null ? c.getSharedPreferences("launcher", 0) : null;
-        boolean polOn = sp == null || sp.getBoolean("nav_police_alerts", true);
-        if (!polOn) {
-            nearbyPolice = null;
-            nearbyPoliceDistM = 0;
-            return;
-        }
-        Route r = hasActiveRoute ? active : null;
-        int nPts = r != null && r.pts != null ? r.pts.length / 2 : 0;
-
-        PoliceReport found = null;
-        double bestDist = Double.MAX_VALUE;
-        boolean pruned;
-        synchronized (policeReports) {
-            pruned = pruneExpiredPoliceLocked();
-            for (int i = 0; i < policeReports.size(); i++) {
-                PoliceReport pr = policeReports.get(i);
-                if (pr == null) continue;
-                double d = Double.MAX_VALUE;
-                if (r != null && nPts >= 2 && r.cumDistM != null) {
-                    if (pr.alongM < 0) {
-                        double[] cl = closestOnRange(r.pts, pr.lat, pr.lon, 0, nPts - 2);
-                        int sg = (int) cl[1];
-                        if (cl[0] <= 140.0 && sg + 1 < r.cumDistM.length) {
-                            pr.alongM = r.cumDistM[sg] + (r.cumDistM[sg + 1] - r.cumDistM[sg]) * cl[2];
-                        }
-                    }
-                    if (pr.alongM >= 0 && pr.alongM >= alongM - 30 && pr.alongM - alongM <= 500) {
-                        d = Math.max(0, pr.alongM - alongM);
-                    }
-                }
-                if (d == Double.MAX_VALUE && !Double.isNaN(lat) && !Double.isNaN(lon)) {
-                    double rad = approxDist(lat, lon, pr.lat, pr.lon);
-                    if (rad <= (r != null ? 300.0 : 550.0)) d = rad;
-                }
-                if (d < bestDist) {
-                    bestDist = d;
-                    found = pr;
-                }
-            }
-        }
-        if (pruned && c != null) savePoliceReports(c);
-
-        nearbyPolice = found;
-        nearbyPoliceDistM = found != null ? bestDist : 0;
-        if (announce && found != null && (lastPoliceId == null || !lastPoliceId.equals(found.id) || nowSp - lastPoliceChimeAt > 45000L)) {
-            lastPoliceId = found.id;
-            lastPoliceChimeAt = nowSp;
-            playAlertTone(ToneGenerator.TONE_PROP_BEEP2, 240);
-            if (c != null) speakRaw(c, I18n.t("Policía reportada adelante"));
-        }
-    }
-
-    private static void playAlertTone(final int tone, final int ms) {
+    private static void playAlertTone(final Context c, final int tone, final int ms) {
+        if (!isSoundOn(c)) return;
         try {
-            final ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 75);
+            if (c != null) requestNavFocus(c, ms + 350);
+            final ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_MUSIC, 85);
             tg.startTone(tone, ms);
             UI.postDelayed(new Runnable() {
                 public void run() {
                     try { tg.release(); } catch (Throwable ignored) { }
                 }
-            }, ms + 120);
+            }, ms + 140);
         } catch (Throwable ignored) { }
     }
 
@@ -2932,7 +3299,23 @@ public class Nav {
             if (duckAm == null) duckAm = (AudioManager) c.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
             if (duckAm == null) return;
             UI.removeCallbacks(ABANDON_FOCUS);
-            int res = duckAm.requestAudioFocus(FOCUS_LS, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
+            int res;
+            if (Build.VERSION.SDK_INT >= 26) {
+                AudioAttributes aa = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build();
+                if (navFocusReq == null) {
+                    navFocusReq = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                            .setAudioAttributes(aa)
+                            .setAcceptsDelayedFocusGain(false)
+                            .setOnAudioFocusChangeListener(FOCUS_LS, UI)
+                            .build();
+                }
+                res = duckAm.requestAudioFocus(navFocusReq);
+            } else {
+                res = duckAm.requestAudioFocus(FOCUS_LS, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
+            }
             if (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) hasAudioFocus = true;
             UI.postDelayed(ABANDON_FOCUS, Math.max(2500, Math.min(14000, approxMs)));
         } catch (Throwable ignored) { }
@@ -2942,74 +3325,161 @@ public class Nav {
     static void abandonNavFocus() {
         UI.removeCallbacks(ABANDON_FOCUS);
         if (hasAudioFocus && duckAm != null) {
-            try { duckAm.abandonAudioFocus(FOCUS_LS); } catch (Throwable ignored) { }
+            try {
+                if (Build.VERSION.SDK_INT >= 26 && navFocusReq != null) {
+                    duckAm.abandonAudioFocusRequest(navFocusReq);
+                } else {
+                    duckAm.abandonAudioFocus(FOCUS_LS);
+                }
+            } catch (Throwable ignored) { }
         }
         hasAudioFocus = false;
     }
 
+    public static void prewarmTts(Context c) {
+        if (c == null || !isSoundOn(c)) return;
+        if ((tts == null || !I18n.lang.equals(ttsLang)) && !ttsInitializing) {
+            initTtsEngine(c.getApplicationContext());
+        }
+    }
+
+    private static void initTtsEngine(final Context app) {
+        if (app == null) return;
+        shutdownTts();
+        ttsLang = I18n.lang;
+        ttsInitializing = true;
+        try {
+            tts = new TextToSpeech(app, new TextToSpeech.OnInitListener() {
+                public void onInit(final int status) {
+                    UI.post(new Runnable() {
+                        public void run() {
+                            ttsInitializing = false;
+                            if (status == TextToSpeech.SUCCESS && tts != null) {
+                                try {
+                                    if (Build.VERSION.SDK_INT >= 21) {
+                                        tts.setAudioAttributes(new AudioAttributes.Builder()
+                                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                                .build());
+                                    }
+                                    Locale[] cands = {
+                                        I18n.loc != null ? I18n.loc : Locale.getDefault(),
+                                        new Locale(I18n.lang != null ? I18n.lang : "en"),
+                                        Locale.ENGLISH,
+                                        Locale.getDefault()
+                                    };
+                                    for (Locale loc : cands) {
+                                        if (loc == null) continue;
+                                        int res = tts.setLanguage(loc);
+                                        if (res != TextToSpeech.LANG_MISSING_DATA && res != TextToSpeech.LANG_NOT_SUPPORTED) {
+                                            break;
+                                        }
+                                    }
+                                    tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                                        public void onStart(String utteranceId) { }
+                                        public void onDone(String utteranceId) {
+                                            if (utteranceId != null && utteranceId.equals(curUttId)) UI.post(ABANDON_FOCUS);
+                                        }
+                                        public void onError(String utteranceId) {
+                                            if (utteranceId != null && utteranceId.equals(curUttId)) {
+                                                UI.post(new Runnable() {
+                                                    public void run() {
+                                                        playNavChimeFallback(app);
+                                                        abandonNavFocus();
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    });
+                                } catch (Throwable ignored) { }
+                                ttsReady = true;
+                                String pending = pendingSpeakText;
+                                pendingSpeakText = null;
+                                if (pending != null && pending.length() > 0 && isSoundOn(app)) {
+                                    doSpeak(app, pending);
+                                }
+                            } else {
+                                ttsReady = false;
+                                String pending = pendingSpeakText;
+                                pendingSpeakText = null;
+                                if (pending != null && pending.length() > 0 && isSoundOn(app)) {
+                                    playNavChimeFallback(app);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        } catch (Throwable e) {
+            ttsInitializing = false;
+            ttsReady = false;
+            String pending = pendingSpeakText;
+            pendingSpeakText = null;
+            if (pending != null && pending.length() > 0) playNavChimeFallback(app);
+        }
+    }
+
+    private static void playNavChimeFallback(final Context c) {
+        if (c != null && !isSoundOn(c)) return;
+        playAlertTone(c, ToneGenerator.TONE_PROP_ACK, 220);
+    }
+
     public static void speakRaw(final Context c, final String text) {
         if (c == null || text == null || text.length() == 0) return;
-        if (!c.getSharedPreferences("launcher", 0).getBoolean("nav_voice", true)) return;
+        if (!isSoundOn(c)) return;
         final Context app = c.getApplicationContext();
         try {
             if (tts == null || !I18n.lang.equals(ttsLang)) {
-                shutdownTts();
-                ttsLang = I18n.lang;
-                tts = new TextToSpeech(app, new TextToSpeech.OnInitListener() {
-                    public void onInit(final int status) {
-                        Runnable initTask = new Runnable() {
-                            public void run() {
-                                if (status == TextToSpeech.SUCCESS && tts != null) {
-                                    try {
-                                        int res = tts.setLanguage(I18n.loc);
-                                        if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
-                                            tts.setLanguage(new Locale(I18n.lang));
-                                        }
-                                        tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                                            public void onStart(String utteranceId) { }
-                                            public void onDone(String utteranceId) {
-                                                if (utteranceId != null && utteranceId.equals(curUttId)) UI.post(ABANDON_FOCUS);
-                                            }
-                                            public void onError(String utteranceId) {
-                                                if (utteranceId != null && utteranceId.equals(curUttId)) UI.post(ABANDON_FOCUS);
-                                            }
-                                        });
-                                    } catch (Throwable ignored) { }
-                                    ttsReady = true;
-                                    doSpeak(app, text);
-                                }
-                            }
-                        };
-                        if (tts != null) initTask.run();
-                        else UI.post(initTask);
-                    }
-                });
-            } else if (ttsReady) {
+                pendingSpeakText = text;
+                if (!ttsInitializing || !I18n.lang.equals(ttsLang)) {
+                    initTtsEngine(app);
+                }
+            } else if (ttsInitializing || !ttsReady) {
+                pendingSpeakText = text;
+            } else {
+                pendingSpeakText = null;
                 doSpeak(app, text);
             }
-        } catch (Throwable ignored) { }
+        } catch (Throwable e) {
+            playNavChimeFallback(app);
+        }
     }
 
     @SuppressWarnings("deprecation")
     private static void doSpeak(Context c, String text) {
-        if (tts == null || !ttsReady) return;
+        if (tts == null || !ttsReady) {
+            playNavChimeFallback(c);
+            return;
+        }
         try {
             int timeoutMs = Math.max(3000, Math.min(14000, text.length() * 95 + 1800));
             requestNavFocus(c, timeoutMs);
             String uttId = "stradaos_nav_" + (++speakSeq);
             curUttId = uttId;
+            int status;
             if (Build.VERSION.SDK_INT >= 21) {
-                tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, uttId);
+                Bundle params = new Bundle();
+                params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC);
+                params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f);
+                status = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uttId);
             } else {
-                HashMap<String, String> params = new HashMap<String, String>(1);
+                HashMap<String, String> params = new HashMap<String, String>(2);
+                params.put(TextToSpeech.Engine.KEY_PARAM_STREAM, String.valueOf(AudioManager.STREAM_MUSIC));
                 params.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, uttId);
-                tts.speak(text, TextToSpeech.QUEUE_FLUSH, params);
+                status = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params);
             }
-        } catch (Throwable ignored) { }
+            if (status != TextToSpeech.SUCCESS) {
+                playNavChimeFallback(c);
+            }
+        } catch (Throwable e) {
+            playNavChimeFallback(c);
+        }
     }
 
     public static void shutdownTts() {
         ttsReady = false;
+        ttsInitializing = false;
+        pendingSpeakText = null;
         abandonNavFocus();
         if (tts != null) {
             try { tts.stop(); tts.shutdown(); } catch (Throwable ignored) { }

@@ -4,35 +4,54 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 
 /**
- * Temas premium (2.24): el tema en uso y sus colores. Main pide aquí los colores y el fondo, así Aurora y Cobalto
- * comparten la barra de arriba, «Solo mapa», las transiciones y la barra de apps.
+ * Registro de temas premium de StradaOS (colores, fondos, miniaturas y disponibilidad).
  */
 final class Prem {
     private Prem() { }
 
-    static final String[] IDS = {Aurora.ID, Cobalto.ID, Faro.ID};
+    static final String[] IDS = {
+        Aurora.ID, Cobalto.ID, Faro.ID, CockpitThemes.NIGHTPULSE
+    };
     static String style = Aurora.ID;
 
-    static boolean known(String id) { return Aurora.ID.equals(id) || Cobalto.ID.equals(id) || Faro.ID.equals(id); }
+    static String normalize(String id) {
+        return ("aurora_drive".equals(id) || "cyberflow".equals(id)) ? CockpitThemes.NIGHTPULSE : id;
+    }
 
-    /** Temas premium que se regalan a todos (lanzamiento de la 2.24). Los que vengan después se desbloquean con una donación (Fase 3). */
-    static boolean free(String id) { return Aurora.ID.equals(id) || Cobalto.ID.equals(id); }
-    /** Cuántos temas se desbloquean con donación. Con dos o más, la app ofrece sola el paquete de 8 USD por dos temas. */
+    static boolean known(String id) {
+        return Aurora.ID.equals(id) || Cobalto.ID.equals(id) || Faro.ID.equals(id) || CockpitThemes.isCustom(id);
+    }
+
+    /** Temas gratuitos/desbloqueados inmediatamente en Personalización. */
+    static boolean free(String id) {
+        return Aurora.ID.equals(id) || Cobalto.ID.equals(id) || CockpitThemes.isCustom(id);
+    }
+
     static int paidCount() {
         int n = 0;
         for (String id : IDS) if (!free(id)) n++;
         return n;
     }
-    /** Solo para las pruebas en el emulador (gancho «paquete:1»): ver el paquete antes de que exista el segundo tema. */
+
     static boolean forceBundle;
     static boolean bundle() { return forceBundle || paidCount() >= 2; }
     static boolean cob() { return Cobalto.ID.equals(style); }
     static boolean faro() { return Faro.ID.equals(style); }
-    /** Solo Aurora tiene «Solo mapa» (Cobalto y Faro son fijos). */
+    static boolean cockpit() { return CockpitThemes.isCockpit(style); }
     static boolean mapOnlyOk() { return Aurora.ID.equals(style); }
 
-    static String name(String id) { return Cobalto.ID.equals(id) ? "Cobalto" : Faro.ID.equals(id) ? "Faro" : "Aurora"; }
+    static String name(String id) {
+        id = normalize(id);
+        if (Cobalto.ID.equals(id)) return "Cobalto";
+        if (Faro.ID.equals(id)) return "Faro";
+        if (CockpitThemes.NIGHTPULSE.equals(id)) return "NightPulse";
+        return "Aurora";
+    }
+
     static String desc(String id) {
+        id = normalize(id);
+        if (CockpitThemes.NIGHTPULSE.equals(id))
+            return "Futurista · Oscuro · Deportivo. Paneles de vidrio negro, acentos azul eléctrico, barra lateral derecha de apps, mapa central amplio y tu Nissan Almera N17 Impul blanco en vista elevada trasera con pilotos LED.";
         if (Faro.ID.equals(id))
             return "Fondo carbón (o perla en claro) con un haz de luz diagonal. A la izquierda, el velocímetro y un carro visto desde arriba que enciende los faros de noche; en el centro, el mapa integrado al fondo; a la derecha, el clima por horas y tus próximos mantenimientos, con el reproductor y la barra de apps debajo.";
         return Cobalto.ID.equals(id)
@@ -40,14 +59,38 @@ final class Prem {
             : "Fondo con un arco de color difuminado y granulado, tarjetas translúcidas, la hora en grande con música, vehículo y clima arriba, el mapa a lo ancho y una barra tipo píldora. El botón «Solo mapa» agranda el mapa.";
     }
 
-    static int base(boolean l) { return faro() ? Faro.base(l) : cob() ? Cobalto.base(l) : Aurora.base(l); }
-    static int glass(boolean l) { return faro() ? Faro.glass(l) : cob() ? Cobalto.glassTop(l) : Aurora.glass(l); }
-    static int glassEdge(boolean l) { return faro() ? Faro.glassEdge(l) : cob() ? Cobalto.glassEdge(l) : Aurora.glassEdge(l); }
-    static int pill(boolean l) { return faro() ? Faro.pill(l) : cob() ? Cobalto.pill(l) : Aurora.pill(l); }
-    static int pillEdge(boolean l) { return faro() ? Faro.pillEdge(l) : cob() ? Cobalto.pillEdge(l) : Aurora.pillEdge(l); }
-    static int pillIcon(boolean l) { return faro() ? Faro.pillIcon(l) : cob() ? Cobalto.pillIcon(l) : Aurora.pillIcon(l); }
-    static int soft(boolean l) { return faro() ? Faro.soft(l) : cob() ? Cobalto.soft(l) : Aurora.soft(l); }
-    static float mapAlpha(boolean l) { return faro() ? Faro.mapAlpha(l) : cob() ? Cobalto.mapAlpha(l) : Aurora.mapAlpha(l); }
+    static int base(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.base(style, l)
+            : faro() ? Faro.base(l) : cob() ? Cobalto.base(l) : Aurora.base(l);
+    }
+    static int glass(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.glass(style, l)
+            : faro() ? Faro.glass(l) : cob() ? Cobalto.glassTop(l) : Aurora.glass(l);
+    }
+    static int glassEdge(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.glassEdge(style, l)
+            : faro() ? Faro.glassEdge(l) : cob() ? Cobalto.glassEdge(l) : Aurora.glassEdge(l);
+    }
+    static int pill(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.pill(style, l)
+            : faro() ? Faro.pill(l) : cob() ? Cobalto.pill(l) : Aurora.pill(l);
+    }
+    static int pillEdge(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.pillEdge(style, l)
+            : faro() ? Faro.pillEdge(l) : cob() ? Cobalto.pillEdge(l) : Aurora.pillEdge(l);
+    }
+    static int pillIcon(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.pillIcon(style, l)
+            : faro() ? Faro.pillIcon(l) : cob() ? Cobalto.pillIcon(l) : Aurora.pillIcon(l);
+    }
+    static int soft(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.soft(style, l)
+            : faro() ? Faro.soft(l) : cob() ? Cobalto.soft(l) : Aurora.soft(l);
+    }
+    static float mapAlpha(boolean l) {
+        return CockpitThemes.isCustom(style) ? CockpitThemes.mapAlpha(style, l)
+            : faro() ? Faro.mapAlpha(l) : cob() ? Cobalto.mapAlpha(l) : Aurora.mapAlpha(l);
+    }
 
     private static Bitmap cache;
     private static String cacheKey;
@@ -55,7 +98,7 @@ final class Prem {
     /** Fondo del tema en uso a media resolución, con grano; se guarda hasta que cambie el tamaño, el modo o el tema. */
     static Bitmap background(int w, int h, boolean light, int accent) {
         int bw = Math.max(64, w / 2), bh = Math.max(64, h / 2);
-        String key = style + ":" + bw + "x" + bh + ":" + light + ":" + accent;
+        String key = style + ":" + bw + "x" + bh + ":" + light + ":" + accent + ":" + Faro.mapLevel;
         if (cache != null && !cache.isRecycled() && key.equals(cacheKey)) return cache;
         Bitmap b;
         try {
@@ -66,10 +109,15 @@ final class Prem {
             return b;
         }
         Canvas c = new Canvas(b);
-        if (faro()) Faro.paint(c, bw, bh, light, accent);
+        if (CockpitThemes.isCustom(style)) CockpitThemes.paint(style, c, bw, bh, light, accent);
+        else if (faro()) Faro.paint(c, bw, bh, light, accent);
         else if (cob()) Cobalto.paint(c, bw, bh, light, accent);
         else Aurora.paint(c, bw, bh, light, accent);
-        if (faro()) Aurora.grain(b, Faro.grain(light)); else Aurora.grain(b, light);
+        if (CockpitThemes.isCustom(style)) {
+            int ga = CockpitThemes.grainAmp(style, light);
+            if (ga > 0) Aurora.grain(b, ga);
+        } else if (faro()) Aurora.grain(b, Faro.grain(light));
+        else Aurora.grain(b, light);
         cache = b;
         cacheKey = key;
         return b;

@@ -162,21 +162,25 @@ public class Main extends Activity {
     private View mapTagBox, navSearchBtn, navHud, navLaneBox, topNavPill;
     private Nav.ManeuverView navTurnIc, topNavIc;
     private Nav.LaneStripView navLaneView;
-    private TextView navDistTv, navStepTv, navEtaTv, speedSignTv, navCurSpeedTv, navCurUnitTv, camBadgeTv, topNavDistTv;
+    private TextView navDistTv, navStepTv, navEtaTv, speedSignTv, navCurSpeedTv, navCurUnitTv, topNavDistTv;
     private LinearLayout speedHudBox;
+    private LinearLayout hazardBannerBox, hazardsPillBtn;
+    private View hazardBannerDot;
+    private TextView hazardBannerTitleTv, hazardBannerSubTv, hazardBannerDismissTv, hazardsPillTv;
+    private String hazardBannerAlertId;
+    private FrameLayout hazardsSheetOverlay;
     private WaveAlertView waveAlertView;
     private double waveAlertLat = Double.NaN, waveAlertLon = Double.NaN;
-    private Nav.PoliceReport waveAlertPolice;
     private final List<Nav.Place> pendingStops = new ArrayList<Nav.Place>();
-    private LiveMapView liveMap;
     private MapLibreMapView mlMap;
-    private boolean mapLibreFallback;
     private boolean autoSimPending;
     private Nav.Place previewPlace;
     private FrameLayout mapPreviewCard, mapSearchOverlay, mapStepsOverlay;
-    private View mapCtrlBox, mapRecenterBtn, mapOverviewBtn, mapStepsBtn, mapTiltQuickBtn, mapSimBtn, mapPoliceBtn, mapEngineBtn;
-    private TextView mapTiltQuickTv, mapEngineTv;
+    private View mapCtrlBox, mapRecenterBtn, mapOverviewBtn, mapStepsBtn, mapSimBtn, mapSoundBtn, mapCompassBtn;
     private ImageView mapSimIc;
+    private SoundIconView mapSoundIcon;
+    private CompassBadgeView mapCompassView;
+    private float lastMapBearing = Float.NaN;
     private View mapConnPanel, mapConnHandle, mapConnNavBtn, mapConnGauge;
     private boolean mapConnHasPanel, mapConnNavBtnVisible;
     private MediaWatcher mediaWatcher;
@@ -214,8 +218,8 @@ public class Main extends Activity {
         prefs = getSharedPreferences("launcher", MODE_PRIVATE);
         I18n.init(this, prefs);
         LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
-        LiveMapView.view3d = prefs.getBoolean("map_3d", false);
-        LiveMapView.tiltAngle = prefs.getInt("map_angle", 45);
+        LiveMapView.view3d = true;
+        LiveMapView.tiltAngle = manualMapAngle();
         lm = (LocationManager) getSystemService(LOCATION_SERVICE);
         if (getPackageName().endsWith(".debug") && getIntent() != null && "saltar".equals(getIntent().getStringExtra("prueba")))
             prefs.edit().putBoolean("setup_done", true).apply();
@@ -253,7 +257,18 @@ public class Main extends Activity {
         if (!Double.isNaN(wLat)) sunSpot(wLat, wLon);
         loadApps();
         startOdo();
-        if ("internal".equals(prefs.getString("nav_app", null)) && Nav.restore(this)) LiveMapView.headingUp = true;
+        PoiIndex.initIfNeeded(this);
+        if (!Double.isNaN(wLat) && !Double.isNaN(wLon)) RoadAlerts.updateAnchor(wLat, wLon);
+        RoadAlerts.init(this);
+        RoadAlerts.setListener(new RoadAlerts.AlertsListener() {
+            public void onAlertsChanged() {
+                if (isFinishing()) return;
+                syncMapRoadAlerts();
+                updateWaveAlerts(useMph());
+                updateHazardsPill();
+            }
+        });
+        if ("internal".equals(prefs.getString("nav_app", null)) && Nav.restore(this) && !prefs.contains("map_heading")) LiveMapView.headingUp = true;
         // mapa sin conexión: aviso al terminar la descarga y, si quedó a medias (se apagó el carro), continuarla
         MapDownload.onFinish = new Runnable() { public void run() { onMapDownloadFinished(); } };
         if (MapDownload.paused(this) && !prefs.getBoolean("map_dl_user_paused", false)) {
@@ -502,6 +517,8 @@ public class Main extends Activity {
         Nav.stopSimulation();
         simLastOk = false;
         if (waveAlertView != null) { waveAlertView.setAlert(false, 0); waveAlertView = null; }
+        RoadAlerts.setListener(null);
+        closeHazardsSheet();
         if (mlMap != null) { mlMap.destroy(); mlMap = null; }
         Nav.shutdownTts();
         Guard.stopWatchdog();
@@ -976,7 +993,7 @@ public class Main extends Activity {
                 else if (v.startsWith("rumbo:")) {
                     prefs.edit().putBoolean("map_heading", "1".equals(v.substring(6))).apply(); LiveMapView.headingUp = "1".equals(v.substring(6)); rebuild();
                     h.postDelayed(new Runnable() { public void run() {
-                        if (liveMap == null) return;
+                        if (mlMap == null) return;
                         Location l = new Location(LocationManager.GPS_PROVIDER);
                         l.setLatitude(4.6533); l.setLongitude(-74.0836); l.setBearing(45); l.setSpeed(12); l.setTime(System.currentTimeMillis());
                         feedMap(l);
@@ -986,7 +1003,7 @@ public class Main extends Activity {
                     prefs.edit().putString("map_file", v.substring(13)).apply();
                     LiveMapView.loadFile(Main.this); rebuild();
                 }
-                else if (v.startsWith("mapa-zoom:")) { if (liveMap != null) liveMap.setZoom(Integer.parseInt(v.substring(10))); }
+                else if (v.startsWith("mapa-zoom:")) { /* MapLibre zoom managed internally */ }
                 else if ("mapa-buscar".equals(v)) pickMapFile();
                 else if ("mapa-diag".equals(v)) showMapDiag();
                 else if (v.startsWith("mapa-nombres:")) {
@@ -1238,7 +1255,7 @@ public class Main extends Activity {
             }
             updatePlayIcon();
             updateStatusIcons();
-            checkAutoMapEngineSwitch();
+            syncMapLibreOfflineState();
             if (++themeTick % 30 == 0) {
                 boolean was = LIGHT;
                 applyTheme();
@@ -1254,17 +1271,24 @@ public class Main extends Activity {
     };
 
     private final BroadcastReceiver netReceiver = new BroadcastReceiver() {
-        public void onReceive(Context c, Intent i) { checkAutoMapEngineSwitch(); }
+        public void onReceive(Context c, Intent i) {
+            syncMapLibreOfflineState();
+            updateMapTag();
+        }
     };
 
-    private void checkAutoMapEngineSwitch() {
-        if (isFinishing() || root == null || !showMap) return;
-        if (!prefs.getBoolean("map_live", true)) return;
-        if (previewPlace != null || mapSearchOverlay != null || mapStepsOverlay != null) return;
-        boolean wantMl = useMapLibre();
-        boolean hasMl = mlMap != null;
-        if (wantMl != hasMl) {
-            rebuild();
+    private boolean wantMapLibreOffline() {
+        if (prefs == null) return false;
+        if (prefs.getBoolean("maplibre_offline", false)) return true;
+        return LiveMapView.fileMap != null && !Nav.hasNetwork(this);
+    }
+
+    private void syncMapLibreOfflineState() {
+        if (mlMap == null || isFinishing()) return;
+        boolean wantOff = wantMapLibreOffline();
+        if (wantOff != mlMap.isOfflineMode()) {
+            mlMap.setOfflineMode(wantOff);
+            updateMapTag();
         }
     }
 
@@ -1285,16 +1309,15 @@ public class Main extends Activity {
     }
 
     private void build0(int W, int H) {
-        if (waveAlertView != null) { waveAlertView.setAlert(false, 0, false); waveAlertView = null; }
-        waveAlertPolice = null;
+        if (waveAlertView != null) { waveAlertView.setAlert(false, 0); waveAlertView = null; }
         if (mlMap != null) { mlMap.destroy(); mlMap = null; }
         speedHudBox = null; navCurSpeedTv = null; navCurUnitTv = null;
         mapSearchOverlay = null;
         mapStepsOverlay = null;
         mapPreviewCard = null;
         mapCtrlBox = null; mapRecenterBtn = null; mapOverviewBtn = null;
-        mapStepsBtn = null; mapTiltQuickBtn = null; mapSimBtn = null; mapPoliceBtn = null;
-        mapEngineBtn = null; mapEngineTv = null;
+        mapStepsBtn = null; mapSimBtn = null; mapSoundBtn = null; mapSoundIcon = null;
+        mapCompassBtn = null; mapCompassView = null;
         root.removeAllViews();
         idleView = null; idleClock = idleDate = idleSpeedTv = null; idleGauge = null;
         // versión de prueba: simular otra pantalla (p. ej. una ancha de 1920x720 en una tablet)
@@ -1324,8 +1347,8 @@ public class Main extends Activity {
         playerLeft = "left".equals(prefs.getString("player_side", "right"));
         showCar = prefs.getBoolean("show_car", true);
         showMap = true;   // «ocultar el mapa» del PR #35 queda para más adelante
-        LiveMapView.view3d = prefs.getBoolean("map_3d", false);
-        LiveMapView.tiltAngle = prefs.getInt("map_angle", 45);
+        LiveMapView.view3d = true;
+        LiveMapView.tiltAngle = (Nav.active != null && !Nav.previewMode) ? applyNavPitch() : manualMapAngle();
         // 2.18: ocultar el reproductor (el mapa gana espacio), la velocidad y el servicio (carros sin GPS) y el aceite
         showPlayer = prefs.getBoolean("show_player", true);
         carSpeed = prefs.getBoolean("car_speed", true);
@@ -1336,7 +1359,7 @@ public class Main extends Activity {
         dockLabels = prefs.getBoolean("dock_labels", true);
         // 2.24: tema premium «Aurora»: su propia distribución (la barra lateral y la compacta no aplican)
         premium = premiumActive();
-        Prem.style = premium ? prefs.getString("premium_theme", Aurora.ID) : Aurora.ID;
+        Prem.style = premium ? savedPremiumTheme() : Aurora.ID;
         mapOnly = premium && Prem.mapOnlyOk() && prefs.getBoolean("prem_map_only", false);   // Cobalto y Faro son fijos: sin «Solo mapa»
         // Faro (2.25): qué tan visible es el mapa sobre el fondo. Auto (por defecto): suave en pantallas de alta
         // resolución y más fuerte en las pantallas sencillas de los radios (lado corto ≤ 720 px y densidad baja)
@@ -2792,153 +2815,79 @@ public class Main extends Activity {
             .show();
     }
 
-    private boolean useMapLibre() {
-        if (prefs == null) return false;
-        if ("osm".equals(prefs.getString("map_engine", "maplibre"))) return false;
-        if (mapLibreFallback) return false;
-        if (LiveMapView.fileMap != null && !Nav.hasNetwork(this)) return false;
-        return true;
-    }
-
-    private void toggleMapEngineFromMap() {
-        boolean curMl = mlMap != null;
-        String next = curMl ? "osm" : "maplibre";
-        prefs.edit().putString("map_engine", next).apply();
-        mapLibreFallback = false;
-        if ("osm".equals(next)) {
-            toast("Motor: OpenStreetMap");
-        } else if (LiveMapView.fileMap != null && !Nav.hasNetwork(this)) {
-            toast("MapLibre seleccionado (sin internet: usando OSM)");
-        } else {
-            toast("Motor: MapLibre");
-        }
-        rebuild();
-    }
-
     private boolean mapHasFix() {
-        return mlMap != null ? mlMap.hasFix() : (liveMap != null && liveMap.hasFix());
+        return mlMap != null && mlMap.hasFix();
     }
 
     private boolean mapIsFollowing() {
-        return mlMap != null ? mlMap.isFollowing() : (liveMap == null || liveMap.isFollowing());
+        return mlMap == null || mlMap.isFollowing();
     }
 
     private boolean mapIsOverview() {
-        return mlMap != null ? mlMap.isOverview() : (liveMap != null && liveMap.isOverview());
+        return mlMap != null && mlMap.isOverview();
     }
 
     private double mapCenterLat() {
         if (!Double.isNaN(wLat)) return wLat;
         if (mlMap != null) return mlMap.getCenterLat();
-        if (liveMap != null) return liveMap.getCenterLat();
         return 4.7110;
     }
 
     private double mapCenterLon() {
         if (!Double.isNaN(wLon)) return wLon;
         if (mlMap != null) return mlMap.getCenterLon();
-        if (liveMap != null) return liveMap.getCenterLon();
         return -74.0721;
     }
 
+    private int manualMapAngle() {
+        int a = prefs.getInt("map_angle", 30);
+        if (a == 45) prefs.edit().putInt("map_angle", 30).apply();
+        return a >= 48 ? 60 : 30;
+    }
+
+    private int applyNavPitch() {
+        return prefs.getBoolean("map_auto_angle", true) ? 60 : manualMapAngle();
+    }
+
+    private String savedPremiumTheme() {
+        String id = prefs.getString("premium_theme", null);
+        String n = Prem.normalize(id);
+        if (n != null && !n.equals(id)) prefs.edit().putString("premium_theme", n).apply();
+        return n;
+    }
+
     private void mapSyncTilt() {
+        LiveMapView.view3d = true;
         if (mlMap != null) mlMap.onTiltConfigChanged();
-        if (liveMap != null) liveMap.onTiltConfigChanged();
         updateMapControls();
     }
 
     private void mapSyncHeading() {
         if (mlMap != null) mlMap.setHeadingUp(LiveMapView.headingUp);
-        if (liveMap != null) liveMap.invalidate();
+        updateCompassBadge();
     }
 
     private void mapSyncRoute() {
         if (mlMap != null) mlMap.syncRoute();
-        if (liveMap != null) liveMap.invalidate();
-    }
-
-    private void mapSyncPolice() {
-        if (mlMap != null) mlMap.syncPoliceReports();
-        if (liveMap != null) liveMap.invalidate();
-    }
-
-    private void reportPoliceHere() {
-        double lat, lon;
-        if (previewPlace != null && !Double.isNaN(previewPlace.lat) && !Double.isNaN(previewPlace.lon)) {
-            lat = previewPlace.lat;
-            lon = previewPlace.lon;
-        } else if (mlMap != null && !mapIsFollowing()) {
-            lat = mlMap.getCenterLat();
-            lon = mlMap.getCenterLon();
-        } else if (liveMap != null && !mapIsFollowing()) {
-            lat = liveMap.getCenterLat();
-            lon = liveMap.getCenterLon();
-        } else {
-            lat = mapCenterLat();
-            lon = mapCenterLon();
-        }
-        reportPoliceAt(lat, lon, "");
-    }
-
-    private void reportPoliceAt(double lat, double lon, String label) {
-        if (Double.isNaN(lat) || Double.isNaN(lon)) return;
-        Nav.reportPolice(this, lat, lon, label);
-        mapSyncPolice();
-        updateNavHud();
-        toast("Policía reportada en el mapa");
-    }
-
-    private void openPoliceAlertDialog(final Nav.PoliceReport pr, double distM) {
-        if (pr == null) return;
-        mapFocusPoint(pr.lat, pr.lon, 17);
-        long ageMin = Math.max(0L, (System.currentTimeMillis() - pr.reportedAtMs) / 60000L);
-        String ageTxt = ageMin < 1 ? I18n.t("Hace un momento") : I18n.t("Reportado hace {} min").replace("{}", String.valueOf(ageMin));
-        StringBuilder sb = new StringBuilder();
-        if (pr.label != null && pr.label.length() > 0) sb.append(pr.label).append('\n');
-        sb.append(Nav.fmtStepDist(distM, useMph())).append(" · ").append(ageTxt);
-        new TB(this, dlg())
-            .setTitle("Alerta de policía")
-            .setMessage(sb.toString())
-            .setPositiveButton("Sigue ahí", new DialogInterface.OnClickListener() {
-                public void onClick(DialogInterface d, int w) {
-                    Nav.confirmPolice(Main.this, pr);
-                    mapSyncPolice();
-                    toast("Alerta confirmada");
-                }
-            })
-            .setNeutralButton("Ya no está", new DialogInterface.OnClickListener() {
-                public void onClick(DialogInterface d, int w) {
-                    Nav.clearPolice(Main.this, pr);
-                    mapSyncPolice();
-                    updateNavHud();
-                    toast("Alerta eliminada");
-                }
-            })
-            .setNegativeButton("Cerrar", null)
-            .show();
     }
 
     private void mapRecenter() {
         if (mlMap != null) mlMap.recenter();
-        if (liveMap != null) liveMap.recenter();
         updateMapControls();
     }
 
     private void mapSetOverview(boolean ov) {
         if (mlMap != null) mlMap.setOverview(ov);
-        if (liveMap != null) liveMap.setOverview(ov);
         updateMapControls();
     }
 
     private void mapFocusPoint(double la, double lo, int z) {
         if (mlMap != null) mlMap.focusPoint(la, lo, z);
-        if (liveMap != null) liveMap.focusPoint(la, lo, z);
         updateMapControls();
     }
 
     private void mapZoomBy(int d) {
         if (mlMap != null) mlMap.zoomBy(d);
-        if (liveMap != null) liveMap.zoomBy(d);
     }
 
     private void onMapPicked(final double lat, final double lon) {
@@ -2961,9 +2910,21 @@ public class Main extends Activity {
     private void startNavSimulation() {
         if (Nav.active == null) return;
         Nav.previewMode = false;
+        boolean autoZoomOn = prefs.getBoolean("map_auto_zoom", true);
+        LiveMapView.view3d = true;
+        LiveMapView.tiltAngle = applyNavPitch();
         LiveMapView.headingUp = true;
+        mapSyncTilt();
         mapSyncHeading();
-        mapRecenter();
+        if (mlMap != null) {
+            if (!mlMap.hasFix()) {
+                double sLat = !Double.isNaN(wLat) ? wLat : (Nav.active.pts != null && Nav.active.pts.length >= 2 ? Nav.active.pts[0] : Double.NaN);
+                double sLon = !Double.isNaN(wLon) ? wLon : (Nav.active.pts != null && Nav.active.pts.length >= 2 ? Nav.active.pts[1] : Double.NaN);
+                if (!Double.isNaN(sLat) && !Double.isNaN(sLon)) mlMap.setPosition(sLat, sLon, Float.NaN, 0f);
+            }
+            mlMap.setAutoZoom(autoZoomOn);
+            mlMap.startNavCamera(LiveMapView.tiltAngle, autoZoomOn);
+        }
         Nav.startSimulation(this, useMph(), new Nav.SimListener() {
             public void onSimLocation(Location loc) {
                 if (isFinishing()) return;
@@ -2974,6 +2935,9 @@ public class Main extends Activity {
                 if (isFinishing()) return;
                 simLastOk = false;
                 LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+                LiveMapView.tiltAngle = manualMapAngle();
+                if (mlMap != null) mlMap.setNavActive(false);
+                mapSyncTilt();
                 mapSyncHeading();
                 if (Nav.active == null) toast("Llegaste a tu destino");
                 mapSyncRoute();
@@ -2987,18 +2951,20 @@ public class Main extends Activity {
     }
 
     private void buildAaCard() {
-        if (waveAlertView != null) { waveAlertView.setAlert(false, 0, false); waveAlertView = null; }
-        waveAlertPolice = null;
+        if (waveAlertView != null) { waveAlertView.setAlert(false, 0); waveAlertView = null; }
         if (mlMap != null) { mlMap.destroy(); mlMap = null; }
         if (!showMap) {
-            liveMap = null; navHud = null; navTurnIc = null; navDistTv = null; navStepTv = null;
+            navHud = null; navTurnIc = null; navDistTv = null; navStepTv = null;
             navEtaTv = null; navLaneBox = null; navLaneView = null;
-            speedHudBox = null; speedSignTv = null; navCurSpeedTv = null; navCurUnitTv = null; camBadgeTv = null;
+            speedHudBox = null; speedSignTv = null; navCurSpeedTv = null; navCurUnitTv = null;
+            hazardBannerBox = null; hazardBannerDot = null; hazardBannerTitleTv = null;
+            hazardBannerSubTv = null; hazardBannerDismissTv = null; hazardBannerAlertId = null;
+            hazardsPillBtn = null; hazardsPillTv = null;
             mapTagBox = null; mapTagTv = null; navSearchBtn = null; aaBtnTv = null; aaSubTv = null;
             cpSubTv = null; mapGauge = null; mapGaugeBox = null; panelWx = null;
             mapPreviewCard = null; mapCtrlBox = null; mapRecenterBtn = null; mapOverviewBtn = null;
-            mapStepsBtn = null; mapTiltQuickBtn = null; mapSimBtn = null; mapPoliceBtn = null;
-            mapEngineBtn = null; mapEngineTv = null;
+            mapStepsBtn = null; mapSimBtn = null; mapSoundBtn = null; mapSoundIcon = null;
+            mapCompassBtn = null; mapCompassView = null;
             mapConnPanel = null; mapConnHandle = null; mapConnNavBtn = null; mapConnGauge = null;
             seedLastLocation();
             return;
@@ -3006,67 +2972,54 @@ public class Main extends Activity {
         FrameLayout card = new FrameLayout(this);
         mapClipView = null;
         if (premium) {
-            // Aurora: el mapa va dentro de un marco con su tamaño final; al entrar a «Solo mapa» la tarjeta sube
-            // dentro del marco y el borde de abajo se queda quieto (no se asoma por debajo junto a la barra)
             FrameLayout clip = new FrameLayout(this);
             place(board, clip, mapX, mapY, mapW, mapH);
             place(clip, card, 0, 0, mapW, mapH);
             mapClipView = clip;
         } else place(board, card, mapX, mapY, mapW, mapH);
         mapCardView = card;
-        // fondo decorativo mientras no hay GPS; encima, el mapa en vivo (Faro: sin dibujo de relleno, el área queda limpia)
-        if (!(premium && Prem.faro())) card.addView(new MapView(this, s, 20 * s), new FrameLayout.LayoutParams(-1, -1));
-        if (!prefs.getBoolean("map_live", true)) { liveMap = null; mlMap = null; seedLastLocation(); buildAaCardRest(card); return; }
+        if (!(premium && Prem.cockpit())) card.addView(new MapView(this, s, 20 * s), new FrameLayout.LayoutParams(-1, -1));
+        if (!prefs.getBoolean("map_live", true)) { mlMap = null; seedLastLocation(); buildAaCardRest(card); return; }
 
         Location sv = savedLoc();
         double initLat = !Double.isNaN(wLat) ? wLat : (sv != null ? sv.getLatitude() : 4.7110);
         double initLon = !Double.isNaN(wLon) ? wLon : (sv != null ? sv.getLongitude() : -74.0721);
 
-        if (useMapLibre()) {
-            liveMap = null;
-            mlMap = new MapLibreMapView(this, 20 * s, LIGHT, RED);
-            mlMap.setInitialCenter(initLat, initLon);
-            mlMap.setHeadingUp(LiveMapView.headingUp);
-            mlMap.onTiltConfigChanged();
-            if (premium && Prem.faro()) mlMap.setAlpha(0.88f);
-            mlMap.setListener(new MapLibreMapView.Listener() {
-                public void onEngineFallback(String reason) {
-                    if (isFinishing()) return;
-                    mapLibreFallback = true;
-                    toast(I18n.t("Modo clásico de mapa activado"));
-                    rebuild();
-                }
-                public void onFollowChanged(boolean following) {
-                    updateMapControls();
-                }
-                public void onMapPick(double lat, double lon) {
-                    onMapPicked(lat, lon);
-                }
-            });
-            card.addView(mlMap, new FrameLayout.LayoutParams(-1, -1));
-        } else {
-            mlMap = null;
-            liveMap = new LiveMapView(this, s, 20 * s);
-            liveMap.setInitialCenter(initLat, initLon);
-            card.addView(liveMap, new FrameLayout.LayoutParams(-1, -1));
-            // Aurora: esquinas redondas de verdad sobre el fondo y el mapa un poco translúcido
-            if (premium && premBg != null) liveMap.setBackdrop(premBg, premBgHolder, Prem.mapAlpha(LIGHT));
-            if (premium && Prem.faro()) { liveMap.setAttribution(14 * s, 70 * s); liveMap.setTone(Faro.mapTone(LIGHT)); }
-            // Cobalto: el mapa se difumina hasta donde empieza el reproductor (abajo, hacia las tarjetas, en vertical)
-            if (premium && Prem.cob() && !mapOnly && premBg != null) liveMap.setFade(vertical ? 2 : 1, (vertical ? 150 : Math.max(260, mapW * 0.5f)) * s);
-            liveMap.setVisibility(View.VISIBLE);
-            liveMap.setListener(new LiveMapView.Listener() {
-                public void onFollowChanged(boolean following) {
-                    updateMapControls();
-                }
-                public void onMapPick(double lat, double lon) {
-                    onMapPicked(lat, lon);
-                }
-            });
+        int mlAccent = (premium && CockpitThemes.isCustom(Prem.style))
+            ? CockpitThemes.accent(Prem.style, LIGHT, RED) : RED;
+        mlMap = new MapLibreMapView(this, 20 * s, LIGHT, mlAccent);
+        mlMap.setInitialCenter(initLat, initLon);
+        mlMap.setOfflineMode(wantMapLibreOffline());
+        mlMap.setHeadingUp(LiveMapView.headingUp);
+        boolean navOngoing = Nav.active != null && !Nav.previewMode;
+        LiveMapView.tiltAngle = navOngoing ? applyNavPitch() : manualMapAngle();
+        mlMap.setAutoZoom(prefs.getBoolean("map_auto_zoom", true));
+        mlMap.onTiltConfigChanged();
+        if (navOngoing) {
+            mlMap.setNavActive(true);
+            double sLat = !Double.isNaN(wLat) ? wLat : (Nav.active.pts != null && Nav.active.pts.length >= 2 ? Nav.active.pts[0] : initLat);
+            double sLon = !Double.isNaN(wLon) ? wLon : (Nav.active.pts != null && Nav.active.pts.length >= 2 ? Nav.active.pts[1] : initLon);
+            if (!mlMap.hasFix() && !Double.isNaN(sLat) && !Double.isNaN(sLon)) {
+                mlMap.setPosition(sLat, sLon, Float.NaN, 0f);
+            }
+            mlMap.syncRoute();
         }
-        Nav.loadPoliceReports(this);
+        if (premium && Prem.cockpit()) mlMap.setAlpha(CockpitThemes.NIGHTPULSE.equals(Prem.style) ? 0.94f : 0.88f);
+        mlMap.setListener(new MapLibreMapView.Listener() {
+            public void onFollowChanged(boolean following) {
+                updateMapControls();
+            }
+            public void onMapPick(double lat, double lon) {
+                onMapPicked(lat, lon);
+            }
+            public void onHazardTap(String alertId) {
+                RoadAlerts.AlertItem a = RoadAlerts.findById(alertId);
+                if (a != null) showHazardDetailDialog(a);
+            }
+        });
+        card.addView(mlMap, new FrameLayout.LayoutParams(-1, -1));
+        syncMapRoadAlerts();
         seedLastLocation();
-        mapSyncPolice();
 
         waveAlertView = new WaveAlertView(this, s, 20 * s);
         card.addView(waveAlertView, new FrameLayout.LayoutParams(-1, -1));
@@ -3076,7 +3029,7 @@ public class Main extends Activity {
     }
 
     private void buildAaCardRest(FrameLayout card) {
-        final boolean faroT = premium && Prem.faro();
+        final boolean faroT = premium && Prem.cockpit();
         if (faroT) buildFaroMapTop(card);
         else {
         LinearLayout topRow = new LinearLayout(this);
@@ -3114,7 +3067,7 @@ public class Main extends Activity {
         tag.addView(icon("my_location", 15), new LinearLayout.LayoutParams((int) (15 * s), (int) (15 * s)));
         mapTagTv = tv("Buscando GPS…", 12, MUTED, true);
         mapTagTv.setPadding((int) (6 * s), 0, 0, 0);
-        mapTagTv.setMaxWidth((int) (Math.max(90, mapW - 190) * s));
+        mapTagTv.setMaxWidth((int) (Math.max(70, mapW - 246 - insR) * s));
         tag.addView(mapTagTv);
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(-2, -2);
         tlp.leftMargin = (int) (8 * s);
@@ -3191,7 +3144,7 @@ public class Main extends Activity {
         boolean hasPanel = nBtn > 0 || wx;
         final float panelY = hasPanel ? mapH - 96 : mapH, panelW = mapW - 24 - insL - insR;
         final FrameLayout panel = new FrameLayout(this);
-        panel.setBackground(round(faroT ? Faro.glass(LIGHT) : (CARD & 0x00FFFFFF) | 0xEB000000, 16));
+        panel.setBackground(round(faroT ? CockpitThemes.glass(Prem.style, LIGHT) : (CARD & 0x00FFFFFF) | 0xEB000000, 16));
         place(card, panel, 12 + insL, panelY, panelW, 84);
         if (!hasPanel) panel.setVisibility(View.GONE);
 
@@ -3247,7 +3200,7 @@ public class Main extends Activity {
         laneBox.addView(navLaneView, new FrameLayout.LayoutParams(-1, -1));
         laneBox.setVisibility(View.GONE);
         navLaneBox = laneBox;
-        float laneW = Math.min(184, Math.max(110, mapW - 140));
+        float laneW = Math.min(184, Math.max(96, mapW - 220));
         place(card, laneBox, (mapW - laneW) * 0.5f, 92, laneW, 30);
 
         LinearLayout shb = new LinearLayout(this);
@@ -3279,26 +3232,98 @@ public class Main extends Activity {
         float sdx = gaugeTopLeft ? Math.max(12, mapW - 12 - 40 - insR - 122) : 12;
         placeWrap(card, shb, sdx, 92);
 
-        camBadgeTv = tv("", 11, Color.WHITE, true);
-        camBadgeTv.setBackground(round(0xFFD92B2B, 11));
-        camBadgeTv.setPadding((int) (10 * s), (int) (4 * s), (int) (10 * s), (int) (4 * s));
-        camBadgeTv.setSingleLine(true);
-        camBadgeTv.setEllipsize(TextUtils.TruncateAt.END);
-        camBadgeTv.setMaxWidth((int) (Math.max(120, mapW - 84) * s));
-        camBadgeTv.setVisibility(View.GONE);
-        camBadgeTv.setOnClickListener(new View.OnClickListener() {
+        // Bottom-corner Nearby Hazards pill (away from nav button & mini gauge)
+        hazardsPillBtn = new LinearLayout(this);
+        hazardsPillBtn.setOrientation(LinearLayout.HORIZONTAL);
+        hazardsPillBtn.setGravity(Gravity.CENTER_VERTICAL);
+        hazardsPillBtn.setMinimumHeight((int) (44 * s));
+        hazardsPillBtn.setMinimumWidth((int) (64 * s));
+        hazardsPillBtn.setPadding((int) (12 * s), (int) (8 * s), (int) (14 * s), (int) (8 * s));
+        GradientDrawable hPillBg = round(LIGHT ? 0xF5FFFFFF : 0xEB141822, 22);
+        hPillBg.setStroke(Math.max(1, (int) (1.5f * s)), 0xFFF59E0B);
+        hazardsPillBtn.setBackground(hPillBg);
+        TextView warnIc = tv("⚠", 13, 0xFFF59E0B, true);
+        warnIc.setPadding(0, 0, (int) (6 * s), 0);
+        hazardsPillBtn.addView(warnIc);
+        hazardsPillTv = tv("0", 12, LIGHT ? 0xFF14161B : 0xFFF4F7FC, true);
+        hazardsPillBtn.addView(hazardsPillTv);
+        hazardsPillBtn.setVisibility(View.GONE);
+        hazardsPillBtn.setContentDescription(I18n.t("Alertas viales cercanas"));
+        hazardsPillBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { openHazardsSheet(); }
+        });
+        boolean hpLeft = faroT || !nbLeft;
+        float hpW = 82f;
+        float hpX = hpLeft ? 12 + insL : mapW - 12 - insR - hpW;
+        if (mapGaugeBox != null && mapGaugeBox.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams mlp = (FrameLayout.LayoutParams) mapGaugeBox.getLayoutParams();
+            float mgTop = mlp.topMargin / s;
+            float mgLeft = mlp.leftMargin / s;
+            float mgRight = (mlp.leftMargin + mlp.width) / s;
+            if (mgTop > panelY - 200) {
+                if (hpLeft && mgLeft < hpX + hpW + 10) hpX = Math.max(hpX, mgRight + 10);
+                else if (!hpLeft && mgRight > hpX - 10) hpX = Math.min(hpX, mgLeft - hpW - 10);
+            }
+        }
+        placeWrap(card, hazardsPillBtn, hpX, panelY - 12 - 44);
+
+        // Proximity Hazard Banner Card (free-drive & turn-by-turn)
+        hazardBannerBox = new LinearLayout(this);
+        hazardBannerBox.setOrientation(LinearLayout.HORIZONTAL);
+        hazardBannerBox.setGravity(Gravity.CENTER_VERTICAL);
+        hazardBannerBox.setMinimumHeight((int) (48 * s));
+        hazardBannerBox.setPadding((int) (10 * s), (int) (7 * s), (int) (8 * s), (int) (7 * s));
+        hazardBannerBox.setVisibility(View.GONE);
+        if (SDK >= 21) hazardBannerBox.setElevation(8f * s);
+        hazardBannerDot = new View(this);
+        hazardBannerDot.setBackground(round(0xFFF59E0B, 6));
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams((int) (10 * s), (int) (26 * s));
+        dotLp.rightMargin = (int) (9 * s);
+        hazardBannerBox.addView(hazardBannerDot, dotLp);
+        LinearLayout hbTextCol = new LinearLayout(this);
+        hbTextCol.setOrientation(LinearLayout.VERTICAL);
+        hazardBannerTitleTv = tv("", 12, LIGHT ? 0xFF14161B : 0xFFF4F7FC, true);
+        hazardBannerTitleTv.setSingleLine(true);
+        hazardBannerTitleTv.setEllipsize(TextUtils.TruncateAt.END);
+        hazardBannerTitleTv.setMaxWidth((int) (Math.max(130, mapW - 124) * s));
+        hbTextCol.addView(hazardBannerTitleTv);
+        hazardBannerSubTv = tv("", 10, LIGHT ? 0xFF4B5563 : 0xFFB8C2D4, false);
+        hazardBannerSubTv.setSingleLine(true);
+        hazardBannerSubTv.setEllipsize(TextUtils.TruncateAt.END);
+        hazardBannerSubTv.setMaxWidth((int) (Math.max(130, mapW - 124) * s));
+        hazardBannerSubTv.setVisibility(View.GONE);
+        hbTextCol.addView(hazardBannerSubTv);
+        hazardBannerBox.addView(hbTextCol, new LinearLayout.LayoutParams(-2, -2));
+        hazardBannerDismissTv = tv("✕", 12, LIGHT ? 0xFF4B5563 : 0xFFB8C2D4, true);
+        hazardBannerDismissTv.setGravity(Gravity.CENTER);
+        hazardBannerDismissTv.setMinimumWidth((int) (36 * s));
+        hazardBannerDismissTv.setMinimumHeight((int) (36 * s));
+        hazardBannerDismissTv.setPadding((int) (8 * s), (int) (6 * s), (int) (4 * s), (int) (6 * s));
+        hazardBannerDismissTv.setContentDescription(I18n.t("Cerrar"));
+        hazardBannerDismissTv.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
-                if (waveAlertPolice != null) {
-                    openPoliceAlertDialog(waveAlertPolice, Nav.nearbyPoliceDistM);
-                } else if (!Double.isNaN(waveAlertLat) && !Double.isNaN(waveAlertLon)) {
+                if (hazardBannerAlertId != null) {
+                    RoadAlerts.dismissAlertLocally(hazardBannerAlertId);
+                }
+            }
+        });
+        hazardBannerBox.addView(hazardBannerDismissTv);
+        hazardBannerBox.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (hazardBannerAlertId != null) {
+                    RoadAlerts.AlertItem a = RoadAlerts.findById(hazardBannerAlertId);
+                    if (a != null) { showHazardDetailDialog(a); return; }
+                }
+                if (!Double.isNaN(waveAlertLat) && !Double.isNaN(waveAlertLon)) {
                     mapFocusPoint(waveAlertLat, waveAlertLon, 17);
                 }
             }
         });
-        placeWrap(card, camBadgeTv, gaugeTopLeft ? Math.max(12, mapW - 12 - 40 - insR - 148) : 12, 152);
+        placeWrap(card, hazardBannerBox, gaugeTopLeft ? Math.max(12, mapW - 12 - 40 - insR - 210) : 12, 152);
 
         buildMapControls(card, faroT);
         updateNavHud();
+        updateHazardsPill();
         navBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { openNavApp(); }
         });
@@ -3311,7 +3336,7 @@ public class Main extends Activity {
         aaBtnTv = null; aaSubTv = null; cpSubTv = null;
         float x = 10;
         if (showAa) {
-            aa = projButton("navigation", "Android Auto", faroT ? Faro.tile(LIGHT) : RED, !faroT);
+            aa = projButton("navigation", "Android Auto", faroT ? CockpitThemes.tile(Prem.style, LIGHT) : RED, !faroT);
             if (faroT) faroProj(aa, true);
             aaBtnTv = (TextView) aa.getTag();
             float w = nBtn == 2 || wx ? slotW : fullW;
@@ -3319,7 +3344,7 @@ public class Main extends Activity {
             x += w + 8;
         }
         if (showCp) {
-            cp = projButton("phone_iphone", "CarPlay", faroT ? Faro.tile(LIGHT) : BTN, false);
+            cp = projButton("phone_iphone", "CarPlay", faroT ? CockpitThemes.tile(Prem.style, LIGHT) : BTN, false);
             if (faroT) faroProj(cp, false);
             cpSubTv = (TextView) cp.getTag();
             float w = nBtn == 2 || wx ? slotW : fullW;
@@ -3333,7 +3358,7 @@ public class Main extends Activity {
         // Android Auto / CarPlay plegables: una flechita los esconde para ver todo el mapa (Druids07, idea de Andrés).
         // Tocar o deslizar la flechita hacia arriba los muestra; hacia abajo (o deslizar los botones) los esconde.
         final FrameLayout handle = new FrameLayout(this);
-        handle.setBackground(round(faroT ? Faro.glass(LIGHT) : (CARD & 0x00FFFFFF) | 0xEB000000, 11));
+        handle.setBackground(round(faroT ? CockpitThemes.glass(Prem.style, LIGHT) : (CARD & 0x00FFFFFF) | 0xEB000000, 11));
         final ImageView chev = icon("chevron_right", 18);
         FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
         clp.gravity = Gravity.CENTER;
@@ -3410,6 +3435,10 @@ public class Main extends Activity {
         if (mapCtrlBox != null) {
             mapCtrlBox.bringToFront();
             if (SDK >= 21) mapCtrlBox.setElevation(8f * s);
+        }
+        if (mapCompassBtn != null) {
+            mapCompassBtn.bringToFront();
+            if (SDK >= 21) mapCompassBtn.setElevation(8f * s);
         }
         if (mapTagBox != null) {
             mapTagBox.bringToFront();
@@ -3640,12 +3669,12 @@ public class Main extends Activity {
         Location sv = savedLoc();
         if (sv == null) return;
         if (Double.isNaN(wLat) || Double.isNaN(wLon)) { wLat = sv.getLatitude(); wLon = sv.getLongitude(); }
+        RoadAlerts.updateAnchor(wLat, wLon);
         if (mlMap != null && !mlMap.hasFix()) {
             mlMap.setInitialCenter(sv.getLatitude(), sv.getLongitude());
-            updateMapTag();
-        } else if (liveMap != null && !liveMap.hasFix()) {
-            liveMap.setPosition(sv.getLatitude(), sv.getLongitude(), Float.NaN, 0);
-            liveMap.setVisibility(View.VISIBLE);
+            if (Nav.active != null && !Nav.previewMode) {
+                mlMap.setPosition(sv.getLatitude(), sv.getLongitude(), Float.NaN, 0f);
+            }
             updateMapTag();
         }
     }
@@ -3688,6 +3717,7 @@ public class Main extends Activity {
         }
         if (l != null) {
             wLat = l.getLatitude(); wLon = l.getLongitude();
+            RoadAlerts.evaluateProximity(this, l, useMph());
             if (!isSim) {
                 Nav.previewMode = false;
                 if (Nav.active != null) {
@@ -3695,6 +3725,9 @@ public class Main extends Activity {
                         public void run() {
                             if (Nav.active == null) {
                                 LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+                                LiveMapView.tiltAngle = manualMapAngle();
+                                if (mlMap != null) mlMap.setNavActive(false);
+                                mapSyncTilt();
                                 mapSyncHeading();
                                 toast("Llegaste a tu destino");
                             }
@@ -3704,9 +3737,10 @@ public class Main extends Activity {
                     });
                     updateNavHud();
                 } else {
-                    Nav.onFreeLocation(this, l);
                     updateWaveAlerts(useMph());
                 }
+            } else if (Nav.active == null) {
+                updateWaveAlerts(useMph());
             }
         }
         if (l == null) return;
@@ -3719,13 +3753,11 @@ public class Main extends Activity {
             simLastOk = false;
         }
         float br = l.hasBearing() && (isSim || kmh > 4) ? l.getBearing() : Float.NaN;
+        if (!Float.isNaN(br)) lastMapBearing = br;
         if (mlMap != null) {
             mlMap.setPosition(l.getLatitude(), l.getLongitude(), br, kmh);
         }
-        if (liveMap != null) {
-            liveMap.setPosition(l.getLatitude(), l.getLongitude(), br, kmh);
-            liveMap.setVisibility(View.VISIBLE);
-        }
+        updateCompassBadge();
         updateMapTag();
         updateMapControls();
     }
@@ -3794,7 +3826,8 @@ public class Main extends Activity {
             + "\nÚltima señal: " + (ago < 0 ? "ninguna desde que abrió StradaOS" : ago < 120 ? "hace " + ago + " s" : "hace " + (ago / 60) + " min")
             + (gpsStartAt > 0 ? "\nBuscando desde hace " + ((SystemClock.elapsedRealtime() - gpsStartAt) / 60000) + " min" : "");
         String off = LiveMapView.fileMap != null ? (" · .map=" + LiveMapView.fileMap.file.getName()) : "";
-        String eng = mlMap != null ? "Motor: MapLibre GL JS (3D=" + LiveMapView.view3d + ")" + off : (liveMap != null ? liveMap.diag() : "Mapa en vivo apagado" + off);
+        String mode = (mlMap != null && mlMap.isOfflineMode()) ? "offline" : "online";
+        String eng = mlMap != null ? "Motor: MapLibre GL JS (3D edificios=SI · " + mode + ")" + off : "Mapa en vivo apagado" + off;
         return I18n.lines(head + "\n\n" + eng);
     }
 
@@ -3811,9 +3844,8 @@ public class Main extends Activity {
         else if (!live && st == 2) mapTagTv.setText(I18n.t("Ubicación apagada · toca aquí"));
         else if (!mapHasFix())
             mapTagTv.setText(I18n.t(gpsStartAt > 0 && SystemClock.elapsedRealtime() - gpsStartAt > 180000 ? "Sin señal GPS · toca aquí" : "Buscando GPS…"));
-        else if (liveMap != null && liveMap.usingFile()) mapTagTv.setText(I18n.t(live ? "Mapa sin conexión" : "Sin señal GPS · mapa sin conexión"));
-        else if (liveMap != null && liveMap.offline()) mapTagTv.setText(I18n.t(live ? "En vivo · sin internet" : "Sin señal GPS ni internet"));
-        else mapTagTv.setText(I18n.t(live ? (LiveMapView.view3d ? "Mapa 3D" : "Mapa en vivo") : "Sin señal GPS · última posición"));
+        else if (mlMap != null && mlMap.isOfflineMode()) mapTagTv.setText(I18n.t(live ? "Mapa sin conexión" : "Sin señal GPS · mapa sin conexión"));
+        else mapTagTv.setText(I18n.t(live ? "Mapa 3D" : "Sin señal GPS · última posición"));
         updateFaroPill();
     }
 
@@ -3874,41 +3906,6 @@ public class Main extends Activity {
         col.addView(stBtn, lpSt);
         mapStepsBtn = stBtn;
 
-        FrameLayout engBtn = new FrameLayout(this);
-        engBtn.setBackground(round(bgCol, 12));
-        engBtn.setContentDescription(I18n.t("Cambiar motor del mapa"));
-        TextView engTv = tv(mlMap != null ? "ML" : "OSM", 11, mlMap != null ? Color.WHITE : TEXT, true);
-        engTv.setGravity(Gravity.CENTER);
-        engBtn.addView(engTv, new FrameLayout.LayoutParams(-1, -1));
-        engBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { toggleMapEngineFromMap(); }
-        });
-        LinearLayout.LayoutParams lpEng = new LinearLayout.LayoutParams((int) (40 * s), (int) (32 * s));
-        lpEng.bottomMargin = (int) (6 * s);
-        col.addView(engBtn, lpEng);
-        mapEngineBtn = engBtn;
-        mapEngineTv = engTv;
-
-        FrameLayout tiltBtn = new FrameLayout(this);
-        tiltBtn.setBackground(round(bgCol, 12));
-        TextView tiltTv = tv(LiveMapView.view3d ? "3D" : "2D", 12, LiveMapView.view3d ? Color.WHITE : TEXT, true);
-        tiltTv.setGravity(Gravity.CENTER);
-        tiltBtn.addView(tiltTv, new FrameLayout.LayoutParams(-1, -1));
-        tiltBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                boolean next = !prefs.getBoolean("map_3d", false);
-                prefs.edit().putBoolean("map_3d", next).apply();
-                LiveMapView.view3d = next;
-                mapSyncTilt();
-                updateMapTag();
-            }
-        });
-        LinearLayout.LayoutParams lpTilt = new LinearLayout.LayoutParams((int) (40 * s), (int) (32 * s));
-        lpTilt.bottomMargin = (int) (6 * s);
-        col.addView(tiltBtn, lpTilt);
-        mapTiltQuickBtn = tiltBtn;
-        mapTiltQuickTv = tiltTv;
-
         FrameLayout simBtn = new FrameLayout(this);
         simBtn.setBackground(round(bgCol, 12));
         ImageView simIc = icon("play_arrow", 19);
@@ -3932,6 +3929,9 @@ public class Main extends Activity {
             public boolean onLongClick(View v) {
                 if (Nav.simulating) {
                     Nav.stopSimulation();
+                    LiveMapView.tiltAngle = manualMapAngle();
+                    if (mlMap != null) mlMap.setNavActive(false);
+                    mapSyncTilt();
                     updateMapControls();
                     updateNavHud();
                     toast("Simulación detenida");
@@ -3946,23 +3946,28 @@ public class Main extends Activity {
         mapSimBtn = simBtn;
         mapSimIc = simIc;
 
-        FrameLayout polBtn = new FrameLayout(this);
-        GradientDrawable polGd = round(bgCol, 12);
-        if (LIGHT) polGd.setStroke(Math.max(1, (int) s), 0x18000000);
-        polBtn.setBackground(polGd);
-        polBtn.setContentDescription(I18n.t("Reportar policía"));
-        ImageView polIc = icon("verified_user", 18);
-        polIc.setColorFilter(0xFF2563EB);
-        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
-        plp.gravity = Gravity.CENTER;
-        polBtn.addView(polIc, plp);
-        polBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) { reportPoliceHere(); }
+        FrameLayout sndBtn = new FrameLayout(this);
+        GradientDrawable sndGd = round(bgCol, 12);
+        if (LIGHT) sndGd.setStroke(Math.max(1, (int) s), 0x18000000);
+        sndBtn.setBackground(sndGd);
+        sndBtn.setContentDescription(I18n.t("Silenciar o activar sonido"));
+        SoundIconView sndIc = new SoundIconView(this, s);
+        FrameLayout.LayoutParams snlp = new FrameLayout.LayoutParams((int) (20 * s), (int) (20 * s));
+        snlp.gravity = Gravity.CENTER;
+        sndBtn.addView(sndIc, snlp);
+        sndBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean next = !Nav.isSoundOn(Main.this);
+                Nav.setSoundOn(Main.this, next);
+                updateMapControls();
+                toast(next ? "Sonido activado" : "Sonido silenciado");
+            }
         });
-        LinearLayout.LayoutParams lpPol = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
-        lpPol.bottomMargin = (int) (6 * s);
-        col.addView(polBtn, lpPol);
-        mapPoliceBtn = polBtn;
+        LinearLayout.LayoutParams lpSnd = new LinearLayout.LayoutParams((int) (40 * s), (int) (40 * s));
+        lpSnd.bottomMargin = (int) (6 * s);
+        col.addView(sndBtn, lpSnd);
+        mapSoundBtn = sndBtn;
+        mapSoundIcon = sndIc;
 
         if (!faroT && mapH >= 240) {
             LinearLayout zBox = new LinearLayout(this);
@@ -3987,10 +3992,71 @@ public class Main extends Activity {
         mapCtrlBox = col;
         float topY = (faroT && Nav.active == null && mapH >= 220) ? 152 : 92;
         placeWrap(card, col, mapW - 12 - 40 - insR, topY);
+
+        FrameLayout cmpBtn = new FrameLayout(this);
+        CompassBadgeView cmpView = new CompassBadgeView(this, s);
+        cmpBtn.addView(cmpView, new FrameLayout.LayoutParams(-1, -1));
+        cmpBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean next = !LiveMapView.headingUp;
+                prefs.edit().putBoolean("map_heading", next).apply();
+                LiveMapView.headingUp = next;
+                mapSyncHeading();
+                toast(next ? "Mapa: Según tu dirección" : "Mapa: Norte arriba");
+            }
+        });
+        float cmpSz = faroT ? 40f : 42f;
+        mapCompassBtn = cmpBtn;
+        mapCompassView = cmpView;
+        place(card, cmpBtn, mapW - 12 - cmpSz - insR, 14, cmpSz, cmpSz);
+
         updateMapControls();
     }
 
+    private void updateCompassBadge() {
+        if (mapCompassBtn == null || mapCompassView == null) return;
+        boolean hasRoute = Nav.active != null;
+        boolean faroT = premium && Prem.cockpit();
+        boolean dirUp = LiveMapView.headingUp;
+        int accCol = faroT && CockpitThemes.isCustom(Prem.style) ? CockpitThemes.accent(Prem.style, LIGHT, RED) : RED;
+        int txCol = faroT && CockpitThemes.isCustom(Prem.style) ? CockpitThemes.text(Prem.style, LIGHT, TEXT) : TEXT;
+        int muCol = faroT && CockpitThemes.isCustom(Prem.style) ? CockpitThemes.muted(Prem.style, LIGHT, MUTED) : MUTED;
+        int bgCol = faroT ? CockpitThemes.glass(Prem.style, LIGHT) : ((CARD & 0x00FFFFFF) | 0xEB000000);
+        float sz = (faroT && !hasRoute) ? 40f : 42f;
+        GradientDrawable gd = round(bgCol, sz * 0.5f);
+        if (dirUp) gd.setStroke(Math.max(1, (int) (1.5f * s)), accCol);
+        else if (LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
+        mapCompassBtn.setBackground(gd);
+        mapCompassView.setState(dirUp, lastMapBearing, txCol, muCol, accCol);
+        mapCompassBtn.setContentDescription(I18n.t(dirUp ? "Orientación: Según tu dirección" : "Orientación: Norte arriba"));
+
+        if (mapCompassBtn.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) mapCompassBtn.getLayoutParams();
+            int wantW = Math.round(sz * s);
+            int wantX;
+            int wantY;
+            if (hasRoute) {
+                wantX = Math.round((mapW - 12f - 40f - 8f - sz - insR) * s);
+                wantY = Math.round(92f * s);
+            } else if (faroT) {
+                wantX = Math.round((mapW - 12f - 40f - 8f - sz) * s);
+                wantY = Math.round(12f * s);
+            } else {
+                wantX = Math.round((mapW - 12f - sz - insR) * s);
+                wantY = Math.round(14f * s);
+            }
+            if (lp.width != wantW || lp.height != wantW || lp.leftMargin != wantX || lp.topMargin != wantY) {
+                lp.width = wantW;
+                lp.height = wantW;
+                lp.leftMargin = wantX;
+                lp.topMargin = wantY;
+                mapCompassBtn.setLayoutParams(lp);
+            }
+        }
+    }
+
     private void updateMapControls() {
+        updateCompassBadge();
         if (mapCtrlBox == null) return;
         boolean hasRoute = Nav.active != null;
         boolean hideForPreview = previewPlace != null;
@@ -4013,22 +4079,6 @@ public class Main extends Activity {
         if (mapStepsBtn != null) {
             mapStepsBtn.setVisibility(hasRoute ? View.VISIBLE : View.GONE);
         }
-        if (mapEngineBtn != null && mapEngineTv != null) {
-            boolean isMl = mlMap != null;
-            GradientDrawable gd = round(isMl ? RED : ((CARD & 0x00FFFFFF) | 0xEB000000), 12);
-            if (!isMl && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
-            mapEngineBtn.setBackground(gd);
-            mapEngineTv.setText(isMl ? "ML" : "OSM");
-            mapEngineTv.setTextColor(isMl ? Color.WHITE : TEXT);
-        }
-        if (mapTiltQuickBtn != null && mapTiltQuickTv != null) {
-            boolean is3d = LiveMapView.view3d;
-            GradientDrawable gd = round(is3d ? RED : ((CARD & 0x00FFFFFF) | 0xEB000000), 12);
-            if (!is3d && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
-            mapTiltQuickBtn.setBackground(gd);
-            mapTiltQuickTv.setText(is3d ? "3D" : "2D");
-            mapTiltQuickTv.setTextColor(is3d ? Color.WHITE : TEXT);
-        }
         if (mapSimBtn != null && mapSimIc != null) {
             mapSimBtn.setVisibility(hasRoute ? View.VISIBLE : View.GONE);
             boolean activeSim = Nav.simulating && !Nav.simPaused;
@@ -4039,6 +4089,18 @@ public class Main extends Activity {
                 mapSimIc.setImageBitmap(asset("ic/" + (activeSim ? "pause" : "play_arrow") + ".png"));
             } catch (Throwable ignored) { }
             mapSimIc.setColorFilter(Nav.simulating ? Color.WHITE : TEXT);
+        }
+        if (mapSoundBtn != null && mapSoundIcon != null) {
+            mapSoundBtn.setVisibility(hasRoute ? View.VISIBLE : View.GONE);
+            boolean sndOn = Nav.isSoundOn(this);
+            boolean cock = premium && Prem.cockpit();
+            int bgCol = cock ? CockpitThemes.glass(Prem.style, LIGHT) : ((CARD & 0x00FFFFFF) | 0xEB000000);
+            int accCol = cock && CockpitThemes.isCustom(Prem.style) ? CockpitThemes.accent(Prem.style, LIGHT, RED) : RED;
+            GradientDrawable gd = round(sndOn ? accCol : bgCol, 12);
+            if (!sndOn && LIGHT) gd.setStroke(Math.max(1, (int) s), 0x18000000);
+            mapSoundBtn.setBackground(gd);
+            mapSoundIcon.setState(sndOn, sndOn ? Color.WHITE : MUTED);
+            mapSoundBtn.setContentDescription(I18n.t(sndOn ? "Sonido activado" : "Sonido silenciado"));
         }
     }
 
@@ -4231,68 +4293,298 @@ public class Main extends Activity {
         updateMapControls();
     }
 
+    private void syncMapRoadAlerts() {
+        if (mlMap == null) return;
+        if (RoadAlerts.isAlertsEnabled(this)) {
+            mlMap.setRoadAlerts(RoadAlerts.getActiveAlerts(this), RoadAlerts.getActiveJams(this));
+        } else {
+            mlMap.setRoadAlerts(java.util.Collections.<RoadAlerts.AlertItem>emptyList(),
+                    java.util.Collections.<RoadAlerts.JamSegment>emptyList());
+        }
+    }
+
+    private void updateHazardsPill() {
+        if (hazardsPillBtn == null || hazardsPillTv == null) return;
+        if (!RoadAlerts.isAlertsEnabled(this)) {
+            hazardsPillBtn.setVisibility(View.GONE);
+            return;
+        }
+        List<RoadAlerts.AlertItem> list = RoadAlerts.getActiveAlerts(this);
+        if (list.isEmpty()) {
+            hazardsPillBtn.setVisibility(View.GONE);
+        } else {
+            hazardsPillTv.setText(String.valueOf(list.size()));
+            hazardsPillBtn.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void closeHazardsSheet() {
+        if (hazardsSheetOverlay == null) return;
+        if (root != null) root.removeView(hazardsSheetOverlay);
+        hazardsSheetOverlay = null;
+    }
+
+    private void openHazardsSheet() {
+        if (root == null) return;
+        closeHazardsSheet();
+        final List<RoadAlerts.AlertItem> list = RoadAlerts.getActiveAlerts(this);
+        if (list.isEmpty()) {
+            toast("No hay alertas viales activas");
+            return;
+        }
+        final double refLat = mapCenterLat();
+        final double refLon = mapCenterLon();
+        java.util.Collections.sort(list, new java.util.Comparator<RoadAlerts.AlertItem>() {
+            public int compare(RoadAlerts.AlertItem a, RoadAlerts.AlertItem b) {
+                double da = RoadAlerts.distM(refLat, refLon, a.lat, a.lon);
+                double db = RoadAlerts.distM(refLat, refLon, b.lat, b.lon);
+                return Double.compare(da, db);
+            }
+        });
+        final boolean mph = useMph();
+
+        final FrameLayout scrim = new FrameLayout(this);
+        scrim.setBackgroundColor(0x99000000);
+        scrim.setClickable(true);
+        scrim.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { closeHazardsSheet(); } });
+
+        LinearLayout sheet = new LinearLayout(this);
+        sheet.setOrientation(LinearLayout.VERTICAL);
+        sheet.setClickable(true);
+        GradientDrawable bg = round(CARD, 20);
+        if (LIGHT) bg.setStroke(Math.max(1, (int) s), 0x18000000);
+        sheet.setBackground(bg);
+        int pad = (int) (16 * s);
+        sheet.setPadding(pad, (int) (14 * s), pad, (int) (14 * s));
+
+        LinearLayout hdr = new LinearLayout(this);
+        hdr.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout titleCol = new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.VERTICAL);
+        TextView titleTv = tv(I18n.t("Alertas viales cercanas"), 16, TEXT, true);
+        titleCol.addView(titleTv);
+        RoadAlerts.StatusSnapshot st = RoadAlerts.getStatus();
+        String subMsg = I18n.t(list.size() + " activas") + (st.format.length() > 0 ? " · " + st.format : "");
+        TextView subHdr = tv(subMsg, 12, 0xFFF59E0B, true);
+        subHdr.setPadding(0, (int) (2 * s), 0, 0);
+        titleCol.addView(subHdr);
+        hdr.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView closeX = tv("✕", 16, MUTED, true);
+        closeX.setGravity(Gravity.CENTER);
+        closeX.setBackground(round(BTN, 18));
+        closeX.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { closeHazardsSheet(); } });
+        hdr.addView(closeX, new LinearLayout.LayoutParams((int) (42 * s), (int) (42 * s)));
+        sheet.addView(hdr);
+
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        int maxItems = Math.min(list.size(), 40);
+        for (int i = 0; i < maxItems; i++) {
+            final RoadAlerts.AlertItem item = list.get(i);
+            final double distM = RoadAlerts.distM(refLat, refLon, item.lat, item.lon);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setMinimumHeight((int) (54 * s));
+            row.setPadding((int) (10 * s), (int) (9 * s), (int) (10 * s), (int) (9 * s));
+            GradientDrawable rbg = round(INNER, 12);
+            row.setBackground(rbg);
+
+            TextView badge = tv(RoadAlerts.badgeGlyph(item), 13, Color.WHITE, true);
+            badge.setGravity(Gravity.CENTER);
+            badge.setBackground(round(RoadAlerts.colorForAlert(item), 16));
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams((int) (32 * s), (int) (32 * s));
+            blp.rightMargin = (int) (12 * s);
+            row.addView(badge, blp);
+
+            LinearLayout col = new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            TextView t1 = tv(RoadAlerts.displayTitle(item), 14, TEXT, true);
+            col.addView(t1);
+            String stLine = (item.street != null && item.street.length() > 0) ? item.street : (item.description != null ? item.description : "");
+            if (stLine.length() > 0) {
+                TextView t2 = tv(stLine, 12, MUTED, false);
+                t2.setSingleLine(true);
+                t2.setEllipsize(TextUtils.TruncateAt.END);
+                col.addView(t2);
+            }
+            row.addView(col, new LinearLayout.LayoutParams(0, -2, 1));
+
+            TextView distTv = tv(Nav.fmtStepDist(distM, mph), 12, SOFT, true);
+            distTv.setPadding((int) (8 * s), 0, 0, 0);
+            row.addView(distTv);
+
+            row.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    closeHazardsSheet();
+                    mapFocusPoint(item.lat, item.lon, 17);
+                    showHazardDetailDialog(item);
+                }
+            });
+
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+            rlp.topMargin = (int) (8 * s);
+            rows.addView(row, rlp);
+        }
+        sv.addView(rows);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        slp.topMargin = (int) (8 * s);
+        sheet.addView(sv, slp);
+
+        int availW = root.getWidth() > 0 ? root.getWidth() : (builtW > 0 ? builtW : Math.round(1024 * s));
+        int availH = root.getHeight() > 0 ? root.getHeight() : (builtH > 0 ? builtH : Math.round(600 * s));
+        int shW = (int) (Math.min(availW - 36 * s, 520 * s));
+        int shH = (int) (Math.min(availH - 36 * s, 430 * s));
+        FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(shW, shH, Gravity.CENTER);
+        scrim.addView(sheet, flp);
+        root.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+        hazardsSheetOverlay = scrim;
+    }
+
+    private void showHazardDetailDialog(final RoadAlerts.AlertItem a) {
+        if (isFinishing() || a == null) return;
+        StringBuilder sb = new StringBuilder();
+        if (a.street != null && a.street.trim().length() > 0) {
+            sb.append(a.street.trim()).append("\n");
+        }
+        if (a.description != null && a.description.trim().length() > 0 && !a.description.trim().equals(a.street)) {
+            sb.append(a.description.trim()).append("\n");
+        }
+        if (!Double.isNaN(wLat) && !Double.isNaN(wLon)) {
+            double d = RoadAlerts.distM(wLat, wLon, a.lat, a.lon);
+            sb.append("\n").append(I18n.t("Distancia")).append(": ").append(Nav.fmtStepDist(d, useMph()));
+        }
+        if (a.createdAtMs > 0) {
+            long mins = Math.max(0L, (System.currentTimeMillis() - a.createdAtMs) / 60000L);
+            String age = mins < 1 ? I18n.t("Hace un momento") : I18n.t("Reportado hace " + mins + " min");
+            sb.append("\n").append(age);
+        }
+        sb.append("\n").append(I18n.t("Confirmaciones")).append(": ").append(Math.max(1, a.confirmCount));
+        if (a.source != null && a.source.length() > 0) {
+            sb.append(" · ").append(a.source);
+        }
+
+        new TB(this, dlg())
+            .setTitle(RoadAlerts.displayTitle(a))
+            .setMessage(sb.toString().trim())
+            .setPositiveButton(I18n.t("Enfocar"), new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    mapFocusPoint(a.lat, a.lon, 17);
+                }
+            })
+            .setNeutralButton(I18n.t("Ya no está"), new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    RoadAlerts.dismissAlertLocally(a.id);
+                    toast("Alerta despejada");
+                }
+            })
+            .setNegativeButton(I18n.t("Cerrar"), null)
+            .show();
+    }
+
     private void updateWaveAlerts(boolean mph) {
         if (prefs == null) return;
         boolean hasRoute = Nav.active != null;
-        boolean polEnabled = prefs.getBoolean("nav_police_alerts", true);
         boolean camEnabled = prefs.getBoolean("nav_speed_cams", true);
         boolean incEnabled = prefs.getBoolean("nav_inc_alerts", true);
-        Nav.PoliceReport pol = polEnabled ? Nav.nearbyPolice : null;
         Nav.Camera cam = (hasRoute && camEnabled) ? Nav.nearbyCamera : null;
         Nav.Incident inc = (hasRoute && incEnabled) ? Nav.nearbyIncident : null;
-        boolean hasPolice = pol != null && Nav.nearbyPoliceDistM >= 0;
         boolean hasRadar = cam != null && Nav.nearbyCameraDistM >= 0;
         boolean hasInc = inc != null && Nav.nearbyIncidentDistM >= 0;
 
-        if (camBadgeTv != null && camBadgeTv.getLayoutParams() instanceof FrameLayout.LayoutParams) {
-            FrameLayout.LayoutParams clp = (FrameLayout.LayoutParams) camBadgeTv.getLayoutParams();
-            int wantTop = Math.round((hasRoute ? 152 : 60) * s);
+        RoadAlerts.AlertItem roadAlert = RoadAlerts.isAlertsEnabled(this) ? RoadAlerts.nearbyAlert : null;
+        boolean hasRoad = roadAlert != null && RoadAlerts.nearbyAlertDistM >= 0;
+
+        if (hazardBannerBox != null && hazardBannerBox.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            FrameLayout.LayoutParams clp = (FrameLayout.LayoutParams) hazardBannerBox.getLayoutParams();
+            int wantTop = Math.round((hasRoute ? 152 : 66) * s);
             if (clp.topMargin != wantTop) {
                 clp.topMargin = wantTop;
-                camBadgeTv.setLayoutParams(clp);
+                hazardBannerBox.setLayoutParams(clp);
             }
         }
 
-        boolean preferPolice = hasPolice && (!hasRadar || Nav.nearbyPoliceDistM <= Nav.nearbyCameraDistM + 60.0);
-        if (preferPolice) {
-            waveAlertPolice = pol;
-            waveAlertLat = pol.lat; waveAlertLon = pol.lon;
-            if (camBadgeTv != null) {
-                camBadgeTv.setBackground(round(0xFF2563EB, 11));
-                camBadgeTv.setTextColor(Color.WHITE);
-                camBadgeTv.setText(I18n.t("Policía") + " · " + Nav.fmtStepDist(Nav.nearbyPoliceDistM, mph));
-                camBadgeTv.setVisibility(View.VISIBLE);
-            }
-            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFF2563EB, true);
-            if (mlMap != null) mlMap.setWaveAlert(true, "police", pol.lat, pol.lon);
-        } else if (hasRadar) {
-            waveAlertPolice = null;
+        int cardSurface = LIGHT ? 0xF5FFFFFF : 0xF0141822;
+        int primaryText = LIGHT ? 0xFF14161B : 0xFFF4F7FC;
+        int secondaryText = LIGHT ? 0xFF4B5563 : 0xFFB8C2D4;
+
+        if (hasRadar) {
             waveAlertLat = cam.lat; waveAlertLon = cam.lon;
-            if (camBadgeTv != null) {
-                camBadgeTv.setBackground(round(0xFFD92B2B, 11));
-                camBadgeTv.setTextColor(Color.WHITE);
-                camBadgeTv.setText(I18n.t("Radar") + " · " + Nav.fmtStepDist(Nav.nearbyCameraDistM, mph));
-                camBadgeTv.setVisibility(View.VISIBLE);
+            hazardBannerAlertId = null;
+            if (hazardBannerBox != null) {
+                GradientDrawable bd = round(cardSurface, 14);
+                bd.setStroke(Math.max(1, (int) (1.5f * s)), 0xFFEF4444);
+                hazardBannerBox.setBackground(bd);
+                if (hazardBannerDot != null) hazardBannerDot.setBackground(round(0xFFEF4444, 5));
+                if (hazardBannerTitleTv != null) {
+                    hazardBannerTitleTv.setTextColor(primaryText);
+                    hazardBannerTitleTv.setText(I18n.t("Radar") + " · " + Nav.fmtStepDist(Nav.nearbyCameraDistM, mph));
+                }
+                if (hazardBannerSubTv != null) hazardBannerSubTv.setVisibility(View.GONE);
+                if (hazardBannerDismissTv != null) hazardBannerDismissTv.setVisibility(View.GONE);
+                hazardBannerBox.setVisibility(View.VISIBLE);
             }
-            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFFEF4444, false);
+            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFFEF4444);
             if (mlMap != null) mlMap.setWaveAlert(true, "radar", cam.lat, cam.lon);
-        } else if (hasInc) {
-            waveAlertPolice = null;
-            waveAlertLat = inc.lat; waveAlertLon = inc.lon;
-            String lbl = inc.desc != null && inc.desc.length() > 0 ? inc.desc : Nav.incidentLabel(inc.category);
-            if (camBadgeTv != null) {
-                camBadgeTv.setBackground(round(0xFFF59E0B, 11));
-                camBadgeTv.setTextColor(0xFF14161B);
-                camBadgeTv.setText(lbl + " · " + Nav.fmtStepDist(Nav.nearbyIncidentDistM, mph));
-                camBadgeTv.setVisibility(View.VISIBLE);
+        } else if (hasRoad) {
+            waveAlertLat = roadAlert.lat; waveAlertLon = roadAlert.lon;
+            hazardBannerAlertId = roadAlert.id;
+            int col = RoadAlerts.colorForAlert(roadAlert);
+            if (hazardBannerBox != null) {
+                GradientDrawable bd = round(cardSurface, 14);
+                bd.setStroke(Math.max(1, (int) (1.5f * s)), col);
+                hazardBannerBox.setBackground(bd);
+                if (hazardBannerDot != null) hazardBannerDot.setBackground(round(col, 5));
+                if (hazardBannerTitleTv != null) {
+                    hazardBannerTitleTv.setTextColor(primaryText);
+                    hazardBannerTitleTv.setText(RoadAlerts.displayTitle(roadAlert) + " · " + Nav.fmtStepDist(RoadAlerts.nearbyAlertDistM, mph));
+                }
+                if (hazardBannerSubTv != null) {
+                    String st = roadAlert.street != null && roadAlert.street.trim().length() > 0
+                            ? roadAlert.street.trim()
+                            : (roadAlert.description != null ? roadAlert.description.trim() : "");
+                    if (st.length() > 0) {
+                        hazardBannerSubTv.setTextColor(secondaryText);
+                        hazardBannerSubTv.setText(st);
+                        hazardBannerSubTv.setVisibility(View.VISIBLE);
+                    } else {
+                        hazardBannerSubTv.setVisibility(View.GONE);
+                    }
+                }
+                if (hazardBannerDismissTv != null) {
+                    hazardBannerDismissTv.setTextColor(secondaryText);
+                    hazardBannerDismissTv.setVisibility(View.VISIBLE);
+                }
+                hazardBannerBox.setVisibility(View.VISIBLE);
             }
-            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFFF59E0B, false);
+            if (waveAlertView != null) waveAlertView.setAlert(true, col);
+            String waveKind = (RoadAlerts.CAT_ACCIDENT.equals(roadAlert.category) || "road_closed".equals(roadAlert.subtype)) ? "radar" : "hazard";
+            if (mlMap != null) mlMap.setWaveAlert(true, waveKind, roadAlert.lat, roadAlert.lon);
+        } else if (hasInc) {
+            waveAlertLat = inc.lat; waveAlertLon = inc.lon;
+            hazardBannerAlertId = null;
+            String lbl = inc.desc != null && inc.desc.length() > 0 ? inc.desc : Nav.incidentLabel(inc.category);
+            if (hazardBannerBox != null) {
+                GradientDrawable bd = round(cardSurface, 14);
+                bd.setStroke(Math.max(1, (int) (1.5f * s)), 0xFFF59E0B);
+                hazardBannerBox.setBackground(bd);
+                if (hazardBannerDot != null) hazardBannerDot.setBackground(round(0xFFF59E0B, 5));
+                if (hazardBannerTitleTv != null) {
+                    hazardBannerTitleTv.setTextColor(primaryText);
+                    hazardBannerTitleTv.setText(lbl + " · " + Nav.fmtStepDist(Nav.nearbyIncidentDistM, mph));
+                }
+                if (hazardBannerSubTv != null) hazardBannerSubTv.setVisibility(View.GONE);
+                if (hazardBannerDismissTv != null) hazardBannerDismissTv.setVisibility(View.GONE);
+                hazardBannerBox.setVisibility(View.VISIBLE);
+            }
+            if (waveAlertView != null) waveAlertView.setAlert(true, 0xFFF59E0B);
             if (mlMap != null) mlMap.setWaveAlert(true, "hazard", inc.lat, inc.lon);
         } else {
-            waveAlertPolice = null;
             waveAlertLat = Double.NaN; waveAlertLon = Double.NaN;
-            if (camBadgeTv != null) camBadgeTv.setVisibility(View.GONE);
-            if (waveAlertView != null) waveAlertView.setAlert(false, 0, false);
+            hazardBannerAlertId = null;
+            if (hazardBannerBox != null) hazardBannerBox.setVisibility(View.GONE);
+            if (waveAlertView != null) waveAlertView.setAlert(false, 0);
             if (mlMap != null) mlMap.setWaveAlert(false, "radar", Double.NaN, Double.NaN);
         }
     }
@@ -4667,20 +4959,16 @@ public class Main extends Activity {
         });
         final boolean slow = slowScreen();
         if (slow) {
-            // pantallas modestas (Android 4.x, como el Picanto): el mapa se dibuja una vez en una capa y solo se mueve
-            // esa capa; al terminar se redibuja en su sitio (esquinas y transparencia alineadas otra vez)
             v.setLayerType(View.LAYER_TYPE_HARDWARE, null);
             va.addListener(new android.animation.AnimatorListenerAdapter() {
                 @Override public void onAnimationEnd(android.animation.Animator a) {
                     v.setLayerType(View.LAYER_TYPE_NONE, null);
-                    if (liveMap != null) liveMap.invalidate();
                 }
             });
         }
         va.addUpdateListener(new android.animation.ValueAnimator.AnimatorUpdateListener() {
             public void onAnimationUpdate(android.animation.ValueAnimator a) {
                 v.setTranslationY((Float) a.getAnimatedValue());
-                if (!slow && liveMap != null) liveMap.invalidate();
             }
         });
         va.start();
@@ -4839,7 +5127,7 @@ public class Main extends Activity {
 
     /** Tema premium elegido y desbloqueado. */
     private boolean premiumActive() {
-        String id = prefs.getString("premium_theme", null);
+        String id = savedPremiumTheme();
         return id != null && premiumUnlocked(id);
     }
 
@@ -4874,7 +5162,7 @@ public class Main extends Activity {
         premPillH = noDock ? 0 : vertical ? 68 : 64;
         dockTop = noDock ? boardH : boardH - 16 - premPillH;
         premHeadY = 60;
-        if (Prem.faro()) { faroMetrics(); return; }
+        if (Prem.cockpit()) { faroMetrics(); return; }
         if (Prem.cob()) { cobaltoMetrics(); return; }
         if (mapOnly) premHeadH = 0;
         else if (vertical) premHeadH = 92 + 8 + (shortVertical ? 150 : 172);
@@ -4897,7 +5185,7 @@ public class Main extends Activity {
     private void buildPremium() {
         carCard = null; mapGauge = null; mapGaugeBox = null; carGauge = null; chipTv = null; carDataTv = null;
         faroGauge = null; faroBar = null; faroWxIc = null; faroMaintBox = null; faroPillTv = null;
-        if (Prem.faro()) { buildFaro(); setGps(false, 0); return; }
+        if (Prem.cockpit()) { buildFaro(); setGps(false, 0); return; }
         buildPremiumTop();
         buildAaCard();
         if (mapOnly) premiumDetached();
@@ -5186,7 +5474,7 @@ public class Main extends Activity {
     // reproductor y la barra. Sin «Solo mapa» (tema fijo, como Cobalto).
 
     private float faroColX, faroColY, faroColW, faroColH, faroRX, faroRW, faroWxY, faroWxH, faroMtY, faroMtH,
-        faroPlX, faroPlY, faroPlW, faroPlH, faroTopX;
+        faroPlX, faroPlY, faroPlW, faroPlH, faroTopX, faroRailX, faroRailY, faroRailW, faroRailH;
     private FaroGauge faroGauge;
     private Faro.Timeline faroBar;
     private Faro.Icon faroWxIc;
@@ -5200,36 +5488,61 @@ public class Main extends Activity {
 
     private void faroMetrics() {
         float W0 = premW();
+        String st = Prem.style;
+        boolean custom = CockpitThemes.isCustom(st);
+        boolean nightPulse = CockpitThemes.NIGHTPULSE.equals(st);
+        float gap = 12f;
         premHeadH = 0;
         premWide = false;
-        premPillH = noDock ? 0 : vertical ? 60 : 56;
-        dockTop = noDock ? boardH : boardH - 10 - premPillH;
-        float bottom = dockTop - (noDock ? 12 : 10), top = 8, topH = 34;
-        faroPlH = showPlayer ? (vertical ? 80 : 74) : 0;
+        float top = 8, topH = 34;
+        if (custom) {
+            premPillH = 0;
+            dockTop = boardH;
+            faroRailW = noDock ? 0 : (vertical ? 56f : (nightPulse ? 60f : 64f));
+            faroRailX = W0 - 12f - faroRailW;
+            faroRailY = top;
+            faroRailH = boardH - top - 10f;
+        } else {
+            faroRailW = 0;
+            premPillH = noDock ? 0 : vertical ? 60 : 56;
+            dockTop = noDock ? boardH : boardH - 10 - premPillH;
+        }
+        float cRight = faroRailW > 0 ? faroRailX - gap : W0 - 12f;
+        float bottom = custom ? (boardH - 12f) : (dockTop - (noDock ? 12 : 10));
+        faroPlH = showPlayer ? (vertical ? (nightPulse ? 76 : 82) : (nightPulse ? 70 : 74)) : 0;
         faroPlY = bottom - faroPlH;
-        float above = faroPlY - (showPlayer ? 10 : 0);   // donde terminan el mapa y las tarjetas
+        float above = faroPlY - (showPlayer ? 10 : 0);
         boolean wx = prefs.getBoolean("weather_on", true);
         if (vertical) {
-            float rh = shortVertical ? 300 : Math.max(300, Math.min(470, boardH * 0.36f));
+            float rh = nightPulse
+                ? (shortVertical ? 268 : Math.max(268, Math.min(395, boardH * 0.315f)))
+                : (shortVertical ? 300 : Math.max(300, Math.min(470, boardH * 0.36f)));
             float ry = above - rh;
             faroTopX = 12;
-            mapX = 12; mapY = top + topH + 4; mapW = W0 - 24;
-            mapH = Math.max(120, ry - 10 - mapY);
-            faroColX = 12; faroColY = ry; faroColW = 290; faroColH = rh;
-            faroRX = faroColX + faroColW + 12; faroRW = W0 - 12 - faroRX;
+            mapX = 12; mapY = top + topH + 4; mapW = cRight - 12;
+            mapH = Math.max(120, ry - gap - mapY);
+            faroColX = 12; faroColY = ry;
+            faroColW = custom ? Math.min(nightPulse ? 260 : 280, (cRight - 12) * 0.43f) : 290;
+            faroColH = rh;
+            faroRX = faroColX + faroColW + gap; faroRW = cRight - faroRX;
             faroWxY = ry; faroWxH = wx ? Math.round(rh * 0.54f) : 0;
-            faroPlX = 12; faroPlW = W0 - 24;
+            faroPlX = 12; faroPlW = cRight - 12;
         } else {
-            // la columna llega hasta el borde de abajo: la barra de apps va solo debajo del reproductor
-            faroColX = 12; faroColY = top; faroColW = 292 + Math.min(64, ex / 6f); faroColH = boardH - top;
-            float rx0 = faroColX + faroColW + 12;
-            faroRW = 324 + Math.min(48, ex / 8f);
-            faroRX = W0 - 12 - faroRW;
+            faroColX = 12; faroColY = top;
+            faroColW = nightPulse ? 248 + Math.min(36, ex / 10f)
+                : custom ? 280 + Math.min(54, ex / 7f)
+                : 292 + Math.min(64, ex / 6f);
+            faroColH = boardH - top;
+            float rx0 = faroColX + faroColW + gap;
+            faroRW = nightPulse ? 256 + Math.min(34, ex / 10f)
+                : custom ? 292 + Math.min(44, ex / 8f)
+                : 324 + Math.min(48, ex / 8f);
+            faroRX = cRight - faroRW;
             faroTopX = rx0;
-            mapX = rx0; mapY = top + topH + 4; mapW = faroRX - 12 - rx0;
+            mapX = rx0; mapY = top + topH + 4; mapW = Math.max(160, faroRX - gap - rx0);
             mapH = Math.max(120, above - mapY);
             faroWxY = mapY; faroWxH = wx ? Math.round(mapH * 0.54f) : 0;
-            faroPlX = rx0; faroPlW = W0 - 12 - rx0;
+            faroPlX = rx0; faroPlW = cRight - rx0;
         }
         faroMtY = wx ? faroWxY + faroWxH + 10 : faroWxY;
         faroMtH = (vertical ? faroColY + faroColH : mapY + mapH) - faroMtY;
@@ -5241,10 +5554,9 @@ public class Main extends Activity {
         premHeadViews.clear();
         faroGauge = null; faroBar = null; faroWxIc = null; faroMaintBox = null; faroPillTv = null; faroPillIc = null;
         buildFaroTop();
-        // en claro, el área del mapa con la misma sombra que las tarjetas (el mapa la tapa por dentro)
-        if (LIGHT) {
+        if (LIGHT || CockpitThemes.NIGHTPULSE.equals(Prem.style)) {
             View sh = new View(this);
-            sh.setBackground(new Faro.Card(true, 20 * s, 8 * s, s));
+            sh.setBackground(CockpitThemes.cardDrawable(Prem.style, LIGHT, 20 * s, 8 * s, s));
             place(board, sh, mapX - 8, mapY - 8, mapW + 16, mapH + 16);
         }
         buildAaCard();
@@ -5258,11 +5570,12 @@ public class Main extends Activity {
         updateOilBadge();
     }
 
-    /** Tarjeta translúcida de Faro. Devuelve el marco interior (w×hh) donde van las vistas. */
+    /** Tarjeta translúcida del cockpit activo. Devuelve el marco interior (w×hh) donde van las vistas. */
     private FrameLayout faroCard(float x, float y, float w, float hh) {
         float m = 8;
+        float rad = 18 * s;
         FrameLayout outer = new FrameLayout(this);
-        outer.setBackground(new Faro.Card(LIGHT, 18 * s, m * s, s));
+        outer.setBackground(CockpitThemes.cardDrawable(Prem.style, LIGHT, rad, m * s, s));
         place(board, outer, x - m, y - m, w + 2 * m, hh + 2 * m);
         FrameLayout inner = new FrameLayout(this);
         place(outer, inner, m, m, w, hh);
@@ -5272,12 +5585,15 @@ public class Main extends Activity {
     /** Botón con un ícono de trazo centrado (área de toque más grande que el ícono). */
     private FrameLayout faroIconBtn(int type, float box, float ic, int bg) {
         FrameLayout f = new FrameLayout(this);
+        String st = Prem.style;
+        int txCol = CockpitThemes.isCustom(st) ? CockpitThemes.text(st, LIGHT, TEXT) : TEXT;
         if (bg != 0) {
             GradientDrawable d = round(bg, box * 0.3f);
-            if (LIGHT) d.setStroke(Math.max(1, (int) s), 0x14000000);
+            if (CockpitThemes.isCustom(st)) d.setStroke(Math.max(1, (int) s), CockpitThemes.glassEdge(st, LIGHT));
+            else if (LIGHT) d.setStroke(Math.max(1, (int) s), 0x14000000);
             f.setBackground(d);
         }
-        Faro.Icon i = new Faro.Icon(this, type, TEXT);
+        Faro.Icon i = new Faro.Icon(this, type, txCol);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams((int) (ic * s), (int) (ic * s));
         lp.gravity = Gravity.CENTER;
         f.addView(i, lp);
@@ -5287,12 +5603,22 @@ public class Main extends Activity {
 
     /** Barra de estado: hora y fecha a la izquierda; Wi-Fi, Bluetooth (y Apps sin barra) y Ajustes a la derecha. */
     private void buildFaroTop() {
-        float W0 = premW(), x = faroTopX, w = W0 - 12 - x;
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
+        int accCol = custom ? CockpitThemes.accent(stId, LIGHT, RED) : RED;
+        int tileBg = custom ? CockpitThemes.tile(stId, LIGHT) : Faro.tile(LIGHT);
+
+        float W0 = premW(), x = faroTopX;
+        float topRight = custom && !noDock ? faroRailX - 12f : W0 - 12f;
+        float w = topRight - x;
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        greetTv = tv("", 13, MUTED, false);   // no se muestra (el reloj lo actualiza)
-        timeTv = tv("", 17, TEXT, true);
-        dateTv = tv("", 13, MUTED, false);
+        greetTv = tv("", 13, muCol, false);   // no se muestra (el reloj lo actualiza)
+        timeTv = tv("", 17, txCol, true);
+        if (custom) timeTv.setTypeface(CockpitThemes.displayFont(this, stId));
+        dateTv = tv("", 13, muCol, false);
         dateTv.setPadding((int) (10 * s), 0, 0, 0);
         row.addView(timeTv);
         row.addView(dateTv);
@@ -5319,15 +5645,17 @@ public class Main extends Activity {
             right.addView(st);
         }
         if (noDock) {
-            FrameLayout apps = faroIconBtn(Faro.I_APPS, 32, 16, Faro.tile(LIGHT));
+            FrameLayout apps = faroIconBtn(Faro.I_APPS, 32, 16, tileBg);
             LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams((int) (32 * s), (int) (32 * s));
             alp.leftMargin = (int) (8 * s);
             right.addView(apps, alp);
             apps.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { openDrawer(); } });
         }
         FrameLayout gear = circleIcon("settings", 32, 18, 0);
-        GradientDrawable gd = round(Faro.tile(LIGHT), 16);
-        if (LIGHT) gd.setStroke(Math.max(1, (int) s), 0x14000000);
+        ((ImageView) gear.getChildAt(0)).setColorFilter(txCol);
+        GradientDrawable gd = round(tileBg, 16);
+        if (custom) gd.setStroke(Math.max(1, (int) s), CockpitThemes.glassEdge(stId, LIGHT));
+        else if (LIGHT) gd.setStroke(Math.max(1, (int) s), 0x14000000);
         gear.setBackground(gd);
         LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams((int) (32 * s), (int) (32 * s));
         glp.leftMargin = (int) (8 * s);
@@ -5336,70 +5664,120 @@ public class Main extends Activity {
         place(board, right, x + w * 0.4f, 9, w * 0.6f, 32);
     }
 
-    /** Columna izquierda: velocímetro arriba, nombre del vehículo con el GPS y el carro visto desde arriba. */
+    /** Columna izquierda: velocímetro arriba, indicador GPS, Nissan Almera N17 Impul y emblema grande de Nissan abajo (o vista Faro clásica). */
     private void buildFaroColumn() {
+        final String stId = Prem.style;
+        final boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
+
         float x = faroColX, y = faroColY, w = faroColW, hh = faroColH;
-        float D = carSpeed ? Math.min(w - 36, vertical ? hh * 0.36f : (boardH - 16) * 0.33f) : 0;
+        // NightPulse: 45° trasera-alta; Faro: vista cenital
+        String col = custom ? CockpitThemes.carForTheme(stId) : Faro.car(prefs.getString("faro_car", Faro.CAR_ALMERA_N17));
+        boolean angled = Faro.isAngled(col);
+        float D = carSpeed ? Math.min(w - 32, vertical ? hh * (custom ? 0.33f : 0.36f) : (boardH - 16) * (custom ? 0.31f : 0.33f)) : 0;
         float gx = x + (w - D) / 2, gy = y + 6;
-        float labelH = 20, carMax = Math.min(hh * 0.70f, 380);
-        float labelY = carSpeed ? gy + D + 2 : y + Math.max(4, (hh - carMax - labelH - 4) * 0.40f);
-        // el carro (y su sombra) llega hasta abajo: en horizontal, hasta el borde de la pantalla
-        float carY = labelY + labelH + 2, carH = Math.max(60, carSpeed ? y + hh - carY : Math.min(carMax, y + hh - carY));
-        String col = Faro.car(prefs.getString("faro_car", "silver"));
-        Faro.Car car = new Faro.Car(this, col, LIGHT);
+        float labelH = custom ? 18 : 20;
+        float logoW = custom ? Math.min(w - 20, vertical ? 76 : 96) : 0;
+        float logoH = custom ? (vertical ? 38 : 48) : 0;
+        float logoHitH = custom ? Math.max(48, logoH + 6) : 0;
+        float logoY = custom ? y + hh - logoHitH - 2 : y + hh;
+        float carMax = angled ? Math.min(hh * 0.56f, 240) : Math.min(hh * 0.70f, 380);
+        float labelY = carSpeed ? gy + D + 2
+            : (custom ? y + 8 : y + Math.max(4, (hh - carMax - labelH - 4) * 0.40f));
+        float carBottom = custom ? logoY - 4 : y + hh;
+        float carY = labelY + labelH + 2;
+        float carH = Math.max(60, (carSpeed || angled) ? carBottom - carY : Math.min(carMax, carBottom - carY));
+
+        Faro.Car car = new Faro.Car(this, col, LIGHT, CockpitThemes.tailColor(stId, LIGHT));
         place(board, car, x, carY, w, carH);
         car.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { showSettings(C_VEHICLE); } });
-        car.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { chooseFaroCar(); return true; } });
-        // faros: encendidos en oscuro; al pasar de claro a oscuro se encienden y de oscuro a claro se apagan
-        android.graphics.RectF cr = Faro.carRect(w * s, carH * s);
-        float lampY = carY + (cr.top + cr.height() * Faro.LAMP_Y) / s;
-        float lxL = (cr.left + cr.width() * Faro.LAMP_X) / s, lxR = (cr.left + cr.width() * (1 - Faro.LAMP_X)) / s;
-        float bTop = carSpeed ? y : Math.max(y, lampY - 160), bH = lampY + 16 - bTop;
+        if (!custom) {
+            car.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { chooseFaroCar(); return true; } });
+        }
+
+        // Faros y pilotos encendidos en oscuro según el ángulo y tema
         Boolean prev = faroLastLight;
         faroLastLight = LIGHT;
         boolean fadeOut = LIGHT && prev != null && !prev;
-        if ((!LIGHT || fadeOut) && bH > 40) {
-            float poolY = carSpeed ? gy + D * 0.80f - bTop : (lampY - bTop) * 0.25f;
-            final Faro.Beams beams = new Faro.Beams(this, s, new float[]{lxL * s, (lampY - bTop) * s, lxR * s, (lampY - bTop) * s},
-                (carSpeed ? gy + D * 0.5f - bTop : 0) * s, w / 2 * s, poolY * s, w * 0.42f * s);
-            place(board, beams, x, bTop, w, bH);
-            if (fadeOut) {
-                beams.setAlpha(1f);
-                afterFirstFrame(new Runnable() { public void run() {
-                    beams.animate().alpha(0f).setStartDelay(dur(150)).setDuration(dur(700)).withLayer().withEndAction(new Runnable() { public void run() {
-                        if (beams.getParent() instanceof ViewGroup) ((ViewGroup) beams.getParent()).removeView(beams);
+        if (!LIGHT || fadeOut) {
+            if (angled) {
+                final CockpitThemes.AngleLights lights = new CockpitThemes.AngleLights(this, stId, col, s);
+                place(board, lights, x, carY, w, carH);
+                if (fadeOut) {
+                    lights.setAlpha(1f);
+                    afterFirstFrame(new Runnable() { public void run() {
+                        lights.animate().alpha(0f).setStartDelay(dur(150)).setDuration(dur(700)).withLayer().withEndAction(new Runnable() { public void run() {
+                            if (lights.getParent() instanceof ViewGroup) ((ViewGroup) lights.getParent()).removeView(lights);
+                        }});
                     }});
-                }});
-            } else if (prev == null || prev) {
-                beams.setAlpha(0f);
-                afterFirstFrame(new Runnable() { public void run() {
-                    beams.animate().alpha(1f).setStartDelay(dur(150)).setDuration(dur(900))
-                        .setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator()).withLayer();
-                }});
+                } else if (prev == null || prev) {
+                    lights.setAlpha(0f);
+                    afterFirstFrame(new Runnable() { public void run() {
+                        lights.animate().alpha(1f).setStartDelay(dur(150)).setDuration(dur(900))
+                            .setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator()).withLayer();
+                    }});
+                }
+            } else {
+                android.graphics.RectF cr = Faro.carRect(w * s, carH * s, col);
+                float lampY = carY + (cr.top + cr.height() * Faro.lampY(col)) / s;
+                float lxL = (cr.left + cr.width() * Faro.lampX(col)) / s, lxR = (cr.left + cr.width() * (1 - Faro.lampX(col))) / s;
+                float bTop = carSpeed ? y : Math.max(y, lampY - 160), bH = lampY + 16 - bTop;
+                if (bH > 40) {
+                    float poolY = carSpeed ? gy + D * 0.80f - bTop : (lampY - bTop) * 0.25f;
+                    final Faro.Beams beams = new Faro.Beams(this, s, new float[]{lxL * s, (lampY - bTop) * s, lxR * s, (lampY - bTop) * s},
+                        (carSpeed ? gy + D * 0.5f - bTop : 0) * s, w / 2 * s, poolY * s, w * 0.42f * s,
+                        CockpitThemes.beamColor(stId, LIGHT), CockpitThemes.poolColor(stId, LIGHT));
+                    place(board, beams, x, bTop, w, bH);
+                    if (fadeOut) {
+                        beams.setAlpha(1f);
+                        afterFirstFrame(new Runnable() { public void run() {
+                            beams.animate().alpha(0f).setStartDelay(dur(150)).setDuration(dur(700)).withLayer().withEndAction(new Runnable() { public void run() {
+                                if (beams.getParent() instanceof ViewGroup) ((ViewGroup) beams.getParent()).removeView(beams);
+                            }});
+                        }});
+                    } else if (prev == null || prev) {
+                        beams.setAlpha(0f);
+                        afterFirstFrame(new Runnable() { public void run() {
+                            beams.animate().alpha(1f).setStartDelay(dur(150)).setDuration(dur(900))
+                                .setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator()).withLayer();
+                        }});
+                    }
+                }
             }
         }
-        // velocímetro (mixto por defecto en Faro si nunca se eligió uno)
-        speedTv = tv("0", 12, TEXT, true);   // no se muestra: el número va en el velocímetro
+        speedTv = tv("0", 12, txCol, true);
         carGauge = null; mapGauge = null;
         if (carSpeed) {
             faroGauge = new FaroGauge(this, s);
-            faroGauge.setTheme(LIGHT, TEXT, MUTED);
+            faroGauge.setCockpitTheme(stId, LIGHT, txCol, muCol);
             faroGauge.setUnit(useMph());
             faroGauge.setMode(prefs.contains("speedo") ? prefs.getInt("speedo", 2) : 2);
             place(board, faroGauge, gx, gy, D, D);
         }
-        // nombre del vehículo y el GPS (donde la referencia dice «Comfort»)
         LinearLayout lab = new LinearLayout(this);
         lab.setGravity(Gravity.CENTER);
-        carTv = tv(prefs.getString("car_name", "Mi vehículo"), 13, MUTED, true);
-        carTv.setMaxWidth((int) ((w - 90) * s));
-        lab.addView(carTv);
         gpsDot = new View(this);
-        gpsDot.setBackground(round(MUTED, 4));
+        gpsDot.setBackground(round(muCol, 4));
         LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams((int) (7 * s), (int) (7 * s));
-        dlp.leftMargin = (int) (10 * s);
+        if (custom) {
+            carTv = null;
+            FrameLayout logoBox = new FrameLayout(this);
+            logoBox.setContentDescription("Nissan");
+            CockpitThemes.NissanLogoView nissan = new CockpitThemes.NissanLogoView(this, LIGHT, s);
+            FrameLayout.LayoutParams nlp = new FrameLayout.LayoutParams((int) (logoW * s), (int) (logoH * s));
+            nlp.gravity = Gravity.CENTER;
+            logoBox.addView(nissan, nlp);
+            place(board, logoBox, x, logoY, w, logoHitH);
+            logoBox.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { showSettings(C_VEHICLE); } });
+        } else {
+            carTv = tv(prefs.getString("car_name", "Mi vehículo"), 13, muCol, true);
+            carTv.setMaxWidth((int) ((w - 90) * s));
+            lab.addView(carTv);
+            dlp.leftMargin = (int) (10 * s);
+        }
         lab.addView(gpsDot, dlp);
-        gpsTv = tv("GPS", 11, MUTED, false);
+        gpsTv = tv("GPS", 11, muCol, false);
         gpsTv.setPadding((int) (5 * s), 0, 0, 0);
         lab.addView(gpsTv);
         place(board, lab, x, labelY, w, labelH);
@@ -5421,7 +5799,7 @@ public class Main extends Activity {
         final String[] cols = Faro.CAR_COLORS;
         String[] names = new String[cols.length];
         for (int i = 0; i < cols.length; i++) names[i] = I18n.t(Faro.CAR_NAMES[i]);
-        int sel = Math.max(0, java.util.Arrays.asList(cols).indexOf(Faro.car(prefs.getString("faro_car", "silver"))));
+        int sel = Math.max(0, java.util.Arrays.asList(cols).indexOf(Faro.car(prefs.getString("faro_car", Faro.CAR_ALMERA_N17))));
         new TB(this, dlg()).raw()
             .setTitle(I18n.t("Color del carro"))
             .setSingleChoiceItems(names, sel, new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int which) {
@@ -5435,37 +5813,43 @@ public class Main extends Activity {
 
     /** Clima: ciudad, temperatura grande, máxima/mínima, estado, lluvia y humedad, y las próximas horas abajo. */
     private void buildFaroWeather(float x, float y, float w, float hh) {
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
+        int accCol = custom ? CockpitThemes.accent(stId, LIGHT, RED) : TEXT;
+
         FrameLayout card = faroCard(x, y, w, hh);
         float m = 16;
-        faroCityTv = tv("Clima", 13, MUTED, true);
+        faroCityTv = tv("Clima", 13, muCol, true);
         place(card, faroCityTv, m, 14, w * 0.56f - m, 18);
-        faroTempTv = tv("--°", 46, TEXT, false);
-        faroTempTv.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+        faroTempTv = tv("--°", 46, txCol, false);
+        faroTempTv.setTypeface(custom ? CockpitThemes.displayFont(this, stId) : Typeface.create("sans-serif-light", Typeface.NORMAL));
         place(card, faroTempTv, m - 2, 34, w * 0.52f, 54);
-        faroHiLoTv = tv("", 12, MUTED, false);
+        faroHiLoTv = tv("", 12, muCol, false);
         place(card, faroHiLoTv, m, 92, w * 0.5f, 16);
         float is = 40;
-        faroWxIc = new Faro.Icon(this, Faro.I_CLOUD, TEXT);
+        faroWxIc = new Faro.Icon(this, Faro.I_CLOUD, custom ? accCol : txCol);
         faroWxIc.setStroke(1.35f);
         place(card, faroWxIc, w - m - is, 12, is, is);
-        faroDescTv = tv("", 14, TEXT, false);
+        faroDescTv = tv("", 14, txCol, false);
         faroDescTv.setGravity(Gravity.RIGHT);
         place(card, faroDescTv, w * 0.36f, 58, w * 0.64f - m, 19);
         LinearLayout meta = new LinearLayout(this);
         meta.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
         faroRainBox = new LinearLayout(this);
         faroRainBox.setGravity(Gravity.CENTER_VERTICAL);
-        Faro.Icon ui = new Faro.Icon(this, Faro.I_UMBRELLA, MUTED);
+        Faro.Icon ui = new Faro.Icon(this, Faro.I_UMBRELLA, muCol);
         faroRainBox.addView(ui, new LinearLayout.LayoutParams((int) (13 * s), (int) (13 * s)));
-        faroRainTv = tv("", 12, MUTED, false);
+        faroRainTv = tv("", 12, muCol, false);
         faroRainTv.setPadding((int) (4 * s), 0, 0, 0);
         faroRainBox.addView(faroRainTv);
         meta.addView(faroRainBox);
         faroHumBox = new LinearLayout(this);
         faroHumBox.setGravity(Gravity.CENTER_VERTICAL);
-        Faro.Icon di = new Faro.Icon(this, Faro.I_DROP, MUTED);
+        Faro.Icon di = new Faro.Icon(this, Faro.I_DROP, muCol);
         faroHumBox.addView(di, new LinearLayout.LayoutParams((int) (13 * s), (int) (13 * s)));
-        faroHumTv = tv("", 12, MUTED, false);
+        faroHumTv = tv("", 12, muCol, false);
         faroHumTv.setPadding((int) (4 * s), 0, 0, 0);
         faroHumBox.addView(faroHumTv);
         LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(-2, -2);
@@ -5484,6 +5868,10 @@ public class Main extends Activity {
 
     private void renderFaroWx() {
         if (faroWxIc == null) return;
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
         Weather.Now n = weatherNow;
         faroHours.removeAllViews();
         if (n == null) {
@@ -5513,15 +5901,15 @@ public class Main extends Activity {
             LinearLayout c = new LinearLayout(this);
             c.setOrientation(LinearLayout.VERTICAL);
             c.setGravity(Gravity.CENTER);
-            TextView ht = tv(hourLabel(hr.hour), 11, MUTED, false);
+            TextView ht = tv(hourLabel(hr.hour), 11, muCol, false);
             ht.setGravity(Gravity.CENTER);
             c.addView(ht, new LinearLayout.LayoutParams(-1, -2));
-            Faro.Icon ic = new Faro.Icon(this, Faro.weatherIcon(hr.code, hr.day), TEXT);
+            Faro.Icon ic = new Faro.Icon(this, Faro.weatherIcon(hr.code, hr.day), txCol);
             LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams((int) (22 * s), (int) (22 * s));
             ilp.topMargin = (int) (8 * s);
             ilp.bottomMargin = (int) (8 * s);
             c.addView(ic, ilp);
-            TextView tt = tv(deg(hr.temp), 13, TEXT, true);
+            TextView tt = tv(deg(hr.temp), 13, txCol, true);
             tt.setGravity(Gravity.CENTER);
             c.addView(tt, new LinearLayout.LayoutParams(-1, -2));
             faroHours.addView(c, new LinearLayout.LayoutParams(0, -1, 1f));
@@ -5530,12 +5918,17 @@ public class Main extends Activity {
 
     /** Próximos mantenimientos (los de Ajustes → Mantenimientos), del más urgente al más lejano. */
     private void buildFaroMaint(float x, float y, float w, float hh) {
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
         FrameLayout card = faroCard(x, y, w, hh);
-        place(card, tv("Mantenimientos", 13, TEXT, true), 16, 12, w - 32, 18);
+        float m = 16;
+        TextView hdr = tv("Mantenimientos", 13, txCol, true);
+        place(card, hdr, m, 12, w - 2 * m, 18);
         faroMaintBox = new FrameLayout(this);
-        faroMaintW = w - 24;
+        faroMaintW = w - (m * 1.5f);
         faroMaintH = Math.max(32, hh - 38 - 6);
-        place(card, faroMaintBox, 12, 38, faroMaintW, faroMaintH);
+        place(card, faroMaintBox, m * 0.75f, 38, faroMaintW, faroMaintH);
         card.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { showSettings(C_MAINT); } });
         renderFaroMaint();
     }
@@ -5543,6 +5936,11 @@ public class Main extends Activity {
     private void renderFaroMaint() {
         if (faroMaintBox == null) return;
         faroMaintBox.removeAllViews();
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
+        int accCol = custom ? CockpitThemes.accent(stId, LIGHT, RED) : RED;
         final List<org.json.JSONObject> l = maint();
         List<double[]> items = new ArrayList<double[]>();   // {lo que falta, índice} (índice -1 = aceite)
         if (oilOn()) items.add(new double[]{(oilNextKm() - odoKm()) / Math.max(1, prefs.getFloat("oil_interval_km", 5000)), -1});
@@ -5554,10 +5952,10 @@ public class Main extends Activity {
             LinearLayout e = new LinearLayout(this);
             e.setOrientation(LinearLayout.VERTICAL);
             e.setGravity(Gravity.CENTER);
-            TextView t1 = tv("Sin mantenimientos programados", 13, MUTED, false);
+            TextView t1 = tv("Sin mantenimientos programados", 13, muCol, false);
             t1.setGravity(Gravity.CENTER);
             e.addView(t1, new LinearLayout.LayoutParams(-1, -2));
-            TextView t2 = tv("Toca para agregar uno", 12, RED, true);
+            TextView t2 = tv("Toca para agregar uno", 12, accCol, true);
             t2.setGravity(Gravity.CENTER);
             t2.setPadding(0, (int) (6 * s), 0, 0);
             e.addView(t2, new LinearLayout.LayoutParams(-1, -2));
@@ -5587,12 +5985,13 @@ public class Main extends Activity {
             bar.setBackground(round(uc, 2));
             place(row, bar, 4, rowH * 0.16f, 4, rowH * 0.68f);
             ImageView iv = icon(ic, 16);
+            iv.setColorFilter(txCol);
             iv.setAlpha(0.85f);
             place(row, iv, 16, (rowH - 16) / 2, 16, 16);
-            TextView nt = tv(name, 14, TEXT, false);
-            nt.setTypeface(Typeface.DEFAULT);
+            TextView nt = tv(name, 14, txCol, false);
+            nt.setTypeface(CockpitThemes.bodyFont(this, stId));
             place(row, nt, 40, (rowH - 18) / 2, faroMaintW - 40 - lw - 8, 18);
-            TextView lt = tv(left, 13, f < 0.15 ? uc : MUTED, f < 0.15);
+            TextView lt = tv(left, 13, f < 0.15 ? uc : muCol, f < 0.15);
             lt.setGravity(Gravity.RIGHT);
             place(row, lt, faroMaintW - lw - 4, (rowH - 17) / 2, lw, 17);
             place(faroMaintBox, row, 0, k * rowH, faroMaintW, rowH);
@@ -5604,13 +6003,19 @@ public class Main extends Activity {
 
     /** Reproductor horizontal: anterior, reproducir y siguiente; carátula; canción y artista; la línea de tiempo. */
     private void buildFaroPlayer(float x, float y, float w, float hh) {
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
+        int fillCol = custom ? CockpitThemes.navHighlight(stId, LIGHT, txCol) : txCol;
+
         final FrameLayout card = faroCard(x, y, w, hh);
         float cy = hh / 2, x0 = 14;
         FrameLayout prev = faroIconBtn(Faro.I_PREV, 44, 22, 0), next = faroIconBtn(Faro.I_NEXT, 44, 22, 0);
         FrameLayout play = new FrameLayout(this);
         playIc = new ImageView(this);
         playIc.setImageBitmap(asset("ic/play_arrow.png"));
-        playIc.setColorFilter(TEXT);
+        playIc.setColorFilter(fillCol);
         FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams((int) (34 * s), (int) (34 * s));
         plp.gravity = Gravity.CENTER;
         play.addView(playIc, plp);
@@ -5619,20 +6024,20 @@ public class Main extends Activity {
         place(card, next, x0 + 100, cy - 22, 44, 44);
         float ax = x0 + 100 + 44 + 16, as = hh - 20;
         playerArt = new PlayerArt(this, s, asset("ic/music_note.png"));
-        playerArt.setTile(LIGHT ? 0x14000000 : 0x1FFFFFFF);
+        playerArt.setTile(custom ? CockpitThemes.soft(stId, LIGHT) : (LIGHT ? 0x14000000 : 0x1FFFFFFF));
         place(card, playerArt, ax, (hh - as) / 2, as, as);
         float tlW = Math.max(150, Math.min(460, w * 0.36f)), tlX = w - 18 - tlW;
         float tx = ax + as + 14, tw = Math.max(60, tlX - 20 - tx);
-        trackTv = tv("Nada sonando", 16, TEXT, true);
+        trackTv = tv("Nada sonando", 16, txCol, true);
         place(card, trackTv, tx, cy - 20, tw, 20);
-        artistTv = tv("Radio, Bluetooth o USB", 13, MUTED, false);
+        artistTv = tv("Radio, Bluetooth o USB", 13, muCol, false);
         place(card, artistTv, tx, cy + 3, tw, 17);
-        sourceTv = tv("", 10, MUTED, true);
+        sourceTv = tv("", 10, muCol, true);
         place(card, sourceTv, tlX, cy - 18, tlW * 0.5f, 14);
-        timePosTv = tv("", 12, MUTED, false);
+        timePosTv = tv("", 12, muCol, false);
         timePosTv.setGravity(Gravity.RIGHT);
         place(card, timePosTv, tlX + tlW * 0.4f, cy - 19, tlW * 0.6f, 16);
-        faroBar = new Faro.Timeline(this, s, Faro.track(LIGHT), TEXT);
+        faroBar = new Faro.Timeline(this, s, CockpitThemes.track(stId, LIGHT), fillCol);
         place(card, faroBar, tlX - 5, cy + 3, tlW + 10, 18);
         final View.OnClickListener goPrev = mediaClick(KeyEvent.KEYCODE_MEDIA_PREVIOUS), goNext = mediaClick(KeyEvent.KEYCODE_MEDIA_NEXT);
         prev.setOnClickListener(goPrev);
@@ -5658,21 +6063,37 @@ public class Main extends Activity {
         renderTrack();
     }
 
-    /** Barra de apps compacta y centrada: cada función en un recuadro redondeado; las apps con su propio ícono. */
+    /** Barra de apps: barra vertical en el borde derecho para NightPulse, y píldora inferior en Faro. */
     private void buildFaroDock() {
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int tileBg = custom ? CockpitThemes.tile(stId, LIGHT) : Faro.tile(LIGHT);
+        int pillIc = custom ? CockpitThemes.pillIcon(stId, LIGHT) : Faro.pillIcon(LIGHT);
+
         final int n = dockCount;
         int isz = prefs.getInt("dock_icon_size", 1);
         float ik = isz == 0 ? 0.86f : isz == 2 ? 1.12f : 1f;
-        float pillH = premPillH;
-        // centrada en el reproductor y sin pasarse de sus bordes: crece desde el centro hacia los lados
-        float areaX = faroPlX, areaW = faroPlW;
-        float itemW = Math.min(vertical ? 66 : 62, (areaW - 16) / n), pillW = itemW * n + 16;
-        float px = areaX + (areaW - pillW) / 2, py = dockTop;
-        View bg = new View(this);
-        bg.setBackground(new Faro.Card(LIGHT, Math.min(20, pillH * 0.36f) * s, 8 * s, s));
-        place(board, bg, px - 8, py - 8, pillW + 16, pillH + 16);
-        float tsz = Math.min(Math.min(itemW - 14, pillH - 12) * ik, pillH - 6);
         final boolean appStyle = "apps".equals(prefs.getString("dock_style", "circle"));
+
+        float pillH = premPillH, areaX = faroPlX, areaW = faroPlW;
+        float itemW = 0, pillW = 0, px = 0, py = dockTop;
+        float railInnerY = faroRailY + 8, slotH = 0, tsz;
+        if (custom) {
+            slotH = (faroRailH - 16) / n;
+            tsz = Math.min(Math.min(faroRailW - 14, slotH - 10) * ik, faroRailW - 8);
+            View bg = new View(this);
+            bg.setBackground(CockpitThemes.cardDrawable(stId, LIGHT, Math.min(22, faroRailW * 0.36f) * s, 8 * s, s));
+            place(board, bg, faroRailX - 8, faroRailY - 8, faroRailW + 16, faroRailH + 16);
+        } else {
+            itemW = Math.min(vertical ? 66 : 62, (areaW - 16) / n);
+            pillW = itemW * n + 16;
+            px = areaX + (areaW - pillW) / 2;
+            tsz = Math.min(Math.min(itemW - 14, pillH - 12) * ik, pillH - 6);
+            View bg = new View(this);
+            bg.setBackground(CockpitThemes.cardDrawable(stId, LIGHT, Math.min(20, pillH * 0.36f) * s, 8 * s, s));
+            place(board, bg, px - 8, py - 8, pillW + 16, pillH + 16);
+        }
+
         for (int i = 0; i < n; i++) {
             final int idx = i;
             String t = dockTarget(i);
@@ -5687,15 +6108,17 @@ public class Main extends Activity {
             } else {
                 String id = t.startsWith("fn:") ? t.substring(3) : dockDefault(i);
                 FrameLayout tile = new FrameLayout(this);
-                GradientDrawable d = round(Faro.tile(LIGHT), tsz * 0.26f);
-                if (LIGHT) d.setStroke(Math.max(1, (int) s), 0x14000000);
+                GradientDrawable d = round(tileBg, tsz * 0.26f);
+                if (CockpitThemes.NIGHTPULSE.equals(stId) || LIGHT) {
+                    d.setStroke(Math.max(1, (int) s), CockpitThemes.glassEdge(stId, LIGHT));
+                }
                 tile.setBackground(d);
                 View g;
                 float gs;
-                if ("apps".equals(id)) { g = new Faro.Icon(this, Faro.I_APPS, Faro.pillIcon(LIGHT)); gs = tsz * 0.52f; }
+                if ("apps".equals(id)) { g = new Faro.Icon(this, Faro.I_APPS, pillIc); gs = tsz * 0.52f; }
                 else {
                     ImageView iv = icon(dockFn(id)[2], tsz * 0.5f);
-                    iv.setColorFilter(Faro.pillIcon(LIGHT));
+                    iv.setColorFilter(pillIc);
                     g = iv;
                     gs = tsz * 0.5f;
                 }
@@ -5707,37 +6130,46 @@ public class Main extends Activity {
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams((int) (tsz * s), (int) (tsz * s));
             lp.gravity = Gravity.CENTER;
             b.addView(inner, lp);
-            place(board, b, px + 8 + itemW * i, py, itemW, pillH);
+            if (custom) {
+                place(board, b, faroRailX, railInnerY + slotH * i, faroRailW, slotH);
+            } else {
+                place(board, b, px + 8 + itemW * i, py, itemW, pillH);
+            }
             b.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { runDock(idx); } });
             b.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { dockMenu(idx, null); return true; } });
         }
     }
 
     /**
-     * Arriba del mapa: buscador discreto a la izquierda (con la navegación integrada abre «Ir a…»; si no, la app de
-     * navegación) y, a la derecha, centrar (zoom automático) y acercar/alejar. Sin GPS el buscador muestra el estado.
+     * Arriba del mapa: buscador discreto a la izquierda y, a la derecha, centrar y acercar/alejar.
      */
     private void buildFaroMapTop(FrameLayout card) {
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int pillBg = custom ? CockpitThemes.pill(stId, LIGHT) : (LIGHT ? 0xF2FFFFFF : 0xEB1C1E23);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+
         FrameLayout box = new FrameLayout(this);
         place(card, box, 0, 0, mapW, mapH);
         LinearLayout pill = new LinearLayout(this);
         pill.setGravity(Gravity.CENTER_VERTICAL);
         pill.setClickable(true);
         pill.setFocusable(false);
-        GradientDrawable pd = round(LIGHT ? 0xF2FFFFFF : 0xEB1C1E23, 12);
-        if (LIGHT) pd.setStroke(Math.max(1, (int) s), 0x14000000);
+        GradientDrawable pd = round(pillBg, 12);
+        if (custom) pd.setStroke(Math.max(1, (int) s), CockpitThemes.pillEdge(stId, LIGHT));
+        else if (LIGHT) pd.setStroke(Math.max(1, (int) s), 0x14000000);
         pill.setBackground(pd);
         pill.setPadding((int) (12 * s), 0, (int) (12 * s), 0);
-        faroPillIc = new Faro.Icon(this, Faro.I_SEARCH, TEXT);
+        faroPillIc = new Faro.Icon(this, Faro.I_SEARCH, custom ? CockpitThemes.accent(stId, LIGHT, txCol) : txCol);
         faroPillIc.setClickable(false);
         faroPillIc.setFocusable(false);
         pill.addView(faroPillIc, new LinearLayout.LayoutParams((int) (18 * s), (int) (18 * s)));
-        faroPillTv = tv("", 14, TEXT, false);
+        faroPillTv = tv("", 14, txCol, false);
         faroPillTv.setClickable(false);
         faroPillTv.setFocusable(false);
         faroPillTv.setPadding((int) (10 * s), 0, 0, 0);
         pill.addView(faroPillTv, new LinearLayout.LayoutParams(0, -2, 1f));
-        float pw = Math.min(250, Math.max(140, mapW - 12 - 12 - 40 - 12));
+        float pw = Math.min(230, Math.max(115, mapW - 12 - 100 - 10));
         place(box, pill, 12, 12, pw, 42);
         if (SDK >= 21) pill.setElevation(8f * s);
         pill.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
@@ -5745,7 +6177,7 @@ public class Main extends Activity {
         }});
         pill.setOnLongClickListener(new View.OnLongClickListener() { public boolean onLongClick(View v) { pickFor("nav_app", "Navegación"); return true; } });
         // centrar + acercar / alejar
-        FrameLayout loc = faroIconBtn(Faro.I_LOCATE, 40, 19, LIGHT ? 0xF2FFFFFF : 0xEB1C1E23);
+        FrameLayout loc = faroIconBtn(Faro.I_LOCATE, 40, 19, pillBg);
         place(box, loc, mapW - 12 - 40, 12, 40, 40);
         loc.setOnClickListener(new View.OnClickListener() { public void onClick(View v) {
             if (previewPlace != null) clearMapPlacePreview(true);
@@ -5753,8 +6185,9 @@ public class Main extends Activity {
         }});
         LinearLayout zc = new LinearLayout(this);
         zc.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable zd = round(LIGHT ? 0xF2FFFFFF : 0xEB1C1E23, 12);
-        if (LIGHT) zd.setStroke(Math.max(1, (int) s), 0x14000000);
+        GradientDrawable zd = round(pillBg, 12);
+        if (custom) zd.setStroke(Math.max(1, (int) s), CockpitThemes.pillEdge(stId, LIGHT));
+        else if (LIGHT) zd.setStroke(Math.max(1, (int) s), 0x14000000);
         zc.setBackground(zd);
         FrameLayout zin = faroIconBtn(Faro.I_PLUS, 40, 18, 0), zout = faroIconBtn(Faro.I_MINUS, 40, 18, 0);
         zc.addView(zin, new LinearLayout.LayoutParams((int) (40 * s), (int) (42 * s)));
@@ -5763,31 +6196,42 @@ public class Main extends Activity {
         zin.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { mapZoomBy(1); } });
         zout.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { mapZoomBy(-1); } });
         if (mapH < 200) zc.setVisibility(View.GONE);
-        mapTagTv = tv("", 13, TEXT, true);   // no se muestra: el estado del GPS va en el buscador
+        mapTagTv = tv("", 13, txCol, true);
         navSearchBtn = null;
         mapTagBox = box;
     }
 
-    /** Faro: botón de Android Auto / CarPlay en un recuadro neutro con borde fino; el acento solo en el ícono. */
+    /** Cockpit: botón de Android Auto / CarPlay en un recuadro neutro con borde fino; el acento solo en el ícono. */
     private void faroProj(View b, boolean accentIcon) {
-        if (LIGHT && b.getBackground() instanceof GradientDrawable) ((GradientDrawable) b.getBackground()).setStroke(Math.max(1, (int) s), 0x14000000);
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int accCol = custom ? CockpitThemes.accent(stId, LIGHT, RED) : RED;
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        if (b.getBackground() instanceof GradientDrawable) {
+            if (custom) ((GradientDrawable) b.getBackground()).setStroke(Math.max(1, (int) s), CockpitThemes.glassEdge(stId, LIGHT));
+            else if (LIGHT) ((GradientDrawable) b.getBackground()).setStroke(Math.max(1, (int) s), 0x14000000);
+        }
         if (b instanceof LinearLayout && ((LinearLayout) b).getChildAt(0) instanceof ImageView) {
             ImageView ic = (ImageView) ((LinearLayout) b).getChildAt(0);
-            if (accentIcon) ic.setColorFilter(RED); else ic.setColorFilter(TEXT);
+            if (accentIcon) ic.setColorFilter(accCol); else ic.setColorFilter(txCol);
         }
     }
 
     /** El texto del buscador: el estado del GPS si falta permiso/ubicación; si no, «Buscar lugar…». */
     private void updateFaroPill() {
         if (faroPillTv == null) return;
+        String stId = Prem.style;
+        boolean custom = CockpitThemes.isCustom(stId);
+        int txCol = custom ? CockpitThemes.text(stId, LIGHT, TEXT) : TEXT;
+        int muCol = custom ? CockpitThemes.muted(stId, LIGHT, MUTED) : MUTED;
         boolean fix = mapHasFix();
         if (!fix && gpsState() != 0) {
             faroPillTv.setText(mapTagTv != null ? mapTagTv.getText() : "");
-            faroPillTv.setTextColor(MUTED);
+            faroPillTv.setTextColor(muCol);
             faroPillIc.set(Faro.I_LOCATE);
         } else {
             faroPillTv.setText(I18n.t("Buscar lugar…"));
-            faroPillTv.setTextColor(TEXT);
+            faroPillTv.setTextColor(txCol);
             faroPillIc.set(Faro.I_SEARCH);
         }
     }
@@ -6226,7 +6670,7 @@ public class Main extends Activity {
     }
 
     private void premiumCell(LinearLayout body, boolean portrait, final String id) {
-        final boolean unlocked = premiumUnlocked(id), inUse = premiumActive() && id.equals(prefs.getString("premium_theme", null));
+        final boolean unlocked = premiumUnlocked(id), inUse = premiumActive() && id.equals(savedPremiumTheme());
         LinearLayout cell = new LinearLayout(this);
         cell.setOrientation(portrait ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
         cell.setBackground(round(inUse ? RED_DARK : CARD, 16));
@@ -6245,6 +6689,7 @@ public class Main extends Activity {
             boolean sel = inUse && (i == 1) == LIGHT;
             if (Cobalto.ID.equals(id)) { Cobalto.Thumb t = new Cobalto.Thumb(this, s, portrait, i == 1); t.selected = sel; th = t; }
             else if (Faro.ID.equals(id)) { Faro.Thumb t = new Faro.Thumb(this, s, portrait, i == 1); t.selected = sel; th = t; }
+            else if (CockpitThemes.isCustom(id)) { CockpitThemes.Thumb t = new CockpitThemes.Thumb(this, id, s, portrait, i == 1); t.selected = sel; th = t; }
             else { Aurora.Thumb t = new Aurora.Thumb(this, s, portrait, i == 1); t.selected = sel; th = t; }
             col.addView(th, new LinearLayout.LayoutParams(-1, -2));
             TextView cap = tv(i == 0 ? "Oscuro" : "Claro", 11, MUTED, false);
@@ -6793,7 +7238,12 @@ public class Main extends Activity {
 
         sheet.addView(bar, new LinearLayout.LayoutParams(-1, -2));
 
-        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        final TextView searchStatusTv = tv("", 11, RED, true);
+        searchStatusTv.setPadding((int) (6 * s), (int) (7 * s), (int) (6 * s), (int) (2 * s));
+        searchStatusTv.setVisibility(View.GONE);
+        sheet.addView(searchStatusTv, new LinearLayout.LayoutParams(-1, -2));
+
+        final android.widget.ScrollView sc = new android.widget.ScrollView(this);
         final LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setPadding(0, (int) (10 * s), 0, 0);
@@ -6808,9 +7258,32 @@ public class Main extends Activity {
         final Runnable[] renderDefaults = new Runnable[1];
         final Runnable[] runQuery = new Runnable[1];
 
-        final Nav.SearchCb inlineCb = new Nav.SearchCb() {
-            public void onResult(final List<Nav.Place> places, final String error) {
+        final Nav.SearchCb2 inlineCb = new Nav.SearchCb2() {
+            public void onResult(final List<Nav.Place> places, final String error, final boolean finalResult, final boolean offlineOnly) {
                 if (isFinishing() || mapSearchOverlay != scrim) return;
+                final int prevScrollY = sc.getScrollY();
+
+                if (!finalResult) {
+                    searchStatusTv.setTextColor(RED);
+                    searchStatusTv.setText(places != null && !places.isEmpty()
+                            ? I18n.t("Índice sin conexión · Buscando en línea…")
+                            : I18n.t("Buscando…"));
+                    searchStatusTv.setVisibility(View.VISIBLE);
+                    if (places == null || places.isEmpty()) {
+                        body.removeAllViews();
+                        TextView loading = tv(I18n.t("Buscando…"), 13, MUTED, false);
+                        loading.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
+                        body.addView(loading);
+                        return;
+                    }
+                } else if (offlineOnly) {
+                    searchStatusTv.setTextColor(MUTED);
+                    searchStatusTv.setText(I18n.t("Sin conexión · Índice local"));
+                    searchStatusTv.setVisibility(View.VISIBLE);
+                } else {
+                    searchStatusTv.setVisibility(View.GONE);
+                }
+
                 body.removeAllViews();
                 if (places == null) {
                     TextView msg = tv(error != null ? error : I18n.t("No se pudo buscar"), 13, MUTED, false);
@@ -6876,6 +7349,11 @@ public class Main extends Activity {
                         }
                     });
                 }
+                if (finalResult && prevScrollY > 0) {
+                    sc.post(new Runnable() {
+                        public void run() { sc.scrollTo(0, prevScrollY); }
+                    });
+                }
             }
         };
 
@@ -6885,15 +7363,18 @@ public class Main extends Activity {
                 if (q.length() == 0) { renderDefaults[0].run(); return; }
                 final int mySeq = ++searchSeq[0];
                 body.removeAllViews();
+                searchStatusTv.setTextColor(RED);
+                searchStatusTv.setText(I18n.t("Buscando…"));
+                searchStatusTv.setVisibility(View.VISIBLE);
                 TextView loading = tv(I18n.t("Buscando…"), 13, MUTED, false);
                 loading.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
                 body.addView(loading);
                 double bLat = Double.isNaN(wLat) ? mapCenterLat() : wLat;
                 double bLon = Double.isNaN(wLon) ? mapCenterLon() : wLon;
-                Nav.search(Main.this, q, bLat, bLon, useMph(), new Nav.SearchCb() {
-                    public void onResult(List<Nav.Place> places, String error) {
+                Nav.searchProgressive(Main.this, q, bLat, bLon, useMph(), new Nav.SearchCb2() {
+                    public void onResult(List<Nav.Place> places, String error, boolean finalResult, boolean offlineOnly) {
                         if (mySeq != searchSeq[0]) return;
-                        inlineCb.onResult(places, error);
+                        inlineCb.onResult(places, error, finalResult, offlineOnly);
                     }
                 });
             }
@@ -6902,6 +7383,7 @@ public class Main extends Activity {
         renderDefaults[0] = new Runnable() {
             public void run() {
                 searchSeq[0]++;
+                searchStatusTv.setVisibility(View.GONE);
                 body.removeAllViews();
                 if (!insertActive && !pendingStops.isEmpty()) {
                     LinearLayout hdrRow = new LinearLayout(Main.this);
@@ -6995,13 +7477,16 @@ public class Main extends Activity {
                             double bLon = Double.isNaN(wLon) ? mapCenterLon() : wLon;
                             final int mySeq = ++searchSeq[0];
                             body.removeAllViews();
+                            searchStatusTv.setTextColor(RED);
+                            searchStatusTv.setText(I18n.t("Buscando…"));
+                            searchStatusTv.setVisibility(View.VISIBLE);
                             TextView loading = tv(I18n.t("Buscando…"), 13, MUTED, false);
                             loading.setPadding((int) (6 * s), (int) (12 * s), (int) (6 * s), (int) (12 * s));
                             body.addView(loading);
-                            Nav.searchCategory(Main.this, cKey, bLat, bLon, useMph(), new Nav.SearchCb() {
-                                public void onResult(List<Nav.Place> places, String error) {
+                            Nav.searchCategoryProgressive(Main.this, cKey, bLat, bLon, useMph(), new Nav.SearchCb2() {
+                                public void onResult(List<Nav.Place> places, String error, boolean finalResult, boolean offlineOnly) {
                                     if (mySeq != searchSeq[0]) return;
-                                    inlineCb.onResult(places, error);
+                                    inlineCb.onResult(places, error, finalResult, offlineOnly);
                                 }
                             });
                         }
@@ -7043,11 +7528,11 @@ public class Main extends Activity {
                 clrInput.setVisibility(q.length() > 0 ? View.VISIBLE : View.GONE);
                 if (q.length() == 0) {
                     renderDefaults[0].run();
-                } else if (q.length() >= 3) {
+                } else if (q.length() >= 2) {
                     pendingSearch[0] = new Runnable() {
                         public void run() { runQuery[0].run(); }
                     };
-                    h.postDelayed(pendingSearch[0], 450);
+                    h.postDelayed(pendingSearch[0], 300);
                 }
             }
         });
@@ -7214,10 +7699,6 @@ public class Main extends Activity {
         if (p == null) return;
         previewPlace = p;
         if (mlMap != null) mlMap.setPreviewPlace(p);
-        if (liveMap != null) {
-            liveMap.setPreviewPlace(p);
-            liveMap.setVisibility(View.VISIBLE);
-        }
         updateMapControls();
         if (mapCardView == null) return;
         if (mapPreviewCard != null) {
@@ -7229,11 +7710,18 @@ public class Main extends Activity {
         if (mapConnNavBtn != null) mapConnNavBtn.setVisibility(View.GONE);
         if (mapConnGauge != null) mapConnGauge.setVisibility(View.GONE);
 
-        final boolean faroT = premium && Prem.faro();
+        final int cardBg = LIGHT ? 0xF7FFFFFF : 0xF5151923;
+        final int strokeCol = LIGHT ? 0x240F172A : 0x2EFFFFFF;
+        final int titleCol = LIGHT ? 0xFF14161B : 0xFFF4F7FC;
+        final int subCol = LIGHT ? 0xFF525C6A : 0xFFAAB6C8;
+        final int btnBg = LIGHT ? 0xFFE6EAF0 : 0xFF252B38;
+        final int btnStroke = LIGHT ? 0x1A0F172A : 0x22FFFFFF;
+        final int accCol = (premium && CockpitThemes.isCustom(Prem.style)) ? CockpitThemes.accent(Prem.style, LIGHT, RED) : RED;
+
         LinearLayout cardBox = new LinearLayout(this);
         cardBox.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable bg = round(faroT ? Faro.glass(LIGHT) : (CARD & 0x00FFFFFF) | 0xF2000000, 16);
-        if (LIGHT) bg.setStroke(Math.max(1, (int) s), 0x18000000);
+        GradientDrawable bg = round(cardBg, 16);
+        bg.setStroke(Math.max(1, (int) s), strokeCol);
         cardBox.setBackground(bg);
         cardBox.setPadding((int) (12 * s), (int) (10 * s), (int) (12 * s), (int) (10 * s));
         cardBox.setClickable(true);
@@ -7242,14 +7730,14 @@ public class Main extends Activity {
         top.setGravity(Gravity.CENTER_VERTICAL);
 
         ImageView pinIc = icon("location_on", 20);
-        pinIc.setColorFilter(RED);
+        pinIc.setColorFilter(accCol);
         LinearLayout.LayoutParams pilp = new LinearLayout.LayoutParams((int) (20 * s), (int) (20 * s));
         pilp.rightMargin = (int) (8 * s);
         top.addView(pinIc, pilp);
 
         LinearLayout info = new LinearLayout(this);
         info.setOrientation(LinearLayout.VERTICAL);
-        TextView titleTv = tv("", 15, TEXT, true);
+        TextView titleTv = tv("", 15, titleCol, true);
         titleTv.setText(p.name);
         info.addView(titleTv);
         String dist = placeDistLabel(p);
@@ -7257,7 +7745,7 @@ public class Main extends Activity {
         if (dist.length() > 0 && subTxt.length() > 0) subTxt = dist + " · " + subTxt;
         else if (dist.length() > 0) subTxt = dist;
         if (subTxt.length() > 0) {
-            TextView subTv = tv("", 12, MUTED, false);
+            TextView subTv = tv("", 12, subCol, false);
             subTv.setText(subTxt);
             subTv.setPadding(0, (int) (2 * s), 0, 0);
             info.addView(subTv);
@@ -7265,16 +7753,18 @@ public class Main extends Activity {
         top.addView(info, new LinearLayout.LayoutParams(0, -2, 1f));
 
         final ImageView favIc = icon("star", 19);
-        favIc.setColorFilter(Nav.isFavorite(this, p) ? RED : MUTED);
+        favIc.setColorFilter(Nav.isFavorite(this, p) ? accCol : subCol);
         FrameLayout favBtn = new FrameLayout(this);
-        favBtn.setBackground(round(BTN, 15));
+        GradientDrawable favGd = round(btnBg, 15);
+        favGd.setStroke(Math.max(1, (int) s), btnStroke);
+        favBtn.setBackground(favGd);
         FrameLayout.LayoutParams filp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
         filp.gravity = Gravity.CENTER;
         favBtn.addView(favIc, filp);
         favBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 boolean added = Nav.toggleFavorite(Main.this, p);
-                favIc.setColorFilter(added ? RED : MUTED);
+                favIc.setColorFilter(added ? accCol : subCol);
                 toast(added ? "Añadido a favoritos" : "Quitado de favoritos");
             }
         });
@@ -7282,9 +7772,11 @@ public class Main extends Activity {
         fblp.leftMargin = (int) (8 * s);
         top.addView(favBtn, fblp);
 
-        TextView closeBtn = tv("✕", 14, TEXT, true);
+        TextView closeBtn = tv("✕", 14, titleCol, true);
         closeBtn.setGravity(Gravity.CENTER);
-        closeBtn.setBackground(round(BTN, 15));
+        GradientDrawable closeGd = round(btnBg, 15);
+        closeGd.setStroke(Math.max(1, (int) s), btnStroke);
+        closeBtn.setBackground(closeGd);
         closeBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { clearMapPlacePreview(true); }
         });
@@ -7301,7 +7793,7 @@ public class Main extends Activity {
 
         LinearLayout navGo = new LinearLayout(this);
         navGo.setGravity(Gravity.CENTER);
-        navGo.setBackground(round(RED, 12));
+        navGo.setBackground(round(accCol, 12));
         navGo.setPadding((int) (12 * s), (int) (8 * s), (int) (12 * s), (int) (8 * s));
         ImageView navIc = icon("navigation", 16);
         navIc.setColorFilter(Color.WHITE);
@@ -7317,9 +7809,11 @@ public class Main extends Activity {
         });
         actions.addView(navGo, new LinearLayout.LayoutParams(0, (int) (36 * s), 1.4f));
 
-        TextView addStopBtn = tv("+ Parada", 12, TEXT, true);
+        TextView addStopBtn = tv("+ Parada", 12, titleCol, true);
         addStopBtn.setGravity(Gravity.CENTER);
-        addStopBtn.setBackground(round(BTN, 12));
+        GradientDrawable stopGd = round(btnBg, 12);
+        stopGd.setStroke(Math.max(1, (int) s), btnStroke);
+        addStopBtn.setBackground(stopGd);
         addStopBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 if (Nav.active != null) {
@@ -7337,9 +7831,11 @@ public class Main extends Activity {
         actions.addView(addStopBtn, sblp);
 
         FrameLayout simGo = new FrameLayout(this);
-        simGo.setBackground(round(BTN, 12));
+        GradientDrawable simGd = round(btnBg, 12);
+        simGd.setStroke(Math.max(1, (int) s), btnStroke);
+        simGo.setBackground(simGd);
         ImageView simIc = icon("play_arrow", 18);
-        simIc.setColorFilter(RED);
+        simIc.setColorFilter(accCol);
         FrameLayout.LayoutParams silp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
         silp.gravity = Gravity.CENTER;
         simGo.addView(simIc, silp);
@@ -7354,24 +7850,6 @@ public class Main extends Activity {
         sglp.leftMargin = (int) (8 * s);
         actions.addView(simGo, sglp);
 
-        FrameLayout polGo = new FrameLayout(this);
-        polGo.setBackground(round(BTN, 12));
-        polGo.setContentDescription(I18n.t("Reportar policía"));
-        ImageView polIc = icon("verified_user", 18);
-        polIc.setColorFilter(0xFF2563EB);
-        FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams((int) (18 * s), (int) (18 * s));
-        plp.gravity = Gravity.CENTER;
-        polGo.addView(polIc, plp);
-        polGo.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                clearMapPlacePreview(false);
-                reportPoliceAt(p.lat, p.lon, p.name);
-            }
-        });
-        LinearLayout.LayoutParams pglp = new LinearLayout.LayoutParams((int) (42 * s), (int) (36 * s));
-        pglp.leftMargin = (int) (8 * s);
-        actions.addView(polGo, pglp);
-
         cardBox.addView(actions, aclp);
 
         FrameLayout wrapper = new FrameLayout(this);
@@ -7383,6 +7861,8 @@ public class Main extends Activity {
         lp.bottomMargin = (int) (12 * s);
         mapPreviewCard = wrapper;
         mapCardView.addView(wrapper, lp);
+        if (SDK >= 21) wrapper.setElevation(10f * s);
+        wrapper.bringToFront();
     }
 
     private void clearMapPlacePreview(boolean snapBack) {
@@ -7396,7 +7876,6 @@ public class Main extends Activity {
         if (mapConnNavBtn != null) mapConnNavBtn.setVisibility(mapConnNavBtnVisible ? View.VISIBLE : View.GONE);
         if (mapConnGauge != null) mapConnGauge.setVisibility(View.VISIBLE);
         if (mlMap != null) mlMap.clearPreview(snapBack);
-        if (liveMap != null) liveMap.setPreviewPlace(null);
         updateMapControls();
     }
 
@@ -7521,8 +8000,17 @@ public class Main extends Activity {
     private void activateChosenRoute(Nav.Route r) {
         Nav.activate(this, r);
         Nav.announceStart(this, r);
+        boolean autoZoomOn = prefs.getBoolean("map_auto_zoom", true);
+        LiveMapView.view3d = true;
+        LiveMapView.tiltAngle = Nav.previewMode ? manualMapAngle() : applyNavPitch();
         LiveMapView.headingUp = true;
+        mapSyncTilt();
         mapSyncHeading();
+        if (mlMap != null && !Nav.previewMode && !mlMap.hasFix()) {
+            double sLat = !Double.isNaN(wLat) ? wLat : (r.pts != null && r.pts.length >= 2 ? r.pts[0] : Double.NaN);
+            double sLon = !Double.isNaN(wLon) ? wLon : (r.pts != null && r.pts.length >= 2 ? r.pts[1] : Double.NaN);
+            if (!Double.isNaN(sLat) && !Double.isNaN(sLon)) mlMap.setPosition(sLat, sLon, Float.NaN, 0f);
+        }
         mapSyncRoute();
         updateNavHud();
         if (autoSimPending) {
@@ -7531,10 +8019,14 @@ public class Main extends Activity {
             return;
         }
         if (Nav.previewMode) {
+            if (mlMap != null) mlMap.setNavActive(true);
             mapSetOverview(true);
             toast("Vista previa de ruta (sin GPS)");
         } else {
-            mapRecenter();
+            if (mlMap != null) {
+                mlMap.setAutoZoom(autoZoomOn);
+                mlMap.startNavCamera(LiveMapView.tiltAngle, autoZoomOn);
+            }
         }
         if (!r.incidents.isEmpty()) {
             toast(r.incidents.size() + " " + I18n.t(r.incidents.size() == 1 ? "incidente en la ruta" : "incidentes en la ruta"));
@@ -7651,6 +8143,9 @@ public class Main extends Activity {
         simLastOk = false;
         Nav.stop(this);
         LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
+        LiveMapView.tiltAngle = manualMapAngle();
+        if (mlMap != null) mlMap.setNavActive(false);
+        mapSyncTilt();
         mapSyncHeading();
         mapSyncRoute();
         updateNavHud();
@@ -7659,11 +8154,10 @@ public class Main extends Activity {
     private void openNavMenu() {
         final Nav.Route r = Nav.active;
         if (r == null) { openNavSearch(); return; }
-        final boolean voice = prefs.getBoolean("nav_voice", true);
+        final boolean soundOn = Nav.isSoundOn(this);
         final boolean clockEta = prefs.getBoolean("nav_eta_clock", false);
         final boolean heading = LiveMapView.headingUp;
         final boolean ovNow = mapIsOverview();
-        final boolean is3dNow = LiveMapView.view3d;
         final Nav.Place curDest = new Nav.Place();
         curDest.name = r.destName != null && r.destName.length() > 0
                 ? r.destName : String.format(java.util.Locale.US, "%.5f, %.5f", r.destLat, r.destLon);
@@ -7705,27 +8199,22 @@ public class Main extends Activity {
                 updateNavHud();
             }
         });
-        labels.add(I18n.t(voice ? "Silenciar voz de guía" : "Activar voz de guía"));
+        labels.add(I18n.t(soundOn ? "Silenciar voz y alertas" : "Activar voz y alertas"));
         actions.add(new Runnable() {
             public void run() {
-                prefs.edit().putBoolean("nav_voice", !voice).apply();
-                toast(!voice ? "Voz activada" : "Voz silenciada");
+                boolean next = !soundOn;
+                Nav.setSoundOn(Main.this, next);
+                updateMapControls();
+                toast(next ? "Sonido activado" : "Sonido silenciado");
             }
         });
         labels.add(I18n.t(heading ? "Vista Norte arriba" : "Vista en dirección de marcha"));
         actions.add(new Runnable() {
             public void run() {
-                LiveMapView.headingUp = !heading;
+                boolean next = !heading;
+                prefs.edit().putBoolean("map_heading", next).apply();
+                LiveMapView.headingUp = next;
                 mapSyncHeading();
-            }
-        });
-        labels.add(I18n.t(is3dNow ? "Vista 2D" : "Vista 3D"));
-        actions.add(new Runnable() {
-            public void run() {
-                boolean next = !is3dNow;
-                prefs.edit().putBoolean("map_3d", next).apply();
-                LiveMapView.view3d = next;
-                mapSyncTilt();
             }
         });
         labels.add(I18n.t("Recalcular ruta"));
@@ -8024,8 +8513,8 @@ public class Main extends Activity {
             navCurUnitTv.setText(mph ? "MPH" : "KM/H");
             navCurUnitTv.setTextColor(over ? 0xFFEF4444 : MUTED);
         }
-        boolean faroT = premium && Prem.faro();
-        GradientDrawable bg = round(faroT ? Faro.glass(LIGHT) : ((CARD & 0x00FFFFFF) | 0xEB000000), 16);
+        boolean faroT = premium && Prem.cockpit();
+        GradientDrawable bg = round(faroT ? CockpitThemes.glass(Prem.style, LIGHT) : ((CARD & 0x00FFFFFF) | 0xEB000000), 16);
         bg.setStroke(Math.max(1, (int) ((over ? 1.5f : 1f) * s)), over ? 0xAAEF4444 : (LIGHT ? 0x1F000000 : 0x24FFFFFF));
         speedHudBox.setBackground(bg);
 
@@ -8663,10 +9152,22 @@ public class Main extends Activity {
                             toast("Tráfico en vivo activado");
                         }
                         LiveMapView.clearTrafficCache();
-                        if (liveMap != null) liveMap.invalidate();
                     }
                     if ("extra_actions".equals(key)) {
                         try { nowPlaying.stop(); nowPlaying.start(); } catch (Throwable ignored) { }
+                    }
+                    if ("waze_feed_url".equals(key)) {
+                        RoadAlerts.syncWazeFeedAsync(Main.this, true, mapCenterLat(), mapCenterLon(), new RoadAlerts.SyncCb() {
+                            public void onComplete(RoadAlerts.StatusSnapshot snap) {
+                                if (isFinishing()) return;
+                                if (snap.lastError != null && snap.lastError.length() > 0) {
+                                    toast(I18n.t("Error de sincronización") + ": " + snap.lastError);
+                                } else {
+                                    toast(I18n.t(snap.feedAlerts + " alertas · " + snap.feedJams + " tramos"));
+                                }
+                                if (settingsView != null) showSettings(settingsCat);
+                            }
+                        });
                     }
                     builtW = 0;
                     build(root.getWidth(), root.getHeight());
@@ -10338,15 +10839,18 @@ public class Main extends Activity {
     private void catHome(LinearLayout body) {
         if (premiumActive()) {
             LinearLayout pn = section(body, "Tema premium");
-            String pid = prefs.getString("premium_theme", Aurora.ID);
+            String pid = savedPremiumTheme();
+            if (pid == null) pid = Aurora.ID;
             LinearLayout r = rowBase(pn, I18n.t(Prem.name(pid)) + " · " + I18n.t("En uso"), "El tema arma la pantalla de inicio. Las tarjetas, la barra y el velocímetro de aquí se usan otra vez al quitarlo en Personalización.");
             r.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { showSettings(C_STYLE); } });
-            if (Faro.ID.equals(pid)) {
-                final String[] cols = Faro.CAR_COLORS;
-                int ci = Math.max(0, java.util.Arrays.asList(cols).indexOf(Faro.car(prefs.getString("faro_car", "silver"))));
-                choice(pn, "Color del carro", "El carro del tema Faro, visto desde arriba. También se cambia con una presión larga sobre el carro.", Faro.CAR_NAMES, ci, new IntCb() { public void on(int i) {
-                    prefs.edit().putString("faro_car", cols[i]).apply(); rebuild(); showSettings(C_HOME);
-                }});
+            if (CockpitThemes.isCockpit(pid)) {
+                if (Faro.ID.equals(pid)) {
+                    final String[] cols = Faro.CAR_COLORS;
+                    int ci = Math.max(0, java.util.Arrays.asList(cols).indexOf(Faro.car(prefs.getString("faro_car", Faro.CAR_ALMERA_N17))));
+                    choice(pn, "Color del carro", "El carro del tema Faro, visto desde arriba. También se cambia con una presión larga sobre el carro.", Faro.CAR_NAMES, ci, new IntCb() { public void on(int i) {
+                        prefs.edit().putString("faro_car", cols[i]).apply(); rebuild(); showSettings(C_HOME);
+                    }});
+                }
                 segmented(pn, "Intensidad del mapa", "Qué tan visible es el mapa sobre el fondo. Auto lo pone más fuerte en las pantallas sencillas de los radios y suave en las de alta gama. Súbela si al sol no se ve bien.",
                     new String[]{"Auto", "Baja", "Media", "Alta"}, Math.max(-1, Math.min(2, prefs.getInt("faro_mapa", -1))) + 1, new IntCb() { public void on(int i) {
                         if (i == 0) prefs.edit().remove("faro_mapa").apply(); else prefs.edit().putInt("faro_mapa", i - 1).apply();
@@ -10563,35 +11067,38 @@ public class Main extends Activity {
             edit("city_manual", "Ciudad (vacío = automática por GPS)", ""));
         LinearLayout mo = section(body, "Mapa");
         LinearLayout ml = mo, nv = mo;
-        segmented(mo, "Motor del mapa", "MapLibre GL JS ofrece 3D fluido; OpenStreetMap funciona como respaldo y automáticamente sin internet si tienes un archivo .map",
-            new String[]{"MapLibre 3D", "OpenStreetMap"}, "osm".equals(prefs.getString("map_engine", "maplibre")) ? 1 : 0,
-            new IntCb() { public void on(int i) {
-                prefs.edit().putString("map_engine", i == 1 ? "osm" : "maplibre").apply();
-                mapLibreFallback = false;
-                rebuild();
-                showSettings(settingsCat);
-            }});
         segmented(mo, "El mapa apunta", "Según tu dirección: gira con el carro mientras te mueves", new String[]{"Norte arriba", "Según tu dirección"},
             prefs.getBoolean("map_heading", false) ? 1 : 0, new IntCb() { public void on(int i) {
                 prefs.edit().putBoolean("map_heading", i == 1).apply(); LiveMapView.headingUp = i == 1;
                 mapSyncHeading(); showSettings(settingsCat);
             }});
-        segmented(mo, "Modo del mapa", "3D: vista inclinada en perspectiva automática", new String[]{"2D", "3D"},
-            prefs.getBoolean("map_3d", false) ? 1 : 0, new IntCb() { public void on(int i) {
-                prefs.edit().putBoolean("map_3d", i == 1).apply();
-                LiveMapView.view3d = i == 1;
+        int curAngle = manualMapAngle();
+        int angleIdx = curAngle == 60 ? 1 : 0;
+        segmented(mo, "Ángulo del mapa",
+            "Edificios 3D siempre activos",
+            new String[]{"30°", "60°"}, angleIdx, new IntCb() { public void on(int i) {
+                int deg = i == 1 ? 60 : 30;
+                prefs.edit().putInt("map_angle", deg).apply();
+                LiveMapView.view3d = true;
+                LiveMapView.tiltAngle = (Nav.active != null && !Nav.previewMode) ? applyNavPitch() : deg;
                 mapSyncTilt();
                 showSettings(settingsCat);
             }});
-        int curAngle = prefs.getInt("map_angle", 45);
-        int angleIdx = curAngle <= 35 ? 0 : curAngle >= 55 ? 2 : 1;
-        segmented(mo, "Ángulo del mapa",
-            prefs.getBoolean("map_3d", false) ? "Inclinación de la cámara en modo 3D" : "Se aplica al activar el modo 3D",
-            new String[]{"30°", "45°", "60°"}, angleIdx, new IntCb() { public void on(int i) {
-                int deg = i == 0 ? 30 : i == 2 ? 60 : 45;
-                prefs.edit().putInt("map_angle", deg).apply();
-                LiveMapView.tiltAngle = deg;
-                mapSyncTilt();
+        toggle(mo, "Ángulo automático en navegación",
+            "En navegación paso a paso inclina a 60°; al detenerse vuelve al ángulo elegido",
+            prefs.getBoolean("map_auto_angle", true), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("map_auto_angle", i == 1).apply();
+                if (Nav.active != null && !Nav.previewMode) {
+                    LiveMapView.tiltAngle = applyNavPitch();
+                    mapSyncTilt();
+                }
+                showSettings(settingsCat);
+            }});
+        toggle(mo, "Zoom automático en navegación",
+            "Acercamiento automático al iniciar ruta y ajuste según la velocidad",
+            prefs.getBoolean("map_auto_zoom", true), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("map_auto_zoom", i == 1).apply();
+                if (mlMap != null) mlMap.setAutoZoom(i == 1);
                 showSettings(settingsCat);
             }});
         toggle(ml, "Mapa en vivo", "Apágalo si la pantalla va lenta: queda un mapa de adorno y el velocímetro sigue funcionando", prefs.getBoolean("map_live", true), new IntCb() { public void on(int i) {
@@ -10601,13 +11108,12 @@ public class Main extends Activity {
             new Runnable() { public void run() { pickFor("nav_app", "Navegación"); } });
         final boolean navIn = "internal".equals(prefs.getString("nav_app", null));
         if (navIn) {
-            toggle(nv, "Voz de navegación", "Indicaciones paso a paso habladas durante el recorrido", prefs.getBoolean("nav_voice", true), new IntCb() { public void on(int i) {
-                prefs.edit().putBoolean("nav_voice", i == 1).apply(); showSettings(settingsCat);
+            toggle(nv, "Voz de navegación", "Indicaciones paso a paso habladas durante el recorrido", Nav.isSoundOn(this), new IntCb() { public void on(int i) {
+                Nav.setSoundOn(Main.this, i == 1); updateMapControls(); showSettings(settingsCat);
             }});
             toggle(nv, "Tráfico en vivo", "Muestra congestión en el mapa y evita trancones (usa clave gratis de TomTom)", prefs.getBoolean("map_traffic", false), new IntCb() { public void on(int i) {
                 prefs.edit().putBoolean("map_traffic", i == 1).apply();
                 LiveMapView.clearTrafficCache();
-                if (liveMap != null) liveMap.invalidate();
                 showSettings(settingsCat);
             }});
             String ttKey = prefs.getString("tomtom_key", "").trim();
@@ -10634,12 +11140,11 @@ public class Main extends Activity {
                 prefs.edit().putBoolean("nav_speed_alert", i == 1).apply(); updateNavHud(); showSettings(settingsCat);
             }});
             boolean waveAlertsOn = prefs.getBoolean("nav_speed_cams", true)
-                || prefs.getBoolean("nav_inc_alerts", true)
-                || prefs.getBoolean("nav_police_alerts", true);
-            toggle(nvp, "Alertas de radares, policía e incidentes", "Ondas y avisos al acercarse a radares, policía o incidentes", waveAlertsOn, new IntCb() { public void on(int i) {
+                || prefs.getBoolean("nav_inc_alerts", true);
+            toggle(nvp, "Alertas de radares e incidentes", "Ondas y avisos al acercarse a radares o incidentes", waveAlertsOn, new IntCb() { public void on(int i) {
                 boolean on = i == 1;
                 prefs.edit().putBoolean("nav_speed_cams", on).putBoolean("nav_inc_alerts", on)
-                    .putBoolean("nav_incidents", on).putBoolean("nav_police_alerts", on).apply();
+                    .putBoolean("nav_incidents", on).apply();
                 updateNavHud();
                 showSettings(settingsCat);
             }});
@@ -10649,6 +11154,13 @@ public class Main extends Activity {
         }
         LinearLayout off = section(body, "Mapa sin conexión");
         LiveMapView.loadFile(this);
+        toggle(off, "Mapa sin conexión en MapLibre", "Usa el archivo .map local dentro de MapLibre sin internet",
+            prefs.getBoolean("maplibre_offline", false), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("maplibre_offline", i == 1).apply();
+                syncMapLibreOfflineState();
+                updateMapTag();
+                showSettings(settingsCat);
+            }});
         String mf = prefs.getString("map_file", "");
         row(off, "Archivo del mapa", "Un archivo .map (p. ej. colombia.map) en la memoria de la pantalla o en una USB: el mapa se ve sin internet",
             mf.length() == 0 ? "Ninguno" : LiveMapView.fileMap != null ? new File(mf).getName() : "Error",
@@ -10666,6 +11178,117 @@ public class Main extends Activity {
         off.addView(dlStatusTv);
         refreshDownloadStatus();
         row(off, "¿Dónde consigo el mapa?", "Mapas gratis de OpenStreetMap por país", null, new Runnable() { public void run() { mapHowTo(); } });
+        final PoiIndex.Stats poiStats = PoiIndex.getStats(this);
+        String poiVal = poiStats.indexing
+                ? I18n.t("Indexando…")
+                : I18n.t(poiStats.total() + " lugares");
+        String poiSub = I18n.t("Base: " + poiStats.builtinCount
+                + " · Caché: " + poiStats.cacheCount
+                + " · Mapa .map: " + poiStats.mapCount);
+        row(off, "Índice POI sin conexión", poiSub, poiVal, new Runnable() { public void run() {
+            ArrayList<String> opts = new ArrayList<String>();
+            if (LiveMapView.fileMap != null) opts.add(I18n.t("Reindexar archivo .map"));
+            opts.add(I18n.t("Limpiar caché de búsquedas"));
+            new TB(Main.this, dlg()).raw()
+                .setTitle(I18n.t("Índice POI sin conexión"))
+                .setItems(opts.toArray(new String[0]), new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        boolean hasMap = LiveMapView.fileMap != null;
+                        if (hasMap && w == 0) {
+                            PoiIndex.indexMapFileAsync(Main.this, LiveMapView.fileMap, wLat, wLon, true);
+                            toast(I18n.t("Indexando POIs del mapa…"));
+                            h.postDelayed(new Runnable() { public void run() {
+                                if (settingsView != null) showSettings(settingsCat);
+                            }}, 1200);
+                        } else {
+                            PoiIndex.clearCache(Main.this);
+                            toast(I18n.t("Caché de búsquedas limpia"));
+                            showSettings(settingsCat);
+                        }
+                    }
+                })
+                .setNegativeButton(I18n.t("Cancelar"), null)
+                .show();
+        }});
+        LinearLayout hz = section(body, "Alertas viales en tiempo real");
+        toggle(hz, "Alertas viales en el mapa",
+            "Muestra accidentes, baches, peligros, atascos e iconos en tiempo real",
+            RoadAlerts.isAlertsEnabled(this), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("alerts_enabled", i == 1).apply();
+                syncMapRoadAlerts();
+                updateWaveAlerts(useMph());
+                updateHazardsPill();
+                if (i == 1 && RoadAlerts.hasConfiguredFeed(Main.this)) {
+                    RoadAlerts.syncWazeFeedAsync(Main.this, false, mapCenterLat(), mapCenterLon(), null);
+                }
+                showSettings(settingsCat);
+            }});
+        String wUrl = prefs.getString("waze_feed_url", "").trim();
+        row(hz, "Servidor waze-scraper o feed GeoJSON",
+            "URL base (ej. http://192.168.1.50:8000) o feed .geojson/.json",
+            wUrl.length() > 0 ? wUrl : "Sin configurar",
+            edit("waze_feed_url", "URL waze-scraper (http://IP:8000) o GeoJSON", ""));
+        int pollMins = prefs.getInt("waze_poll_minutes", 2);
+        int pollIdx = pollMins == 1 ? 0 : pollMins == 2 ? 1 : pollMins == 5 ? 2 : 3;
+        choice(hz, "Frecuencia de actualización",
+            "Cada cuánto consultar alertas y tráfico cercanos",
+            new String[]{"1 min", "2 min", "5 min", "Manual"}, pollIdx, new IntCb() { public void on(int i) {
+                int mVal = i == 0 ? 1 : i == 1 ? 2 : i == 2 ? 5 : 0;
+                prefs.edit().putInt("waze_poll_minutes", mVal).apply();
+                RoadAlerts.scheduleNextPoll(Main.this);
+                showSettings(settingsCat);
+            }});
+        toggle(hz, "Voz y tono de proximidad",
+            "Anuncio hablado y tono de aviso al acercarse a un peligro",
+            RoadAlerts.isVoiceEnabled(this), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("alerts_voice_enabled", i == 1).apply();
+                showSettings(settingsCat);
+            }});
+        toggle(hz, "Accidentes y cierres",
+            "Colisiones y cierres de vía reportados",
+            prefs.getBoolean("alert_cat_accident", true), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("alert_cat_accident", i == 1).apply();
+                syncMapRoadAlerts(); updateWaveAlerts(useMph()); updateHazardsPill(); showSettings(settingsCat);
+            }});
+        toggle(hz, "Baches y peligros viales",
+            "Baches, obras, vehículos detenidos e inundaciones",
+            prefs.getBoolean("alert_cat_emergency", true), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("alert_cat_emergency", i == 1).apply();
+                syncMapRoadAlerts(); updateWaveAlerts(useMph()); updateHazardsPill(); showSettings(settingsCat);
+            }});
+        toggle(hz, "Policía y radares móviles",
+            "Controles policiales y cámaras reportadas",
+            prefs.getBoolean("alert_cat_police", true), new IntCb() { public void on(int i) {
+                prefs.edit().putBoolean("alert_cat_police", i == 1).apply();
+                syncMapRoadAlerts(); updateWaveAlerts(useMph()); updateHazardsPill(); showSettings(settingsCat);
+            }});
+        RoadAlerts.StatusSnapshot hzSt = RoadAlerts.getStatus();
+        String hzVal = hzSt.syncing ? I18n.t("Sincronizando…")
+                : hzSt.lastError != null && hzSt.lastError.length() > 0 ? I18n.t("Error")
+                : hzSt.lastSyncAtMs > 0 ? I18n.t(hzSt.feedAlerts + " alertas · " + hzSt.feedJams + " tramos")
+                : I18n.t("Sin configurar");
+        String hzSub = hzSt.lastError != null && hzSt.lastError.length() > 0
+                ? I18n.t("Último error") + ": " + hzSt.lastError
+                : (hzSt.format.length() > 0 ? hzSt.format + " · " + I18n.t("Toca para actualizar ahora") : I18n.t("Toca para consultar /alerts/search y /jams/search"));
+        row(hz, "Probar y sincronizar ahora", hzSub, hzVal, new Runnable() { public void run() {
+            if (!RoadAlerts.hasConfiguredFeed(Main.this)) {
+                editText("waze_feed_url", "URL waze-scraper (http://IP:8000) o GeoJSON", "");
+                return;
+            }
+            toast("Sincronizando feed de Waze…");
+            RoadAlerts.syncWazeFeedAsync(Main.this, true, mapCenterLat(), mapCenterLon(), new RoadAlerts.SyncCb() {
+                public void onComplete(RoadAlerts.StatusSnapshot snap) {
+                    if (isFinishing()) return;
+                    if (snap.lastError != null && snap.lastError.length() > 0) {
+                        toast(I18n.t("Error de sincronización") + ": " + snap.lastError);
+                    } else {
+                        toast(I18n.t(snap.feedAlerts + " alertas · " + snap.feedJams + " tramos"));
+                    }
+                    if (settingsView != null) showSettings(settingsCat);
+                }
+            });
+            showSettings(settingsCat);
+        }});
         m = section(body, "Avanzado");
         row(m, "Diagnóstico del mapa", "Fuentes probadas y errores", null, new Runnable() { public void run() {
             new TB(Main.this, dlg()).setTitle("Diagnóstico del mapa")
@@ -10841,7 +11464,7 @@ public class Main extends Activity {
     /** Ayuda: de dónde bajar un mapa .map y dónde ponerlo. */
     private void mapHowTo() {
         new TB(this, dlg()).setTitle("Mapa sin conexión")
-            .setMessage("1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa sin conexión se activa automáticamente si no hay internet, o cuando eliges OSM en el mapa. Para actualizarlo, descarga uno nuevo y reemplaza el archivo.")
+            .setMessage("1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa sin conexión se activa en MapLibre automáticamente si no hay internet o desde la opción «Mapa sin conexión en MapLibre». Para actualizarlo, descarga uno nuevo y reemplaza el archivo.")
             .setPositiveButton("OK", null).show();
     }
 
@@ -11238,8 +11861,8 @@ public class Main extends Activity {
     private void reloadAll() {
         I18n.init(this, prefs);
         LiveMapView.headingUp = prefs.getBoolean("map_heading", false);
-        LiveMapView.view3d = prefs.getBoolean("map_3d", false);
-        LiveMapView.tiltAngle = prefs.getInt("map_angle", 45);
+        LiveMapView.view3d = true;
+        LiveMapView.tiltAngle = (Nav.active != null && !Nav.previewMode) ? applyNavPitch() : manualMapAngle();
         applyThemeNow();
         applyAccent();
         try { lm.removeUpdates(odoListener); } catch (Throwable ignored) { }
@@ -13052,6 +13675,153 @@ public class Main extends Activity {
         return null;
     }
 
+    private static class SoundIconView extends View {
+        private final float s;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path speakerPath = new Path();
+        private final RectF arcRect = new RectF();
+        private boolean soundOn = true;
+        private int iconColor = Color.WHITE;
+
+        SoundIconView(Context c, float scale) {
+            super(c);
+            s = scale;
+            setClickable(false);
+            setFocusable(false);
+        }
+
+        void setState(boolean on, int color) {
+            if (soundOn == on && iconColor == color) return;
+            soundOn = on;
+            iconColor = color;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float cx = w * 0.5f, cy = h * 0.5f;
+            float u = Math.min(w, h) * 0.05f;
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(iconColor);
+            speakerPath.reset();
+            speakerPath.moveTo(cx - 7.5f * u, cy - 2.8f * u);
+            speakerPath.lineTo(cx - 4.0f * u, cy - 2.8f * u);
+            speakerPath.lineTo(cx + 0.8f * u, cy - 6.6f * u);
+            speakerPath.lineTo(cx + 0.8f * u, cy + 6.6f * u);
+            speakerPath.lineTo(cx - 4.0f * u, cy + 2.8f * u);
+            speakerPath.lineTo(cx - 7.5f * u, cy + 2.8f * u);
+            speakerPath.close();
+            c.drawPath(speakerPath, paint);
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeWidth(Math.max(1.6f, 1.7f * s));
+            if (soundOn) {
+                float r1 = 3.6f * u;
+                arcRect.set(cx + 0.6f * u - r1, cy - r1, cx + 0.6f * u + r1, cy + r1);
+                c.drawArc(arcRect, -48f, 96f, false, paint);
+                float r2 = 6.6f * u;
+                arcRect.set(cx + 0.6f * u - r2, cy - r2, cx + 0.6f * u + r2, cy + r2);
+                c.drawArc(arcRect, -50f, 100f, false, paint);
+            } else {
+                c.drawLine(cx + 3.0f * u, cy - 3.2f * u, cx + 7.6f * u, cy + 3.2f * u, paint);
+                c.drawLine(cx + 7.6f * u, cy - 3.2f * u, cx + 3.0f * u, cy + 3.2f * u, paint);
+            }
+        }
+    }
+
+    private static class CompassBadgeView extends View {
+        private final float s;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path northTri = new Path();
+        private final Path southTri = new Path();
+        private boolean headingUp;
+        private float bearingDeg = Float.NaN;
+        private int textColor = Color.WHITE;
+        private int mutedColor = 0xFF8C929C;
+        private int accentColor = 0xFFEF4444;
+
+        CompassBadgeView(Context c, float scale) {
+            super(c);
+            s = scale;
+            setClickable(false);
+            setFocusable(false);
+            textPaint.setTypeface(Typeface.DEFAULT_BOLD);
+            textPaint.setTextAlign(Paint.Align.CENTER);
+        }
+
+        void setState(boolean dirUp, float bearing, int txtCol, int muteCol, int accCol) {
+            boolean sameBr = (Float.isNaN(bearingDeg) && Float.isNaN(bearing))
+                || (!Float.isNaN(bearingDeg) && !Float.isNaN(bearing) && Math.abs(bearingDeg - bearing) < 1f);
+            if (headingUp == dirUp && sameBr && textColor == txtCol && mutedColor == muteCol && accentColor == accCol) return;
+            headingUp = dirUp;
+            bearingDeg = bearing;
+            textColor = txtCol;
+            mutedColor = muteCol;
+            accentColor = accCol;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float cx = w * 0.5f, cy = h * 0.5f;
+            float r = Math.min(w, h) * 0.5f;
+            float rotDeg = (headingUp && !Float.isNaN(bearingDeg)) ? -bearingDeg : 0f;
+
+            c.save();
+            c.rotate(rotDeg, cx, cy);
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(Math.max(1f, 1.1f * s));
+            paint.setColor((mutedColor & 0x00FFFFFF) | 0x45000000);
+            float tIn = r * 0.78f, tOut = r * 0.88f;
+            c.drawLine(cx + tIn, cy, cx + tOut, cy, paint);
+            c.drawLine(cx - tIn, cy, cx - tOut, cy, paint);
+            c.drawLine(cx, cy + tIn, cx, cy + tOut, paint);
+
+            float cyOffset = cy + r * 0.10f;
+            float tipN = cyOffset - r * 0.44f;
+            float tipS = cyOffset + r * 0.36f;
+            float halfW = r * 0.16f;
+
+            paint.setStyle(Paint.Style.FILL);
+            northTri.reset();
+            northTri.moveTo(cx, tipN);
+            northTri.lineTo(cx + halfW, cyOffset);
+            northTri.lineTo(cx - halfW, cyOffset);
+            northTri.close();
+            paint.setColor(accentColor);
+            c.drawPath(northTri, paint);
+
+            southTri.reset();
+            southTri.moveTo(cx, tipS);
+            southTri.lineTo(cx + halfW, cyOffset);
+            southTri.lineTo(cx - halfW, cyOffset);
+            southTri.close();
+            paint.setColor((mutedColor & 0x00FFFFFF) | 0x80000000);
+            c.drawPath(southTri, paint);
+
+            paint.setColor(textColor);
+            c.drawCircle(cx, cyOffset, Math.max(1.5f, r * 0.065f), paint);
+            c.restore();
+
+            double rad = Math.toRadians(rotDeg);
+            float nDist = r * 0.60f;
+            float nx = cx + (float) Math.sin(rad) * nDist;
+            float ny = cy - (float) Math.cos(rad) * nDist;
+            textPaint.setTextSize(8.2f * s);
+            textPaint.setColor(headingUp ? accentColor : textColor);
+            Paint.FontMetrics fm = textPaint.getFontMetrics();
+            c.drawText("N", nx, ny - (fm.ascent + fm.descent) * 0.5f, textPaint);
+        }
+    }
+
     private static class WaveAlertView extends View {
         private final float s;
         private final float cornerPx;
@@ -13060,10 +13830,8 @@ public class Main extends Activity {
         private final Path clipPath = new Path();
         private final RectF bounds = new RectF();
         private LinearGradient shTop, shBot, shLeft, shRight;
-        private LinearGradient shTopAlt, shBotAlt, shLeftAlt, shRightAlt;
         private int lastW, lastH, lastColor;
-        private boolean lastPolice;
-        private boolean active, policeFlash;
+        private boolean active;
         private int alertColor = 0xFFEF4444;
 
         WaveAlertView(Context c, float scale, float radiusPx) {
@@ -13078,15 +13846,10 @@ public class Main extends Activity {
         }
 
         void setAlert(boolean on, int color) {
-            setAlert(on, color, false);
-        }
-
-        void setAlert(boolean on, int color, boolean flashPolice) {
             int col = color != 0 ? color : 0xFFEF4444;
-            if (active == on && alertColor == col && policeFlash == flashPolice) return;
+            if (active == on && alertColor == col) return;
             active = on;
             alertColor = col;
-            policeFlash = on && flashPolice;
             setVisibility(on ? View.VISIBLE : View.GONE);
             if (on) invalidate();
         }
@@ -13110,42 +13873,34 @@ public class Main extends Activity {
             if (w <= 0 || h <= 0) return;
 
             float edge = Math.min(Math.min(w, h) * 0.14f, 44f * s);
-            if (w != lastW || h != lastH || alertColor != lastColor || policeFlash != lastPolice || shTop == null) {
-                lastW = w; lastH = h; lastColor = alertColor; lastPolice = policeFlash;
-                LinearGradient[] g1 = buildEdges(w, h, edge, policeFlash ? 0xFF2563EB : alertColor);
+            if (w != lastW || h != lastH || alertColor != lastColor || shTop == null) {
+                lastW = w; lastH = h; lastColor = alertColor;
+                LinearGradient[] g1 = buildEdges(w, h, edge, alertColor);
                 shTop = g1[0]; shBot = g1[1]; shLeft = g1[2]; shRight = g1[3];
-                if (policeFlash) {
-                    LinearGradient[] g2 = buildEdges(w, h, edge, 0xFFEF4444);
-                    shTopAlt = g2[0]; shBotAlt = g2[1]; shLeftAlt = g2[2]; shRightAlt = g2[3];
-                } else {
-                    shTopAlt = shBotAlt = shLeftAlt = shRightAlt = null;
-                }
                 bounds.set(0f, 0f, w, h);
                 clipPath.reset();
                 clipPath.addRoundRect(bounds, cornerPx, cornerPx, Path.Direction.CW);
             }
 
-            long period = policeFlash ? 1400L : 1800L;
+            long period = 1800L;
             long tick = SystemClock.uptimeMillis() % period;
             float phase = tick / (float) period;
-            float pulse = 0.40f + 0.60f * (0.5f - 0.5f * (float) Math.cos(phase * Math.PI * (policeFlash ? 4.0 : 2.0)));
+            float pulse = 0.40f + 0.60f * (0.5f - 0.5f * (float) Math.cos(phase * Math.PI * 2.0));
             int alpha = Math.max(45, Math.min(255, Math.round(215f * pulse)));
-            boolean swap = policeFlash && tick >= 700L;
 
             c.save();
             if (android.os.Build.VERSION.SDK_INT >= 18 || !c.isHardwareAccelerated()) c.clipPath(clipPath);
             edgePaint.setAlpha(alpha);
-            edgePaint.setShader(swap ? shTopAlt : shTop);
+            edgePaint.setShader(shTop);
             c.drawRect(0f, 0f, w, edge, edgePaint);
-            edgePaint.setShader(swap ? shBot : shBotAlt != null ? shBotAlt : shBot);
+            edgePaint.setShader(shBot);
             c.drawRect(0f, h - edge, w, h, edgePaint);
-            edgePaint.setShader(swap ? shLeftAlt : shLeft);
+            edgePaint.setShader(shLeft);
             c.drawRect(0f, 0f, edge, h, edgePaint);
-            edgePaint.setShader(swap ? shRight : shRightAlt != null ? shRightAlt : shRight);
+            edgePaint.setShader(shRight);
             c.drawRect(w - edge, 0f, w, h, edgePaint);
 
-            int rimColor = policeFlash ? (swap ? 0xFFEF4444 : 0xFF2563EB) : alertColor;
-            borderPaint.setColor((rimColor & 0x00FFFFFF) | (Math.round(185f * pulse) << 24));
+            borderPaint.setColor((alertColor & 0x00FFFFFF) | (Math.round(185f * pulse) << 24));
             float inset = borderPaint.getStrokeWidth() * 0.5f;
             bounds.set(inset, inset, w - inset, h - inset);
             c.drawRoundRect(bounds, cornerPx, cornerPx, borderPaint);

@@ -1,6 +1,7 @@
 package com.stradaos.launcher;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Camera;
@@ -83,6 +84,10 @@ public class LiveMapView extends View {
         try {
             fileMap = OfflineMap.open(new File(p));
             fileErr = null;
+            SharedPreferences sp = c.getSharedPreferences("launcher", 0);
+            double nLat = sp.contains("w_lat") ? sp.getFloat("w_lat", 0f) : Double.NaN;
+            double nLon = sp.contains("w_lon") ? sp.getFloat("w_lon", 0f) : Double.NaN;
+            PoiIndex.indexMapFileAsync(c, fileMap, nLat, nLon, false);
         } catch (Throwable e) {
             fileErr = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
         }
@@ -125,6 +130,8 @@ public class LiveMapView extends View {
     private final Paint previewText = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint previewBg = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint horizonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint alertPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint alertGlyph = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path corners = new Path();
     private final Camera cam3d = new Camera();
     private final Matrix tiltM = new Matrix();
@@ -140,6 +147,7 @@ public class LiveMapView extends View {
     public interface Listener {
         void onFollowChanged(boolean following);
         void onMapPick(double lat, double lon);
+        void onAlertTap(String alertId);
     }
     private Listener listener;
     private boolean following = true;
@@ -237,9 +245,9 @@ public class LiveMapView extends View {
         deleteOld(new File(c.getCacheDir(), "tiles"));
         deleteOld(new File(c.getCacheDir(), "tiles_v2"));
         bright = c.getSharedPreferences("launcher", 0).getInt("map_bright", 1);
-        grid.setColor(Main.LIGHT ? 0xFFD5D9E0 : 0xFF22252C);
+        grid.setColor(Main.LIGHT ? 0xFFD5D9E0 : 0xFF1A2230);
         grid.setStrokeWidth(Math.max(1, s));
-        text.setColor(Main.LIGHT ? 0x99000000 : 0x99FFFFFF);
+        text.setColor(Main.LIGHT ? 0x99000000 : 0xCCBAE6FD);
         text.setTextSize(10 * s);
         corner.setColor(Main.BG);
         routeOut.setStyle(Paint.Style.STROKE);
@@ -258,12 +266,17 @@ public class LiveMapView extends View {
         previewText.setTextSize(12.5f * s);
         previewText.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         previewBg.setStyle(Paint.Style.FILL);
+        alertGlyph.setTextAlign(Paint.Align.CENTER);
+        alertGlyph.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        alertGlyph.setTextSize(10.5f * s);
+        alertGlyph.setColor(0xFFFFFFFF);
         // Sin capa por software: el mapa se dibuja con la GPU (mucho más fluido). Las esquinas redondeadas no se
         // recortan (clipPath no funciona con GPU antes de Android 4.3): se tapan con el color del fondo.
         Net.init(c);
         sp = c.getSharedPreferences("launcher", 0);
-        view3d = sp.getBoolean("map_3d", false);
-        tiltAngle = sp.getInt("map_angle", 45);
+        view3d = true;
+        int rawAngle = sp.getInt("map_angle", 30);
+        tiltAngle = rawAngle >= 48 ? 60 : 30;
         curTilt = view3d ? Math.max(0f, Math.min(65f, tiltAngle)) : 0f;
         String custom = sp.getString("map_url", "").trim();
         URLS[0] = custom;
@@ -288,7 +301,12 @@ public class LiveMapView extends View {
         gestDet = new android.view.GestureDetector(c, new android.view.GestureDetector.SimpleOnGestureListener() {
             public boolean onDown(android.view.MotionEvent e) { return true; }
             public boolean onSingleTapConfirmed(android.view.MotionEvent e) {
-                if (listener != null && hasCenter) {
+                if (listener != null && hasCenter && lastDrawZoom > 0 && lastCx > 0) {
+                    String hitId = findAlertAtScreen(e.getX(), e.getY());
+                    if (hitId != null) {
+                        listener.onAlertTap(hitId);
+                        return true;
+                    }
                     performClick();
                 } else {
                     cycleZoom();
@@ -352,8 +370,8 @@ public class LiveMapView extends View {
     }
 
     /** Mapa claro → estilo oscuro (invierte y gira el tono 180°, como el "modo noche" de muchos mapas). */
-    /** Modo oscuro para mapas claros: invierte, gira el tono 180° (el agua sigue azul, los parques verdes,
-     *  el texto queda blanco) y aclara según el nivel de brillo (0 bajo, 1 medio, 2 alto). */
+    /** Modo oscuro Obsidian Night: invierte, gira el tono 180°, realza saturación cyan/ámbar
+     *  y aplica contraste alto con piso negro obsidiana (#06080E) según brillo (0 bajo, 1 medio, 2 alto). */
     static Bitmap darken(Bitmap src, int level) {
         Bitmap out = Bitmap.createBitmap(src.getWidth(), src.getHeight(), Bitmap.Config.ARGB_8888);
         android.graphics.ColorMatrix m = new android.graphics.ColorMatrix(new float[]{
@@ -363,9 +381,16 @@ public class LiveMapView extends View {
                 0.426f, 0.43f, 0.144f, 0, 0,
                 0.426f, 1.43f, -0.856f, 0, 0,
                 0, 0, 0, 1, 0}));
-        float lift = level <= 0 ? 14 : level == 1 ? 40 : 64, k = level <= 0 ? 0.85f : level == 1 ? 0.80f : 0.78f;
+        android.graphics.ColorMatrix sat = new android.graphics.ColorMatrix();
+        sat.setSaturation(1.22f);
+        m.postConcat(sat);
+        float k = level <= 0 ? 1.16f : level == 1 ? 1.24f : 1.32f;
+        float off = level <= 0 ? -24f : level == 1 ? -16f : -6f;
         m.postConcat(new android.graphics.ColorMatrix(new float[]{
-                k, 0, 0, 0, lift, 0, k, 0, 0, lift, 0, 0, k * 1.05f, 0, lift + 4, 0, 0, 0, 1, 0}));
+                k, 0, 0, 0, off,
+                0, k, 0, 0, off + 2f,
+                0, 0, k * 1.06f, 0, off + 6f,
+                0, 0, 0, 1, 0}));
         Paint pt = new Paint(Paint.FILTER_BITMAP_FLAG);
         pt.setColorFilter(new android.graphics.ColorMatrixColorFilter(m));
         new Canvas(out).drawBitmap(src, 0, 0, pt);
@@ -466,8 +491,8 @@ public class LiveMapView extends View {
     static boolean headingUp;
     /** true: vista 3D con inclinación automática según tiltAngle. */
     static boolean view3d;
-    /** Ángulo de inclinación de cámara en modo 3D (grados: 30, 45, 60). */
-    static int tiltAngle = 45;
+    /** Ángulo de inclinación de cámara en modo 3D (grados: 30, 60). */
+    static int tiltAngle = 30;
 
     public void setListener(Listener l) { listener = l; }
     public boolean isFollowing() { return following && !overviewMode; }
@@ -628,6 +653,41 @@ public class LiveMapView extends View {
         return new double[]{lat, lon};
     }
 
+    private String findAlertAtScreen(float sx, float sy) {
+        java.util.List<RoadAlerts.AlertItem> alerts = RoadAlerts.getActiveAlerts(getContext());
+        if (alerts.isEmpty() || lastDrawZoom <= 0) return null;
+        int n = 1 << lastDrawZoom;
+        float ts = 256f * s;
+        float bestDistSq = (30f * s) * (30f * s);
+        String bestId = null;
+        double cosB = 1.0, sinB = 0.0;
+        if (lastRot && !Float.isNaN(lastBr)) {
+            double rad = Math.toRadians(-lastBr);
+            cosB = Math.cos(rad);
+            sinB = Math.sin(rad);
+        }
+        for (int i = 0; i < alerts.size(); i++) {
+            RoadAlerts.AlertItem a = alerts.get(i);
+            float ax = mapX(a.lon, lastFx, lastCx, ts, n);
+            float ay = mapY(a.lat, lastFy, lastCy, ts, n);
+            if (lastRot && !Float.isNaN(lastBr)) {
+                float dx = ax - lastCx, dy = ay - lastCy;
+                ax = lastCx + (float) (dx * cosB - dy * sinB);
+                ay = lastCy + (float) (dx * sinB + dy * cosB);
+            }
+            tmpPt[0] = ax;
+            tmpPt[1] = ay;
+            if (lastTilted) tiltM.mapPoints(tmpPt);
+            float ddx = sx - tmpPt[0], ddy = sy - tmpPt[1];
+            float dSq = ddx * ddx + ddy * ddy;
+            if (dSq <= bestDistSq) {
+                bestDistSq = dSq;
+                bestId = a.id;
+            }
+        }
+        return bestId;
+    }
+
     @Override
     public boolean onTouchEvent(android.view.MotionEvent e) {
         boolean handled = scaleDet.onTouchEvent(e);
@@ -677,7 +737,7 @@ public class LiveMapView extends View {
         float w = getWidth(), h = getHeight();
         boolean bd = syncBackdrop();
         if (bd) c.drawRect(0, 0, w, h, back);
-        else c.drawColor(Main.LIGHT ? 0xFFE8EBF0 : 0xFF15171C);
+        else c.drawColor(Main.LIGHT ? 0xFFE8EBF0 : 0xFF06080E);
         boolean moving = step(SystemClock.uptimeMillis());
 
         float targetTilt = view3d ? Math.max(0f, Math.min(65f, tiltAngle)) : 0f;
@@ -805,8 +865,8 @@ public class LiveMapView extends View {
                     }
                 }
             }
+            drawRoadAlerts(c, fx, fy, cx, cy, ts, n);
             drawRoute(c, fx, fy, cx, cy, ts, n, hasPreview);
-            drawPoliceReports(c, fx, fy, cx, cy, ts, n);
             if (tilted || rot) c.restore();
 
             if (tilted && !bd && h > 0) {
@@ -814,7 +874,7 @@ public class LiveMapView extends View {
                 if (hh != horizonH || horizonLight != Main.LIGHT) {
                     horizonH = hh;
                     horizonLight = Main.LIGHT;
-                    int hc = Main.LIGHT ? 0xFFE8EBF0 : 0xFF15171C;
+                    int hc = Main.LIGHT ? 0xFFE8EBF0 : 0xFF06080E;
                     horizonPaint.setShader(new LinearGradient(0, 0, 0, hh, hc, hc & 0x00FFFFFF, Shader.TileMode.CLAMP));
                 }
                 horizonPaint.setAlpha(Math.min(200, Math.round(curTilt * 3.0f)));
@@ -853,7 +913,8 @@ public class LiveMapView extends View {
             corner.setColor(Main.BG);
             c.drawPath(corners, corner);
         }
-        if (Nav.nearbyPolice != null || (Nav.active != null && (Nav.nearbyCamera != null || Nav.nearbyIncident != null))) moving = true;
+        if ((Nav.active != null && (Nav.nearbyCamera != null || Nav.nearbyIncident != null))
+                || RoadAlerts.nearbyAlert != null) moving = true;
         if (moving) postInvalidateDelayed(FRAME_MS);
     }
 
@@ -1056,23 +1117,50 @@ public class LiveMapView extends View {
         c.drawCircle(dxS, dyS, 6.5f * s, destPin);
     }
 
-    private void drawPoliceReports(Canvas c, double fx, double fy, float cx, float cy, float ts, int n) {
-        java.util.List<Nav.PoliceReport> list = Nav.getPoliceReports(getContext());
-        if (list == null || list.isEmpty()) return;
-        Nav.PoliceReport near = Nav.nearbyPolice;
-        destPin.setStyle(Paint.Style.FILL);
-        for (int i = 0; i < list.size(); i++) {
-            Nav.PoliceReport pr = list.get(i);
-            if (pr == null) continue;
-            float px = mapX(pr.lon, fx, cx, ts, n);
-            float py = mapY(pr.lat, fy, cy, ts, n);
-            if (near != null && (near == pr || (near.id != null && near.id.equals(pr.id)))) {
-                drawPoliceWaveRipple(c, px, py);
+    private void drawRoadAlerts(Canvas c, double fx, double fy, float cx, float cy, float ts, int n) {
+        java.util.List<RoadAlerts.JamSegment> jams = RoadAlerts.getActiveJams(getContext());
+        if (!jams.isEmpty()) {
+            alertPaint.setStyle(Paint.Style.STROKE);
+            alertPaint.setStrokeCap(Paint.Cap.ROUND);
+            alertPaint.setStrokeJoin(Paint.Join.ROUND);
+            alertPaint.setStrokeWidth(5.5f * s);
+            for (int ji = 0; ji < jams.size(); ji++) {
+                RoadAlerts.JamSegment seg = jams.get(ji);
+                if (seg == null || seg.pts == null || seg.pts.length < 4) continue;
+                alertPaint.setColor(seg.level >= 4 ? 0xCCEF4444 : 0xCCF59E0B);
+                routePath.reset();
+                int pCount = seg.pts.length / 2;
+                for (int pi = 0; pi < pCount; pi++) {
+                    float px = mapX(seg.pts[pi * 2 + 1], fx, cx, ts, n);
+                    float py = mapY(seg.pts[pi * 2], fy, cy, ts, n);
+                    if (pi == 0) routePath.moveTo(px, py);
+                    else routePath.lineTo(px, py);
+                }
+                c.drawPath(routePath, alertPaint);
             }
-            destPin.setColor(0xFFFFFFFF);
-            c.drawCircle(px, py, 8f * s, destPin);
-            destPin.setColor(0xFF2563EB);
-            c.drawCircle(px, py, 5.5f * s, destPin);
+        }
+
+        java.util.List<RoadAlerts.AlertItem> alerts = RoadAlerts.getActiveAlerts(getContext());
+        if (alerts.isEmpty()) return;
+        float mg = Math.max(getWidth(), getHeight()) * 1.4f;
+        float minX = -mg, maxX = getWidth() + mg, minY = -mg, maxY = getHeight() + mg;
+        float glyphDy = (alertGlyph.descent() + alertGlyph.ascent()) * 0.5f;
+        RoadAlerts.AlertItem curNearby = RoadAlerts.nearbyAlert;
+        for (int i = 0; i < alerts.size(); i++) {
+            RoadAlerts.AlertItem a = alerts.get(i);
+            float ax = mapX(a.lon, fx, cx, ts, n);
+            float ay = mapY(a.lat, fy, cy, ts, n);
+            if (ax < minX || ax > maxX || ay < minY || ay > maxY) continue;
+            int col = RoadAlerts.colorForCategory(a.category);
+            if (curNearby != null && a.id != null && a.id.equals(curNearby.id)) {
+                drawWaveRipple(c, ax, ay, col);
+            }
+            alertPaint.setStyle(Paint.Style.FILL);
+            alertPaint.setColor(0xFFFFFFFF);
+            c.drawCircle(ax, ay, 11.2f * s, alertPaint);
+            alertPaint.setColor(col);
+            c.drawCircle(ax, ay, 9.0f * s, alertPaint);
+            c.drawText(RoadAlerts.badgeGlyph(a), ax, ay - glyphDy, alertGlyph);
         }
     }
 
@@ -1090,26 +1178,6 @@ public class LiveMapView extends View {
             c.drawCircle(x, y, r, wavePaint);
             wavePaint.setStyle(Paint.Style.STROKE);
             wavePaint.setStrokeWidth(2.4f * s);
-            wavePaint.setColor(rgb | (strokeAlpha << 24));
-            c.drawCircle(x, y, r, wavePaint);
-        }
-    }
-
-    private void drawPoliceWaveRipple(Canvas c, float x, float y) {
-        long period = 1400L;
-        long now = SystemClock.uptimeMillis();
-        int[] cols = new int[]{0x002563EB, 0x00EF4444};
-        for (int ring = 0; ring < 2; ring++) {
-            float p = ((now + (ring == 1 ? period / 2 : 0L)) % period) / (float) period;
-            float r = (11f + p * 40f) * s;
-            int rgb = cols[ring];
-            int fillAlpha = Math.max(0, Math.min(255, Math.round((1f - p) * 56f)));
-            int strokeAlpha = Math.max(0, Math.min(255, Math.round((1f - p) * 225f)));
-            wavePaint.setStyle(Paint.Style.FILL);
-            wavePaint.setColor(rgb | (fillAlpha << 24));
-            c.drawCircle(x, y, r, wavePaint);
-            wavePaint.setStyle(Paint.Style.STROKE);
-            wavePaint.setStrokeWidth(2.6f * s);
             wavePaint.setColor(rgb | (strokeAlpha << 24));
             c.drawCircle(x, y, r, wavePaint);
         }

@@ -1902,3 +1902,162 @@ Sigue ahí	Still there
 Ya no está	Gone
 Alerta confirmada	Alert confirmed
 Alerta eliminada	Alert cleared
+Alertas de radares e incidentes	Speed camera & hazard alerts
+Ondas y avisos al acercarse a radares o incidentes	Waves and alerts when approaching speed cameras or hazards
+Silenciar o activar sonido	Mute or unmute sound
+Sonido activado	Sound on
+Sonido silenciado	Sound muted
+Silenciar voz y alertas	Mute voice & alerts
+Activar voz y alertas	Enable voice & alerts
+Mapa: Norte arriba	Map: North up
+Mapa: Según tu dirección	Map: Heading up
+Orientación: Norte arriba	Orientation: North up
+Orientación: Según tu dirección	Orientation: Heading up
+
+# Malaysia Road Alerts & Waze for Cities
+Reportar alerta vial	Report road alert
+Control policial	Police control
+Accidente	Accident
+Emergencia / peligro	Emergency / hazard
+Control policial (SJR)	Police roadblock (SJR)
+Radar / control móvil	Speed trap / enforcement
+Accidente grave	Major accident
+Inundación en la vía	Flash flood
+Vía cerrada	Road closed
+Emergencia vial	Road emergency
+Peligro en la vía	Road hazard
+Congestión severa / bloqueo	Severe congestion / closure
+Clave personalizada configurada	Custom key set
+Configurada desde AI Studio Secrets	Set via AI Studio Secrets
+Sin clave configurada	No key configured
+Ingresa la URL del feed de Waze	Enter the Waze feed URL
+Respuesta vacía del servidor	Empty server response
+Formato JSON/GeoJSON no reconocido	Unrecognized JSON/GeoJSON format
+Sin sesión iniciada	Not signed in
+Firebase Auth no está listo	Firebase Auth is not ready
+Falta configuración de Google Sign-In	Google Sign-In setup is missing
+Tipo de credencial inesperado	Unexpected credential type
+Inicia sesión con Google para reportar	Sign in with Google to report
+Base de datos no disponible	Database unavailable
+Ubicación GPS inválida	Invalid GPS location
+Esperando ubicación GPS	Waiting for GPS location
+Inicio de sesión cancelado	Sign-in cancelled
+Error al iniciar sesión	Sign-in error
+Alerta publicada	Alert published
+No se pudo publicar la alerta	Could not publish alert
+Conductor	Driver
+Toca una categoría para enviar en 1 toque	Tap a category for 1-tap reporting
+Inicia sesión con Google para publicar reportes en la nube	Sign in with Google to publish cloud reports
+Sesión iniciada	Signed in
+Nota o vía opcional (p. ej. PLUS KM 28, SJR)	Optional note or road (e.g. PLUS KM 28, SJR)
+REPORTES RÁPIDOS (MALASIA)	QUICK REPORTS (MALAYSIA)
+Alerta expirada	Alert expired
+Distancia	Distance
+Reporte comunitario	Community report
+Confirmaciones	Confirmations
+Enfocar	Focus
+Confirmación enviada	Confirmation sent
+Alerta despejada	Alert cleared
+URL del feed Waze for Cities	Waze for Cities feed URL
+La URL debe empezar con http:// o https://	URL must start with http:// or https://
+Sincronizando feed de Waze…	Syncing Waze feed…
+Error de sincronización	Sync error
+alertas	alerts
+Clave API de Waze	Waze API key
+Vacío = usar clave de Secrets	Empty = use Secrets key
+Alertas viales y Waze for Cities	Road alerts & Waze for Cities
+Alertas viales en el mapa	Road alerts on map
+Muestra controles policiales, accidentes, emergencias y atascos de Waze	Shows police controls, accidents, hazards, and Waze jams
+Cuenta comunitaria (Google)	Community account (Google)
+Necesaria para publicar y confirmar reportes en la nube	Required to post and confirm cloud reports
+¿Deseas cerrar sesión o cambiar de cuenta de Google?	Sign out or switch Google account?
+Cambiar cuenta	Switch account
+Cerrar sesión	Sign out
+Sesión cerrada	Signed out
+Acepta endpoints JSON (alerts/jams) o GeoJSON en tiempo real	Supports real-time JSON (alerts/jams) or GeoJSON endpoints
+Sin configurar	Not configured
+Clave API de Waze (override)	Waze API key (override)
+Opcional: reemplaza la clave configurada en Secrets	Optional: overrides the key configured in Secrets
+Modo de autenticación API	API auth mode
+Cómo se envía la clave API al servidor del feed	How the API key is sent to the feed server
+Frecuencia del feed	Feed refresh rate
+Cada cuánto actualizar alertas de Waze/GeoJSON	How often to refresh Waze/GeoJSON alerts
+Controles policiales	Police controls
+Sekatan Jalan Raya (SJR), controles y radares móviles	Sekatan Jalan Raya (SJR), roadblocks and speed traps
+Accidentes de tránsito	Traffic accidents
+Colisiones y choques reportados en la vía	Collisions and crashes reported on the road
+Emergencias y peligros	Emergencies & hazards
+Inundaciones (banjir), vías cerradas y obstáculos	Flash floods (banjir), road closures and obstacles
+Último error	Last error
+comunidad	community
+alertas comunitarias en línea	community alerts online
+Probar y sincronizar feed ahora	Test & sync feed now
+Sincronizando…	Syncing…
+Error	Error
+
+# Personalization: NightPulse & Nissan Almera N17
+NightPulse	NightPulse
+Futurista · Oscuro · Deportivo. Paneles de vidrio negro, acentos azul eléctrico, barra lateral derecha de apps, mapa central amplio y tu Nissan Almera N17 Impul blanco en vista elevada trasera con pilotos LED.	Futuristic · Dark · Sporty. Black glass panels, electric-blue accents, right-side app rail, expansive center navigation map, and your white Nissan Almera N17 Impul from a top-behind angle with LED taillights.
+Nissan Almera N17 (Blanco)	Nissan Almera N17 (White)
+Edificios 3D siempre activos	3D buildings always active
+Ángulo automático en navegación	Auto angle in navigation
+En navegación paso a paso inclina a 60°; al detenerse vuelve al ángulo elegido	Tilts to 60° in turn-by-turn navigation; restores selected angle when stopped
+Zoom automático en navegación	Auto zoom in navigation
+Acercamiento automático al iniciar ruta y ajuste según la velocidad	Automatically zooms in when route starts and adjusts with speed
+Mapa sin conexión en MapLibre	MapLibre offline map
+Usa el archivo .map local dentro de MapLibre sin internet	Use the local .map file inside MapLibre without internet
+1. En un computador o celular, descarga el mapa de tu país (formato mapsforge, gratis):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Cópialo a una memoria USB o a la carpeta Download de la pantalla.\n\n3. En Ajustes → Mapa y clima → Mapa sin conexión, toca «Archivo del mapa» y elígelo.\n\nEl mapa sin conexión se activa en MapLibre automáticamente si no hay internet o desde la opción «Mapa sin conexión en MapLibre». Para actualizarlo, descarga uno nuevo y reemplaza el archivo.	1. On a computer or phone, download your country's map (mapsforge format, free):\ndownload.mapsforge.org/maps/v5\n\nColombia:\ndownload.mapsforge.org/maps/v5/south-america/colombia.map\n\n2. Copy it to a USB drive or to the screen's Download folder.\n\n3. In Settings → Map & weather → Offline map, tap “Map file” and choose it.\n\nThe offline map activates in MapLibre automatically when internet is unavailable, or from the “MapLibre offline map” option. To update it, download a new one and replace the file.
+
+# Place Search & Offline POI Index
+Índice sin conexión · Buscando en línea…	Offline index · Searching online…
+Sin conexión · Índice local	Offline · Local index
+Índice local	Local index
+Caché local	Local cache
+Área de servicio	Rest area
+Centro comercial	Shopping mall
+Peaje	Toll plaza
+Universidad	University
+Mezquita	Mosque
+Turismo	Tourism
+Terminal	Terminal
+Índice POI sin conexión	Offline POI index
+Indexando…	Indexing…
+{} lugares	{} places
+Base: {} · Caché: {} · Mapa .map: {}	Built-in: {} · Cache: {} · .map: {}
+Reindexar archivo .map	Reindex .map file
+Limpiar caché de búsquedas	Clear search cache
+Indexando POIs del mapa…	Indexing map POIs…
+Caché de búsquedas limpia	Search cache cleared
+
+# Real-time Road Hazard Notifications (waze-scraper)
+Radar	Speed camera
+{} activas	{} active
+Bache en la vía	Pothole ahead
+Obras en la vía	Roadworks ahead
+Vehículo detenido	Stalled vehicle
+Ingresa la URL del servidor o feed GeoJSON	Enter the server URL or GeoJSON feed
+Alertas viales cercanas	Nearby road hazards
+No hay alertas viales activas	No active road hazards
+Alertas viales en tiempo real	Real-time road hazards
+Muestra accidentes, baches, peligros, atascos e iconos en tiempo real	Shows real-time accidents, potholes, hazards, jams, and map icons
+Servidor waze-scraper o feed GeoJSON	waze-scraper server or GeoJSON feed
+URL base (ej. http://192.168.1.50:8000) o feed .geojson/.json	Base URL (e.g. http://192.168.1.50:8000) or .geojson/.json feed
+URL waze-scraper (http://IP:8000) o GeoJSON	waze-scraper URL (http://IP:8000) or GeoJSON
+Frecuencia de actualización	Refresh frequency
+Cada cuánto consultar alertas y tráfico cercanos	How often to check nearby hazards and traffic
+1 min	1 min
+2 min	2 min
+5 min	5 min
+Manual	Manual
+Voz y tono de proximidad	Proximity voice & chime
+Anuncio hablado y tono de aviso al acercarse a un peligro	Spoken warning and chime when approaching a hazard
+Accidentes y cierres	Accidents & closures
+Colisiones y cierres de vía reportados	Reported collisions and road closures
+Baches y peligros viales	Potholes & road hazards
+Baches, obras, vehículos detenidos e inundaciones	Potholes, roadworks, stalled vehicles, and floods
+Policía y radares móviles	Police & speed traps
+Controles policiales y cámaras reportadas	Reported police controls and cameras
+{} alertas · {} tramos	{} alerts · {} jams
+Toca para actualizar ahora	Tap to refresh now
+Toca para consultar /alerts/search y /jams/search	Tap to query /alerts/search and /jams/search
+Probar y sincronizar ahora	Test & sync now

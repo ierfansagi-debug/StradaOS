@@ -2,23 +2,24 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
+<meta name="color-scheme" content="dark light"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
 <title>StradaOS MapLibre</title>
 <style>
   html, body, #map {
     margin: 0; padding: 0; width: 100%; height: 100%;
-    overflow: hidden; background: #15171C;
+    overflow: hidden; background: #06080E;
     -webkit-tap-highlight-color: transparent;
     touch-action: none;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
   .maplibregl-ctrl-attrib, .maplibregl-ctrl-logo {
-    opacity: 0.55;
-    font-size: 9px !important;
+    display: none !important;
   }
   .strada-pin-lbl {
-    background: rgba(24, 27, 34, 0.92);
-    color: #F2F3F5;
+    background: rgba(20, 24, 34, 0.96);
+    color: #F4F7FC;
+    border: 1px solid rgba(255, 255, 255, 0.22);
     font-size: 12px;
     font-weight: 600;
     padding: 4px 10px;
@@ -31,12 +32,12 @@
     pointer-events: none;
   }
   .strada-pin-lbl.light {
-    background: rgba(255, 255, 255, 0.95);
+    background: rgba(255, 255, 255, 0.96);
     color: #14161B;
-    border: 1px solid rgba(0,0,0,0.08);
+    border: 1px solid rgba(15, 23, 42, 0.14);
   }
 </style>
-<link id="ml-css" rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"/>
+<link id="ml-css" rel="stylesheet" href="./maplibre-gl.css"/>
 </head>
 <body>
 <div id="map"></div>
@@ -61,33 +62,69 @@
     state.lastPickAt = now;
     try { if (bridge && bridge.onMapPick) bridge.onMapPick(lat, lon); } catch (e) {}
   }
+  function notifyHazardTap(id) {
+    if (!id) return;
+    try { if (bridge && bridge.onHazardTap) bridge.onHazardTap(String(id)); } catch (e) {}
+  }
+
+  function parseQuery() {
+    var out = {};
+    try {
+      var q = window.location.search ? window.location.search.substring(1) : '';
+      if (!q) return out;
+      var parts = q.split('&');
+      for (var i = 0; i < parts.length; i++) {
+        var kv = parts[i].split('=');
+        if (kv[0]) out[decodeURIComponent(kv[0])] = kv.length > 1 ? decodeURIComponent(kv[1]) : '';
+      }
+    } catch (e) {}
+    return out;
+  }
+  var qp = parseQuery();
+  var qLat = parseFloat(qp.lat), qLon = parseFloat(qp.lon);
+  var qTilt = parseInt(qp.tilt, 10);
+  var qBright = parseInt(qp.bright, 10);
 
   var state = {
     map: null,
-    isLight: false,
-    accent: '#E63946',
-    view3d: false,
-    tiltAngle: 45,
-    headingUp: false,
+    isLight: qp.light === '1' || qp.light === 'true',
+    bright: !isNaN(qBright) ? Math.max(0, Math.min(2, qBright)) : 1,
+    accent: qp.accent || '#E63946',
+    view3d: true,
+    tiltAngle: (!isNaN(qTilt) && qTilt >= 48) ? 60 : 30,
+    autoZoom: qp.autoZoom !== '0' && qp.autoZoom !== 'false',
+    headingUp: qp.headingUp === '1' || qp.headingUp === 'true',
     following: true,
     overview: false,
+    navActive: qp.nav === '1' || qp.nav === 'true',
+    userZoomed: false,
     carLat: NaN,
     carLon: NaN,
     carBearing: 0,
     hasFix: false,
-    initLat: 4.7110,
-    initLon: -74.0721,
-    initZoom: 14.5,
+    initLat: !isNaN(qLat) ? qLat : 4.7110,
+    initLon: !isNaN(qLon) ? qLon : -74.0721,
+    initZoom: 15.0,
     preview: null,
     previewPopup: null,
     routeData: null,
     styleLoaded: false,
-    rasterFallback: false,
+    styleSwitching: false,
+    spritesEnhanced: false,
+    offlineMode: qp.offline === '1' || qp.offline === 'true',
     lastPickAt: 0,
-    pendingTimers: [],
-    policeReports: [],
+    hazards: { alerts: [], jams: [] },
     wave: { active: false, kind: 'radar', lat: NaN, lon: NaN, raf: null }
   };
+
+  try { document.documentElement.style.colorScheme = state.isLight ? 'light' : 'dark'; } catch (e) {}
+
+  function obsBg() { return state.bright >= 2 ? '#090C14' : state.bright <= 0 ? '#040509' : '#06080E'; }
+  function obsUrban() { return state.bright >= 2 ? '#121A28' : state.bright <= 0 ? '#0A0E16' : '#0D121C'; }
+  function obsBldg2d() { return state.bright >= 2 ? '#192438' : state.bright <= 0 ? '#101724' : '#131B29'; }
+  function obsBldg3d() { return state.bright >= 2 ? '#22314A' : state.bright <= 0 ? '#162030' : '#1B2639'; }
+  function obsMinorRoad() { return state.bright >= 2 ? '#465E7E' : state.bright <= 0 ? '#2E3E56' : '#364963'; }
+  function obsServiceRoad() { return state.bright >= 2 ? '#374B66' : state.bright <= 0 ? '#243245' : '#2C3C52'; }
 
   function hasWebGL() {
     try {
@@ -98,45 +135,473 @@
     }
   }
 
-  function styleUrlFor(light, useRaster) {
-    if (useRaster) {
+  function styleUrlFor(light, useOffline) {
+    if (useOffline) {
       return {
         version: 8,
         sources: {
-          osm: {
+          offline: {
             type: 'raster',
-            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tiles: ['https://strada.offline/tiles/{z}/{x}/{y}.png'],
             tileSize: 256,
-            attribution: '© OpenStreetMap contributors'
+            maxzoom: 19
           }
         },
-        layers: [{ id: 'osm-tiles', type: 'raster', source: 'osm', minzoom: 0, maxzoom: 19 }]
+        layers: [
+          {
+            id: 'strada-offline-bg',
+            type: 'background',
+            paint: { 'background-color': light ? '#E8EBF0' : obsBg() }
+          },
+          {
+            id: 'offline-tiles',
+            type: 'raster',
+            source: 'offline',
+            minzoom: 0,
+            maxzoom: 22
+          }
+        ]
       };
     }
-    return light ? 'https://tiles.openfreemap.org/styles/liberty' : 'https://tiles.openfreemap.org/styles/dark';
+    return 'https://tiles.openfreemap.org/styles/liberty';
+  }
+
+  function parseCssColor(col) {
+    if (typeof col !== 'string') return null;
+    var s = col.trim().toLowerCase();
+    if (s === 'black') return [0, 0, 0, 1];
+    if (s === 'white') return [255, 255, 255, 1];
+    if (s.charAt(0) === '#') {
+      var h = s.substring(1);
+      if (h.length === 3 || h.length === 4) {
+        var r3 = parseInt(h.charAt(0) + h.charAt(0), 16);
+        var g3 = parseInt(h.charAt(1) + h.charAt(1), 16);
+        var b3 = parseInt(h.charAt(2) + h.charAt(2), 16);
+        var a3 = h.length === 4 ? parseInt(h.charAt(3) + h.charAt(3), 16) / 255 : 1;
+        return isNaN(r3) ? null : [r3, g3, b3, a3];
+      }
+      if (h.length === 6 || h.length === 8) {
+        var r6 = parseInt(h.substring(0, 2), 16);
+        var g6 = parseInt(h.substring(2, 4), 16);
+        var b6 = parseInt(h.substring(4, 6), 16);
+        var a6 = h.length === 8 ? parseInt(h.substring(6, 8), 16) / 255 : 1;
+        return isNaN(r6) ? null : [r6, g6, b6, a6];
+      }
+      return null;
+    }
+    var m = s.match(/^rgba?\(([^)]+)\)$/);
+    if (m) {
+      var p = m[1].split(',');
+      if (p.length >= 3) {
+        return [parseFloat(p[0]), parseFloat(p[1]), parseFloat(p[2]), p.length >= 4 ? parseFloat(p[3]) : 1];
+      }
+    }
+    var hm = s.match(/^hsla?\(([^)]+)\)$/);
+    if (hm) {
+      var hp = hm[1].split(',');
+      if (hp.length >= 3) {
+        var hDeg = ((parseFloat(hp[0]) % 360) + 360) % 360;
+        var sat = Math.max(0, Math.min(1, parseFloat(hp[1]) / 100));
+        var lit = Math.max(0, Math.min(1, parseFloat(hp[2]) / 100));
+        var al = hp.length >= 4 ? parseFloat(hp[3]) : 1;
+        var c = (1 - Math.abs(2 * lit - 1)) * sat;
+        var x = c * (1 - Math.abs(((hDeg / 60) % 2) - 1));
+        var m0 = lit - c / 2;
+        var rr = 0, gg = 0, bb = 0;
+        if (hDeg < 60) { rr = c; gg = x; }
+        else if (hDeg < 120) { rr = x; gg = c; }
+        else if (hDeg < 180) { gg = c; bb = x; }
+        else if (hDeg < 240) { gg = x; bb = c; }
+        else if (hDeg < 300) { rr = x; bb = c; }
+        else { rr = c; bb = x; }
+        return [Math.round((rr + m0) * 255), Math.round((gg + m0) * 255), Math.round((bb + m0) * 255), al];
+      }
+    }
+    return null;
+  }
+
+  function isColorValue(v) {
+    return parseCssColor(v) !== null;
+  }
+
+  function mapRoadColorByHint(hint, fallbackCol) {
+    var h = (hint || '').toLowerCase();
+    var isLink = h.indexOf('link') >= 0 || h.indexOf('ramp') >= 0;
+    if (h.indexOf('motorway') >= 0 || h.indexOf('interstate') >= 0) return isLink ? '#D97706' : '#F59E0B';
+    if (h.indexOf('trunk') >= 0 || h.indexOf('expressway') >= 0) return isLink ? '#EA580C' : '#FB923C';
+    if (h.indexOf('primary') >= 0) return isLink ? '#06B6D4' : '#22D3EE';
+    if (h.indexOf('secondary') >= 0) return isLink ? '#0284C7' : '#0EA5E9';
+    if (h.indexOf('tertiary') >= 0) return '#5B7EA6';
+    if (h.indexOf('cycleway') >= 0) return '#0891B2';
+    if (h.indexOf('ferry') >= 0) return '#38BDF8';
+    if (h.indexOf('rail') >= 0 || h.indexOf('transit') >= 0 || h.indexOf('subway') >= 0 || h.indexOf('tram') >= 0) return '#64748B';
+    if (h.indexOf('pedestrian') >= 0 || h.indexOf('path') >= 0 || h.indexOf('footway') >= 0 || h.indexOf('steps') >= 0) return '#475569';
+    if (h.indexOf('service') >= 0 || h.indexOf('track') >= 0 || h.indexOf('alley') >= 0 || h.indexOf('parking') >= 0) return obsServiceRoad();
+    if (h.indexOf('minor') >= 0 || h.indexOf('residential') >= 0 || h.indexOf('street') >= 0 || h.indexOf('unclassified') >= 0 || h.indexOf('living') >= 0) return obsMinorRoad();
+    if (fallbackCol) return fallbackCol;
+    return obsMinorRoad();
+  }
+
+  function mapExprColors(val, leafFn, hint) {
+    if (typeof val === 'string') {
+      return isColorValue(val) ? leafFn(val, hint) : val;
+    }
+    if (Array.isArray(val) && val.length > 0) {
+      var op = val[0];
+      var out = [op];
+      if (op === 'match' && val.length >= 4) {
+        out.push(val[1]);
+        for (var i = 2; i < val.length - 1; i += 2) {
+          var key = val[i];
+          var kh = Array.isArray(key) ? key.join(' ') : String(key);
+          out.push(key);
+          out.push(mapExprColors(val[i + 1], leafFn, (hint ? hint + ' ' : '') + kh));
+        }
+        out.push(mapExprColors(val[val.length - 1], leafFn, hint));
+        return out;
+      }
+      if (op === 'case' && val.length >= 4) {
+        for (var ci = 1; ci < val.length - 1; ci += 2) {
+          out.push(val[ci]);
+          out.push(mapExprColors(val[ci + 1], leafFn, hint));
+        }
+        out.push(mapExprColors(val[val.length - 1], leafFn, hint));
+        return out;
+      }
+      if ((op === 'interpolate' || op === 'interpolate-hcl' || op === 'interpolate-lab') && val.length >= 5) {
+        out.push(val[1]); out.push(val[2]);
+        for (var ii = 3; ii < val.length; ii += 2) {
+          out.push(val[ii]);
+          if (ii + 1 < val.length) out.push(mapExprColors(val[ii + 1], leafFn, hint));
+        }
+        return out;
+      }
+      if (op === 'step' && val.length >= 4) {
+        out.push(val[1]);
+        out.push(mapExprColors(val[2], leafFn, hint));
+        for (var si = 3; si < val.length; si += 2) {
+          out.push(val[si]);
+          if (si + 1 < val.length) out.push(mapExprColors(val[si + 1], leafFn, hint));
+        }
+        return out;
+      }
+      for (var j = 1; j < val.length; j++) {
+        out.push(mapExprColors(val[j], leafFn, hint));
+      }
+      return out;
+    }
+    if (val && typeof val === 'object' && Array.isArray(val.stops)) {
+      var copyObj = JSON.parse(JSON.stringify(val));
+      for (var k = 0; k < copyObj.stops.length; k++) {
+        if (Array.isArray(copyObj.stops[k]) && copyObj.stops[k].length >= 2) {
+          copyObj.stops[k][1] = mapExprColors(copyObj.stops[k][1], leafFn, hint);
+        }
+      }
+      return copyObj;
+    }
+    return val;
+  }
+
+  function luminanceBoostColor(cssCol, minLum, maxLum) {
+    var rgba = parseCssColor(cssCol);
+    if (!rgba) return '#CBD5E1';
+    var r = rgba[0], g = rgba[1], b = rgba[2], a = rgba[3];
+    var lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    if (lum < minLum) {
+      var t = (minLum - lum) / Math.max(0.01, 1 - lum);
+      r = Math.round(r + (235 - r) * t);
+      g = Math.round(g + (245 - g) * t);
+      b = Math.round(b + (255 - b) * t);
+    } else if (lum > maxLum) {
+      var k = maxLum / lum;
+      r = Math.round(r * k);
+      g = Math.round(g * k);
+      b = Math.round(b * k);
+    }
+    return a < 0.99 ? ('rgba(' + r + ',' + g + ',' + b + ',' + a.toFixed(2) + ')') : ('rgb(' + r + ',' + g + ',' + b + ')');
+  }
+
+  function transformLayerForObsidian(layer) {
+    var id = (layer.id || '').toLowerCase();
+    var sl = (layer['source-layer'] || '').toLowerCase();
+    if (id.indexOf('strada-') === 0 || id.indexOf('waze-') === 0 || id.indexOf('active-route') === 0 ||
+        id.indexOf('alt-routes') === 0 || id.indexOf('route-') === 0 || id.indexOf('car-') === 0 ||
+        id.indexOf('preview-') === 0 || id.indexOf('alert-wave') === 0) {
+      return layer;
+    }
+    if (!layer.layout) layer.layout = {};
+    if (!layer.paint) layer.paint = {};
+    layer.layout.visibility = 'visible';
+
+    var p = layer.paint;
+
+    if (layer.type === 'background') {
+      p['background-color'] = obsBg();
+      return layer;
+    }
+    if (layer.type === 'raster') {
+      p['raster-opacity'] = 0.24;
+      p['raster-brightness-max'] = 0.36;
+      p['raster-contrast'] = 0.25;
+      p['raster-saturation'] = -0.35;
+      return layer;
+    }
+
+    var isWater = sl === 'water' || sl === 'waterway' || id.indexOf('water') >= 0 || id.indexOf('ocean') >= 0 || id.indexOf('river') >= 0;
+    var isPark = sl === 'park' || sl === 'landcover' || id.indexOf('park') >= 0 || id.indexOf('wood') >= 0 || id.indexOf('forest') >= 0 ||
+                 id.indexOf('grass') >= 0 || id.indexOf('green') >= 0 || id.indexOf('pitch') >= 0 || id.indexOf('cemetery') >= 0 ||
+                 id.indexOf('meadow') >= 0 || id.indexOf('sand') >= 0 || id.indexOf('ice') >= 0 || id.indexOf('glacier') >= 0;
+    var isLanduse = sl === 'landuse' || id.indexOf('landuse') >= 0 || id.indexOf('residential') >= 0 || id.indexOf('commercial') >= 0 ||
+                    id.indexOf('industrial') >= 0 || id.indexOf('hospital') >= 0 || id.indexOf('school') >= 0;
+    var isBuilding = sl === 'building' || id.indexOf('building') >= 0;
+    var isAeroway = sl === 'aeroway' || id.indexOf('aeroway') >= 0 || id.indexOf('airport') >= 0 || id.indexOf('runway') >= 0;
+    var isBoundary = sl === 'boundary' || id.indexOf('boundary') >= 0 || id.indexOf('admin') >= 0;
+    var isRoad = sl === 'transportation' || sl === 'transportation_name' || id.indexOf('road') >= 0 || id.indexOf('highway') >= 0 ||
+                 id.indexOf('tunnel') >= 0 || id.indexOf('bridge') >= 0 || id.indexOf('street') >= 0 || id.indexOf('rail') >= 0 ||
+                 id.indexOf('transit') >= 0 || id.indexOf('ferry') >= 0 || id.indexOf('path') >= 0 || id.indexOf('track') >= 0 ||
+                 id.indexOf('oneway') >= 0 || id.indexOf('motorway') >= 0 || id.indexOf('trunk') >= 0 || id.indexOf('primary') >= 0;
+
+    if (layer.type === 'fill') {
+      if (isWater) {
+        p['fill-color'] = id.indexOf('intermittent') >= 0 ? '#0E345E' : '#0B2848';
+        if (p['fill-outline-color']) p['fill-outline-color'] = '#1D4ED8';
+        if (typeof p['fill-opacity'] === 'number') p['fill-opacity'] = Math.max(0.88, p['fill-opacity']);
+      } else if (isBuilding) {
+        p['fill-color'] = obsBldg2d();
+        p['fill-outline-color'] = '#24344D';
+        if (typeof p['fill-opacity'] === 'number') p['fill-opacity'] = Math.max(0.88, p['fill-opacity']);
+      } else if (isPark) {
+        var parkCol = '#0D2C22';
+        if (id.indexOf('wood') >= 0 || id.indexOf('forest') >= 0) parkCol = '#0A241C';
+        else if (id.indexOf('pitch') >= 0 || id.indexOf('stadium') >= 0 || id.indexOf('golf') >= 0) parkCol = '#114232';
+        else if (id.indexOf('sand') >= 0 || id.indexOf('desert') >= 0) parkCol = '#171C24';
+        else if (id.indexOf('ice') >= 0 || id.indexOf('glacier') >= 0) parkCol = '#13293D';
+        p['fill-color'] = mapExprColors(p['fill-color'], function(c, kh) {
+          var k = (kh || '').toLowerCase();
+          if (k.indexOf('wood') >= 0 || k.indexOf('forest') >= 0) return '#0A241C';
+          if (k.indexOf('sand') >= 0) return '#171C24';
+          if (k.indexOf('ice') >= 0 || k.indexOf('glacier') >= 0) return '#13293D';
+          return parkCol;
+        }, id);
+        if (p['fill-outline-color']) p['fill-outline-color'] = '#14533D';
+        if (typeof p['fill-opacity'] === 'number') p['fill-opacity'] = Math.max(0.84, p['fill-opacity']);
+      } else if (isAeroway) {
+        p['fill-color'] = '#162033';
+      } else if (isLanduse) {
+        var luCol = obsUrban();
+        if (id.indexOf('commercial') >= 0 || id.indexOf('retail') >= 0) luCol = '#111827';
+        else if (id.indexOf('industrial') >= 0 || id.indexOf('railway') >= 0) luCol = '#0F151F';
+        else if (id.indexOf('hospital') >= 0) luCol = '#1B1322';
+        else if (id.indexOf('school') >= 0 || id.indexOf('university') >= 0) luCol = '#11192A';
+        else if (id.indexOf('cemetery') >= 0) luCol = '#0D2C22';
+        p['fill-color'] = mapExprColors(p['fill-color'], function(c, kh) {
+          var k = (kh || '').toLowerCase();
+          if (k.indexOf('hospital') >= 0) return '#1B1322';
+          if (k.indexOf('school') >= 0 || k.indexOf('university') >= 0) return '#11192A';
+          if (k.indexOf('commercial') >= 0 || k.indexOf('retail') >= 0) return '#111827';
+          if (k.indexOf('industrial') >= 0) return '#0F151F';
+          if (k.indexOf('park') >= 0 || k.indexOf('grass') >= 0 || k.indexOf('cemetery') >= 0) return '#0D2C22';
+          return luCol;
+        }, id);
+      } else if (p['fill-color']) {
+        p['fill-color'] = mapExprColors(p['fill-color'], function(c) { return luminanceBoostColor(c, 0.08, 0.22); }, id);
+      }
+      return layer;
+    }
+
+    if (layer.type === 'fill-extrusion') {
+      p['fill-extrusion-color'] = obsBldg3d();
+      p['fill-extrusion-opacity'] = 0.88;
+      return layer;
+    }
+
+    if (layer.type === 'line') {
+      var isCasing = id.indexOf('casing') >= 0 || id.indexOf('border') >= 0 || id.indexOf('outline') >= 0 || id.indexOf('shadow') >= 0;
+      var isTunnel = id.indexOf('tunnel') >= 0;
+      if (isWater) {
+        p['line-color'] = (id.indexOf('river') >= 0 || id.indexOf('canal') >= 0) ? '#0EA5E9' : '#0284C7';
+        p['line-opacity'] = 0.88;
+      } else if (isBoundary) {
+        p['line-color'] = '#64748B';
+        p['line-opacity'] = typeof p['line-opacity'] === 'number' ? Math.max(0.75, p['line-opacity']) : 0.82;
+      } else if (isAeroway) {
+        p['line-color'] = id.indexOf('runway') >= 0 ? '#38BDF8' : '#475569';
+      } else if (isRoad) {
+        if (isCasing) {
+          p['line-color'] = isTunnel ? '#090D16' : '#04060B';
+        } else if (id.indexOf('rail') >= 0 || id.indexOf('transit') >= 0 || id.indexOf('subway') >= 0 || id.indexOf('tram') >= 0) {
+          p['line-color'] = p['line-dasharray'] ? '#CBD5E1' : '#64748B';
+        } else if (id.indexOf('ferry') >= 0) {
+          p['line-color'] = '#38BDF8';
+          p['line-opacity'] = 0.78;
+        } else if (id.indexOf('oneway') >= 0) {
+          p['line-color'] = '#E0F2FE';
+        } else {
+          if (p['line-color']) {
+            p['line-color'] = mapExprColors(p['line-color'], function(c, kh) {
+              return mapRoadColorByHint((kh ? kh + ' ' : '') + id, obsMinorRoad());
+            }, id);
+          } else {
+            p['line-color'] = mapRoadColorByHint(id, obsMinorRoad());
+          }
+          if (isTunnel && typeof p['line-opacity'] !== 'object') {
+            p['line-opacity'] = 0.72;
+          }
+        }
+      } else if (isPark) {
+        p['line-color'] = '#15803D';
+      } else if (p['line-color']) {
+        p['line-color'] = mapExprColors(p['line-color'], function(c) { return luminanceBoostColor(c, 0.35, 0.88); }, id);
+      }
+      return layer;
+    }
+
+    if (layer.type === 'symbol') {
+      var txtCol = '#F4F8FF';
+      if (isWater) {
+        txtCol = '#38BDF8';
+      } else if (isPark || sl === 'mountain_peak' || id.indexOf('peak') >= 0) {
+        txtCol = '#34D399';
+      } else if (sl === 'poi' || id.indexOf('poi') >= 0) {
+        txtCol = '#BAE6FD';
+      } else if (sl === 'housenumber' || id.indexOf('housenumber') >= 0) {
+        txtCol = '#94A3B8';
+      } else if (isRoad || id.indexOf('shield') >= 0 || id.indexOf('highway') >= 0) {
+        txtCol = (id.indexOf('motorway') >= 0 || id.indexOf('trunk') >= 0) ? '#FDE68A' : '#F4F8FF';
+      } else if (sl === 'place' || id.indexOf('place') >= 0 || id.indexOf('label') >= 0) {
+        txtCol = (id.indexOf('city') >= 0 || id.indexOf('country') >= 0 || id.indexOf('state') >= 0 || id.indexOf('capital') >= 0)
+          ? '#FFFFFF' : '#E2E8F0';
+      }
+      p['text-color'] = txtCol;
+      p['text-halo-color'] = '#04060B';
+      p['text-halo-width'] = (sl === 'housenumber' || id.indexOf('housenumber') >= 0) ? 1.4 : 2.0;
+      p['text-halo-blur'] = 0.45;
+      p['icon-opacity'] = 1.0;
+      if (p['icon-color']) {
+        p['icon-color'] = '#E0F2FE';
+      }
+      return layer;
+    }
+
+    if (layer.type === 'circle') {
+      if (p['circle-color']) p['circle-color'] = mapExprColors(p['circle-color'], function(c) { return luminanceBoostColor(c, 0.50, 0.95); }, id);
+      if (p['circle-stroke-color']) p['circle-stroke-color'] = '#04060B';
+      return layer;
+    }
+
+    return layer;
+  }
+
+  function transformStyleForTheme(prevStyle, nextStyle) {
+    if (state.isLight || state.offlineMode || !nextStyle || !Array.isArray(nextStyle.layers)) {
+      return nextStyle;
+    }
+    try {
+      var cloned = JSON.parse(JSON.stringify(nextStyle));
+      cloned.light = {
+        anchor: 'viewport',
+        color: '#E0F2FE',
+        intensity: 0.34,
+        position: [1.2, 180, 45]
+      };
+      for (var i = 0; i < cloned.layers.length; i++) {
+        cloned.layers[i] = transformLayerForObsidian(cloned.layers[i]);
+      }
+      return cloned;
+    } catch (e) {
+      return nextStyle;
+    }
+  }
+
+  function enhanceDarkSprites(map) {
+    if (state.isLight || state.offlineMode || state.spritesEnhanced) return;
+    state.spritesEnhanced = true;
+    try {
+      var ids = map.listImages();
+      if (!ids || !ids.length) return;
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        if (!id || id === 'car-puck' || id === 'preview-pin' || id.indexOf('hazard-') === 0) continue;
+        var img = map.getImage(id);
+        if (!img || img.sdf || !img.data || !img.data.data) continue;
+        var w = img.data.width, h = img.data.height, src = img.data.data;
+        if (!w || !h || src.length !== w * h * 4) continue;
+        var lumSum = 0, visCount = 0;
+        for (var p = 0; p < src.length; p += 4) {
+          var a0 = src[p + 3];
+          if (a0 > 24) {
+            lumSum += (0.299 * src[p] + 0.587 * src[p + 1] + 0.114 * src[p + 2]) / 255;
+            visCount++;
+          }
+        }
+        if (visCount === 0) continue;
+        var avgLum = lumSum / visCount;
+        var lowId = id.toLowerCase();
+        var isShield = lowId.indexOf('shield') >= 0 || lowId.indexOf('badge') >= 0;
+        if (isShield && avgLum >= 0.42) continue;
+        if (!isShield && avgLum >= 0.62) continue;
+
+        var dst = new Uint8ClampedArray(src.length);
+        for (var q = 0; q < src.length; q += 4) {
+          var r = src[q], g = src[q + 1], b = src[q + 2], a = src[q + 3];
+          if (a < 10) {
+            dst[q] = r; dst[q + 1] = g; dst[q + 2] = b; dst[q + 3] = a;
+            continue;
+          }
+          var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+          var diff = mx - mn;
+          if (diff < 36) {
+            // Charcoal / dark-gray icon pixel -> luminous pale cyan-white
+            var l = (0.299 * r + 0.587 * g + 0.114 * b);
+            var inv = Math.max(175, Math.min(255, 255 - Math.round(l * 0.65)));
+            dst[q] = Math.round(inv * 0.90);
+            dst[q + 1] = Math.round(inv * 0.96);
+            dst[q + 2] = inv;
+            dst[q + 3] = a;
+          } else {
+            // Colored POI badge/icon pixel -> preserve hue and boost luminance
+            var lumPx = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+            if (lumPx < 0.55) {
+              var boost = Math.min(2.2, 0.72 / Math.max(0.18, lumPx));
+              dst[q] = Math.min(255, Math.round(r * boost + 30));
+              dst[q + 1] = Math.min(255, Math.round(g * boost + 30));
+              dst[q + 2] = Math.min(255, Math.round(b * boost + 30));
+            } else {
+              dst[q] = r; dst[q + 1] = g; dst[q + 2] = b;
+            }
+            dst[q + 3] = a;
+          }
+        }
+        map.updateImage(id, { width: w, height: h, data: dst });
+      }
+    } catch (e) {}
   }
 
   function ensureImages(map) {
     if (!map.hasImage('car-puck')) {
-      var sz = 72;
+      var sz = 76;
       var c = document.createElement('canvas');
       c.width = sz; c.height = sz;
       var ctx = c.getContext('2d');
       var cx = sz / 2, cy = sz / 2;
       ctx.beginPath();
-      ctx.arc(cx, cy, 30, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(230, 57, 70, 0.24)';
+      ctx.arc(cx, cy, 31, 0, Math.PI * 2);
+      ctx.fillStyle = state.isLight ? 'rgba(15, 23, 42, 0.20)' : 'rgba(34, 211, 238, 0.24)';
       ctx.fill();
 
       ctx.beginPath();
-      ctx.moveTo(cx, cy - 22);
-      ctx.lineTo(cx + 16, cy + 16);
+      ctx.moveTo(cx, cy - 23);
+      ctx.lineTo(cx + 17, cy + 17);
       ctx.lineTo(cx, cy + 8);
-      ctx.lineTo(cx - 16, cy + 16);
+      ctx.lineTo(cx - 17, cy + 17);
       ctx.closePath();
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 6.5;
+      ctx.strokeStyle = '#0F172A';
+      ctx.stroke();
       ctx.fillStyle = state.accent || '#E63946';
       ctx.fill();
-      ctx.lineWidth = 3.5;
+      ctx.lineWidth = 3.2;
       ctx.strokeStyle = '#FFFFFF';
       ctx.stroke();
       map.addImage('car-puck', ctx.getImageData(0, 0, sz, sz));
@@ -166,19 +631,134 @@
       g.fill();
       map.addImage('preview-pin', g.getImageData(0, 0, w, h));
     }
+    ensureHazardSprite(map, 'hazard-accident', '#EF4444', 'accident');
+    ensureHazardSprite(map, 'hazard-pothole', '#F59E0B', 'pothole');
+    ensureHazardSprite(map, 'hazard-hazard', '#F97316', 'hazard');
+    ensureHazardSprite(map, 'hazard-police', '#2563EB', 'police');
+    ensureHazardSprite(map, 'hazard-flood', '#06B6D4', 'flood');
+    ensureHazardSprite(map, 'hazard-closure', '#DC2626', 'closure');
+  }
+
+  function ensureHazardSprite(map, name, bgHex, kind) {
+    if (map.hasImage(name)) return;
+    var sz = 68;
+    var c = document.createElement('canvas');
+    c.width = sz; c.height = sz;
+    var ctx = c.getContext('2d');
+    var cx = sz / 2, cy = sz / 2;
+
+    // Soft drop shadow
+    ctx.beginPath();
+    ctx.arc(cx, cy + 3, 25, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.34)';
+    ctx.fill();
+
+    // Outer white ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 24, 0, Math.PI * 2);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+
+    // Inner colored disc
+    ctx.beginPath();
+    ctx.arc(cx, cy, 20, 0, Math.PI * 2);
+    ctx.fillStyle = bgHex;
+    ctx.fill();
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.fillStyle = '#FFFFFF';
+
+    if (kind === 'accident') {
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 10);
+      ctx.lineTo(cx, cy + 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy + 9, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (kind === 'pothole') {
+      // Road rim + crater dip
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cx - 12, cy + 4);
+      ctx.lineTo(cx - 7, cy + 4);
+      ctx.quadraticCurveTo(cx, cy + 13, cx + 7, cy + 4);
+      ctx.lineTo(cx + 12, cy + 4);
+      ctx.stroke();
+      ctx.lineWidth = 3.2;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 11);
+      ctx.lineTo(cx, cy - 3);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy + 1, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (kind === 'police') {
+      ctx.font = 'bold 22px -apple-system, Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('P', cx, cy + 1);
+    } else if (kind === 'flood') {
+      ctx.lineWidth = 3.2;
+      for (var wy = -5; wy <= 7; wy += 6) {
+        ctx.beginPath();
+        ctx.moveTo(cx - 10, cy + wy);
+        ctx.quadraticCurveTo(cx - 5, cy + wy - 3, cx, cy + wy);
+        ctx.quadraticCurveTo(cx + 5, cy + wy + 3, cx + 10, cy + wy);
+        ctx.stroke();
+      }
+    } else if (kind === 'closure') {
+      ctx.fillRect(cx - 11, cy - 3.5, 22, 7);
+    } else {
+      // General road hazard triangle exclamation
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 11);
+      ctx.lineTo(cx + 11, cy + 9);
+      ctx.lineTo(cx - 11, cy + 9);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.lineWidth = 2.8;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 4);
+      ctx.lineTo(cx, cy + 3);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy + 6.5, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    map.addImage(name, ctx.getImageData(0, 0, sz, sz));
   }
 
   function add3dBuildings(map) {
     try {
-      if (map.getLayer('strada-3d-buildings')) return;
+      var bCol = state.isLight ? '#D0D6E0' : obsBldg3d();
+      var bOp = state.isLight ? 0.78 : 0.88;
+      if (map.getLayer('strada-3d-buildings')) {
+        map.setLayoutProperty('strada-3d-buildings', 'visibility', 'visible');
+        map.setPaintProperty('strada-3d-buildings', 'fill-extrusion-color', bCol);
+        map.setPaintProperty('strada-3d-buildings', 'fill-extrusion-opacity', bOp);
+        return;
+      }
       var style = map.getStyle();
       if (!style || !style.sources) return;
+      var layers = style.layers || [];
+      for (var li = 0; li < layers.length; li++) {
+        if (layers[li].type === 'fill-extrusion' && (layers[li]['source-layer'] === 'building' || (layers[li].id || '').indexOf('building') >= 0)) {
+          map.setLayoutProperty(layers[li].id, 'visibility', 'visible');
+          map.setPaintProperty(layers[li].id, 'fill-extrusion-color', bCol);
+          map.setPaintProperty(layers[li].id, 'fill-extrusion-opacity', bOp);
+          return;
+        }
+      }
       var vecSrc = null;
       for (var k in style.sources) {
         if (style.sources[k] && style.sources[k].type === 'vector') { vecSrc = k; break; }
       }
       if (!vecSrc) return;
-      var layers = style.layers || [];
       var labelId;
       for (var i = 0; i < layers.length; i++) {
         if (layers[i].type === 'symbol' && layers[i].layout && layers[i].layout['text-field']) {
@@ -191,13 +771,13 @@
         source: vecSrc,
         'source-layer': 'building',
         type: 'fill-extrusion',
-        minzoom: 14,
-        layout: { visibility: state.view3d ? 'visible' : 'none' },
+        minzoom: 13.5,
+        layout: { visibility: 'visible' },
         paint: {
-          'fill-extrusion-color': state.isLight ? '#D4D9E2' : '#262B36',
+          'fill-extrusion-color': bCol,
           'fill-extrusion-height': ['coalesce', ['get', 'render_height'], ['get', 'height'], 12],
           'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], ['get', 'min_height'], 0],
-          'fill-extrusion-opacity': 0.72
+          'fill-extrusion-opacity': bOp
         }
       }, labelId);
     } catch (e) {}
@@ -205,8 +785,40 @@
 
   function setupDataLayers(map) {
     ensureImages(map);
+    enhanceDarkSprites(map);
     add3dBuildings(map);
     var emptyFC = { type: 'FeatureCollection', features: [] };
+
+    if (!map.getSource('waze-jams-src')) {
+      map.addSource('waze-jams-src', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'waze-jams-casing',
+        type: 'line',
+        source: 'waze-jams-src',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': state.isLight ? 'rgba(15, 23, 42, 0.40)' : 'rgba(2, 4, 8, 0.85)',
+          'line-width': 7.5,
+          'line-opacity': 0.85
+        }
+      });
+      map.addLayer({
+        id: 'waze-jams-line',
+        type: 'line',
+        source: 'waze-jams-src',
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': [
+            'case',
+            ['>=', ['get', 'level'], 4], '#EF4444',
+            ['==', ['get', 'level'], 3], '#F97316',
+            '#F59E0B'
+          ],
+          'line-width': 4.5,
+          'line-opacity': 0.94
+        }
+      });
+    }
 
     if (!map.getSource('alt-routes')) {
       map.addSource('alt-routes', { type: 'geojson', data: emptyFC });
@@ -218,7 +830,7 @@
         paint: {
           'line-color': state.isLight ? '#64748B' : '#94A3B8',
           'line-width': 5,
-          'line-opacity': 0.65,
+          'line-opacity': 0.72,
           'line-dasharray': [2, 1.5]
         }
       });
@@ -232,9 +844,9 @@
         source: 'active-route',
         layout: { 'line-join': 'round', 'line-cap': 'round' },
         paint: {
-          'line-color': state.isLight ? '#1E293B' : '#090A0D',
-          'line-width': 11,
-          'line-opacity': 0.78
+          'line-color': state.isLight ? '#0F172A' : '#020408',
+          'line-width': 12,
+          'line-opacity': 0.92
         }
       });
       map.addLayer({
@@ -244,7 +856,7 @@
         layout: { 'line-join': 'round', 'line-cap': 'round' },
         paint: {
           'line-color': state.accent || '#E63946',
-          'line-width': 6.5
+          'line-width': 7
         }
       });
     }
@@ -313,21 +925,6 @@
       });
     }
 
-    if (!map.getSource('police-reports-src')) {
-      map.addSource('police-reports-src', { type: 'geojson', data: emptyFC });
-      map.addLayer({
-        id: 'police-reports-layer',
-        type: 'circle',
-        source: 'police-reports-src',
-        paint: {
-          'circle-radius': 8.5,
-          'circle-color': '#2563EB',
-          'circle-stroke-width': 2.8,
-          'circle-stroke-color': '#FFFFFF'
-        }
-      });
-    }
-
     if (!map.getSource('preview-pin-src')) {
       map.addSource('preview-pin-src', { type: 'geojson', data: emptyFC });
       map.addLayer({
@@ -343,6 +940,21 @@
       });
     }
 
+    if (!map.getSource('waze-hazards-src')) {
+      map.addSource('waze-hazards-src', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'waze-hazards-layer',
+        type: 'symbol',
+        source: 'waze-hazards-src',
+        layout: {
+          'icon-image': ['get', 'icon'],
+          'icon-size': 0.68,
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true
+        }
+      });
+    }
+
     if (!map.getSource('car-src')) {
       map.addSource('car-src', { type: 'geojson', data: emptyFC });
       map.addLayer({
@@ -351,9 +963,10 @@
         source: 'car-src',
         layout: {
           'icon-image': 'car-puck',
-          'icon-size': 0.72,
+          'icon-size': 0.86,
           'icon-rotate': ['get', 'bearing'],
           'icon-rotation-alignment': 'map',
+          'icon-pitch-alignment': 'map',
           'icon-allow-overlap': true,
           'icon-ignore-placement': true
         }
@@ -361,15 +974,66 @@
     }
 
     syncRouteLayers();
-    syncPoliceLayer();
+    syncHazardsLayers();
     syncPreviewLayer();
     syncCarLayer();
     syncWaveLoop();
   }
 
-  function syncRouteLayers() {
+  function syncHazardsLayers() {
     var map = state.map;
     if (!map || !state.styleLoaded) return;
+    var sJams = map.getSource('waze-jams-src');
+    var sHaz = map.getSource('waze-hazards-src');
+    if (!sJams || !sHaz) return;
+
+    var jamFeats = [];
+    var jams = state.hazards.jams || [];
+    for (var ji = 0; ji < jams.length; ji++) {
+      var jm = jams[ji];
+      if (!jm || !jm.pts || jm.pts.length < 4) continue;
+      var coords = [];
+      for (var pi = 0; pi < jm.pts.length; pi += 2) {
+        coords.push([jm.pts[pi + 1], jm.pts[pi]]);
+      }
+      if (coords.length >= 2) {
+        jamFeats.push({
+          type: 'Feature',
+          properties: { level: jm.level || 3, street: jm.street || '' },
+          geometry: { type: 'LineString', coordinates: coords }
+        });
+      }
+    }
+    sJams.setData({ type: 'FeatureCollection', features: jamFeats });
+
+    var hazFeats = [];
+    var alerts = state.hazards.alerts || [];
+    for (var ai = 0; ai < alerts.length; ai++) {
+      var al = alerts[ai];
+      if (!al || isNaN(al.lat) || isNaN(al.lon)) continue;
+      hazFeats.push({
+        type: 'Feature',
+        properties: {
+          id: al.id || '',
+          icon: al.icon || 'hazard-hazard',
+          cat: al.cat || 'emergency',
+          title: al.title || ''
+        },
+        geometry: { type: 'Point', coordinates: [al.lon, al.lat] }
+      });
+    }
+    sHaz.setData({ type: 'FeatureCollection', features: hazFeats });
+  }
+
+  function syncRouteLayers() {
+    var map = state.map;
+    if (!map) return;
+    if (!state.styleLoaded && map.isStyleLoaded && map.isStyleLoaded()) {
+      state.styleLoaded = true;
+      setupDataLayers(map);
+      return;
+    }
+    if (!state.styleLoaded) return;
     var emptyFC = { type: 'FeatureCollection', features: [] };
     var rd = state.routeData;
     var sAlt = map.getSource('alt-routes');
@@ -440,6 +1104,9 @@
     if (state.preview.name) {
       var el = document.createElement('div');
       el.className = 'strada-pin-lbl' + (state.isLight ? ' light' : '');
+      el.style.backgroundColor = state.isLight ? 'rgba(255, 255, 255, 0.96)' : 'rgba(20, 24, 34, 0.96)';
+      el.style.color = state.isLight ? '#14161B' : '#F4F7FC';
+      el.style.border = state.isLight ? '1px solid rgba(15, 23, 42, 0.14)' : '1px solid rgba(255, 255, 255, 0.22)';
       el.textContent = state.preview.name;
       state.previewPopup = new maplibregl.Marker({ element: el, anchor: 'bottom', offset: [0, -56] })
         .setLngLat([state.preview.lon, state.preview.lat])
@@ -449,10 +1116,21 @@
 
   function syncCarLayer() {
     var map = state.map;
-    if (!map || !state.styleLoaded) return;
+    if (!map) return;
+    if (!state.styleLoaded && map.isStyleLoaded && map.isStyleLoaded()) {
+      state.styleLoaded = true;
+      setupDataLayers(map);
+      return;
+    }
+    if (!state.styleLoaded) return;
     var src = map.getSource('car-src');
     if (!src) return;
-    if (!state.hasFix || isNaN(state.carLat) || isNaN(state.carLon)) {
+    var lat = state.carLat, lon = state.carLon;
+    if ((isNaN(lat) || isNaN(lon)) && state.navActive && !isNaN(state.initLat) && !isNaN(state.initLon)) {
+      lat = state.initLat;
+      lon = state.initLon;
+    }
+    if (isNaN(lat) || isNaN(lon)) {
       src.setData({ type: 'FeatureCollection', features: [] });
       return;
     }
@@ -461,24 +1139,9 @@
       features: [{
         type: 'Feature',
         properties: { bearing: state.carBearing || 0 },
-        geometry: { type: 'Point', coordinates: [state.carLon, state.carLat] }
+        geometry: { type: 'Point', coordinates: [lon, lat] }
       }]
     });
-  }
-
-  function syncPoliceLayer() {
-    var map = state.map;
-    if (!map || !state.styleLoaded) return;
-    var src = map.getSource('police-reports-src');
-    if (!src) return;
-    var list = state.policeReports || [];
-    var feats = [];
-    for (var i = 0; i < list.length; i++) {
-      var p = list[i];
-      if (!p || isNaN(p.lat) || isNaN(p.lon)) continue;
-      feats.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [p.lon, p.lat] } });
-    }
-    src.setData({ type: 'FeatureCollection', features: feats });
   }
 
   function syncWaveLoop() {
@@ -501,18 +1164,17 @@
       }
       var s = state.map.getSource('alert-wave-src');
       if (s) {
-        var period = state.wave.kind === 'police' ? 1400 : 1700;
+        var period = 1700;
         var p1 = (ts % period) / period;
         var p2 = ((ts + period * 0.5) % period) / period;
-        var col1 = state.wave.kind === 'police' ? '#2563EB' : state.wave.kind === 'radar' ? '#EF4444' : '#F59E0B';
-        var col2 = state.wave.kind === 'police' ? '#EF4444' : col1;
+        var col1 = state.wave.kind === 'radar' ? '#EF4444' : '#F59E0B';
         s.setData({
           type: 'FeatureCollection',
           features: [{
             type: 'Feature',
             properties: {
               col1: col1,
-              col2: col2,
+              col2: col1,
               r1: 10 + p1 * 50,
               o1: (1 - p1) * 0.22,
               so1: (1 - p1) * 0.90,
@@ -530,23 +1192,26 @@
   }
 
   function desiredPitch() {
-    return (state.view3d && !state.overview) ? Math.max(0, Math.min(60, state.tiltAngle || 45)) : 0;
+    return !state.overview ? Math.max(0, Math.min(60, state.tiltAngle || 30)) : 0;
   }
 
-  function applyCameraFollow(dur) {
+  function applyCameraFollow(dur, targetZoom) {
     var map = state.map;
     if (!map || !state.following || state.overview || state.preview || !state.hasFix) return;
     var pitch = desiredPitch();
     var br = (state.headingUp && !isNaN(state.carBearing)) ? state.carBearing : 0;
     var h = map.getContainer().clientHeight || 400;
-    map.easeTo({
+    var padFrac = state.navActive ? 0.34 : 0.25;
+    var opts = {
       center: [state.carLon, state.carLat],
       pitch: pitch,
       bearing: br,
-      padding: pitch > 0 ? { top: Math.round(h * 0.25), bottom: 20, left: 0, right: 0 } : { top: 0, bottom: 0, left: 0, right: 0 },
+      padding: pitch > 0 ? { top: Math.round(h * padFrac), bottom: 16, left: 0, right: 0 } : { top: 0, bottom: 0, left: 0, right: 0 },
       duration: dur || 450,
       essential: true
-    });
+    };
+    if (typeof targetZoom === 'number' && !isNaN(targetZoom)) opts.zoom = targetZoom;
+    map.easeTo(opts);
   }
 
   function initMap() {
@@ -555,28 +1220,47 @@
       return;
     }
     try {
-      document.body.style.background = state.isLight ? '#E8EBF0' : '#15171C';
+      document.body.style.background = state.isLight ? '#E8EBF0' : obsBg();
       var map = new maplibregl.Map({
         container: 'map',
-        style: styleUrlFor(state.isLight, state.rasterFallback),
         center: [state.initLon, state.initLat],
         zoom: state.initZoom,
         pitch: desiredPitch(),
         bearing: 0,
-        attributionControl: true
+        attributionControl: false
       });
       state.map = map;
 
-      map.on('style.load', function() {
+      function ensureStyleLayersReady() {
         state.styleLoaded = true;
+        state.styleSwitching = false;
         setupDataLayers(map);
+      }
+
+      map.on('style.load', ensureStyleLayersReady);
+      map.on('styledata', function() {
+        if (!state.styleLoaded && map.isStyleLoaded()) ensureStyleLayersReady();
+        else if (state.styleLoaded && !map.getSource('active-route') && map.isStyleLoaded()) setupDataLayers(map);
+      });
+      map.on('idle', function() {
+        if (!state.styleLoaded || !map.getSource('active-route')) ensureStyleLayersReady();
       });
 
-      map.on('error', function(ev) {
-        if (!state.styleLoaded && !state.rasterFallback) {
-          state.rasterFallback = true;
-          try { map.setStyle(styleUrlFor(state.isLight, true)); } catch (e) { notifyFail('style_err'); }
+      map.on('error', function(e) {
+        if (state.styleSwitching) return;
+        if (!state.styleLoaded && !state.offlineMode && (!e || !e.sourceId)) {
+          state.offlineMode = true;
+          try {
+            map.setStyle(styleUrlFor(state.isLight, true), { diff: false });
+          } catch (err) {
+            notifyFail('style_err');
+          }
         }
+      });
+
+      map.setStyle(styleUrlFor(state.isLight, state.offlineMode), {
+        diff: false,
+        transformStyle: transformStyleForTheme
       });
 
       function onManualMove(e) {
@@ -591,20 +1275,40 @@
       map.on('dragstart', onManualMove);
       map.on('rotatestart', onManualMove);
       map.on('pitchstart', onManualMove);
+      map.on('zoomstart', function(e) {
+        if (e && e.originalEvent) state.userZoomed = true;
+      });
 
       map.on('moveend', function() {
         var c = map.getCenter();
         notifyCamera(c.lat, c.lng, map.getZoom());
       });
 
+      map.on('mouseenter', 'waze-hazards-layer', function() {
+        try { map.getCanvas().style.cursor = 'pointer'; } catch (e) {}
+      });
+      map.on('mouseleave', 'waze-hazards-layer', function() {
+        try { map.getCanvas().style.cursor = ''; } catch (e) {}
+      });
       map.on('click', function(e) {
-        if (e && e.lngLat) notifyPick(e.lngLat.lat, e.lngLat.lng);
+        if (!e) return;
+        try {
+          if (map.getLayer('waze-hazards-layer')) {
+            var pad = 10;
+            var box = [[e.point.x - pad, e.point.y - pad], [e.point.x + pad, e.point.y + pad]];
+            var hits = map.queryRenderedFeatures(box, { layers: ['waze-hazards-layer'] });
+            if (hits && hits.length > 0 && hits[0].properties && hits[0].properties.id) {
+              notifyHazardTap(hits[0].properties.id);
+              return;
+            }
+          }
+        } catch (err) {}
+        if (e.lngLat) notifyPick(e.lngLat.lat, e.lngLat.lng);
       });
       map.on('contextmenu', function(e) {
         if (e && e.lngLat) notifyPick(e.lngLat.lat, e.lngLat.lng);
       });
 
-      // Touch long-press helper for Android WebViews where contextmenu is suppressed
       var holdTimer = null, holdStart = null;
       var canvas = map.getCanvas();
       canvas.addEventListener('touchstart', function(ev) {
@@ -644,12 +1348,63 @@
   window.StradaMap = {
     setTheme: function(isLight, accentHex) {
       var changed = state.isLight !== !!isLight;
+      var accChanged = !!accentHex && state.accent !== accentHex;
       state.isLight = !!isLight;
       if (accentHex) state.accent = accentHex;
-      document.body.style.background = state.isLight ? '#E8EBF0' : '#15171C';
+      try { document.documentElement.style.colorScheme = state.isLight ? 'light' : 'dark'; } catch (e) {}
+      document.body.style.background = state.isLight ? '#E8EBF0' : obsBg();
       if (state.map && changed) {
         state.styleLoaded = false;
-        state.map.setStyle(styleUrlFor(state.isLight, state.rasterFallback));
+        state.styleSwitching = true;
+        state.spritesEnhanced = false;
+        state.map.setStyle(styleUrlFor(state.isLight, state.offlineMode), {
+          diff: false,
+          transformStyle: transformStyleForTheme
+        });
+        setTimeout(function() {
+          if (state.map && !state.styleLoaded && state.map.isStyleLoaded()) {
+            state.styleLoaded = true;
+            state.styleSwitching = false;
+            setupDataLayers(state.map);
+          }
+        }, 550);
+      } else {
+        if (state.map && state.styleLoaded && accChanged) {
+          try { if (state.map.hasImage('car-puck')) state.map.removeImage('car-puck'); } catch (e) {}
+          try { if (state.map.hasImage('preview-pin')) state.map.removeImage('preview-pin'); } catch (e) {}
+          ensureImages(state.map);
+          try { state.map.setPaintProperty('active-route-line', 'line-color', state.accent || '#E63946'); } catch (e) {}
+        }
+        syncPreviewLayer();
+      }
+    },
+    setBrightness: function(b) {
+      var nb = Math.max(0, Math.min(2, parseInt(b, 10) || 0));
+      if (state.bright === nb) return;
+      state.bright = nb;
+      if (!state.isLight && state.map) {
+        document.body.style.background = obsBg();
+        state.styleLoaded = false;
+        state.styleSwitching = true;
+        state.spritesEnhanced = false;
+        state.map.setStyle(styleUrlFor(state.isLight, state.offlineMode), {
+          diff: false,
+          transformStyle: transformStyleForTheme
+        });
+      }
+    },
+    setOfflineMode: function(enabled, forceReload) {
+      var next = !!enabled;
+      var changed = state.offlineMode !== next;
+      state.offlineMode = next;
+      if (state.map && (changed || (forceReload && next))) {
+        state.styleLoaded = false;
+        state.styleSwitching = true;
+        state.spritesEnhanced = false;
+        state.map.setStyle(styleUrlFor(state.isLight, state.offlineMode), {
+          diff: false,
+          transformStyle: transformStyleForTheme
+        });
       }
     },
     setInitialCenter: function(lat, lon, zoom) {
@@ -657,23 +1412,65 @@
       state.initLat = lat; state.initLon = lon;
       if (zoom) state.initZoom = zoom;
       if (state.map && !state.hasFix && !state.preview) {
-        state.map.jumpTo({ center: [lon, lat], zoom: state.initZoom });
+        state.map.jumpTo({ center: [lon, lat], zoom: state.initZoom, pitch: desiredPitch() });
       }
+      if (state.navActive) syncCarLayer();
     },
     setTiltConfig: function(view3d, tiltAngle) {
-      state.view3d = !!view3d;
-      state.tiltAngle = tiltAngle || 45;
+      state.view3d = true; // edificios 3D siempre activos
+      state.tiltAngle = (tiltAngle >= 48) ? 60 : 30;
       if (!state.map) return;
       if (state.map.getLayer('strada-3d-buildings')) {
-        state.map.setLayoutProperty('strada-3d-buildings', 'visibility', state.view3d ? 'visible' : 'none');
+        state.map.setLayoutProperty('strada-3d-buildings', 'visibility', 'visible');
       }
       if (!state.overview) {
         state.map.easeTo({ pitch: desiredPitch(), duration: 380 });
       }
     },
+    setAutoZoom: function(enabled) {
+      state.autoZoom = !!enabled;
+    },
     setHeadingUp: function(h) {
       state.headingUp = !!h;
-      if (state.following && !state.overview) applyCameraFollow(380);
+      if (state.following && !state.overview && state.hasFix) applyCameraFollow(380);
+      else if (!state.headingUp && state.map && !state.overview) state.map.easeTo({ bearing: 0, duration: 380 });
+    },
+    setNavActive: function(active) {
+      state.navActive = !!active;
+      if (!state.navActive) state.userZoomed = false;
+      syncCarLayer();
+    },
+    startNavCamera: function(pitchDeg, autoZoom) {
+      state.navActive = true;
+      state.view3d = true;
+      if (typeof autoZoom === 'boolean') state.autoZoom = autoZoom;
+      if (typeof pitchDeg === 'number' && !isNaN(pitchDeg)) state.tiltAngle = (pitchDeg >= 48) ? 60 : 30;
+      state.headingUp = true;
+      state.following = true;
+      state.overview = false;
+      state.userZoomed = false;
+      state.preview = null;
+      syncPreviewLayer();
+      syncCarLayer();
+      notifyFollow(true);
+      if (!state.map) return;
+      if (state.map.getLayer('strada-3d-buildings')) {
+        state.map.setLayoutProperty('strada-3d-buildings', 'visibility', 'visible');
+      }
+      var lat = (!isNaN(state.carLat)) ? state.carLat : state.initLat;
+      var lon = (!isNaN(state.carLon)) ? state.carLon : state.initLon;
+      var h = state.map.getContainer().clientHeight || 400;
+      var pitch = desiredPitch();
+      var opts = {
+        center: [lon, lat],
+        pitch: pitch,
+        bearing: !isNaN(state.carBearing) ? state.carBearing : 0,
+        padding: pitch > 0 ? { top: Math.round(h * 0.34), bottom: 16, left: 0, right: 0 } : { top: 0, bottom: 0, left: 0, right: 0 },
+        duration: 650,
+        essential: true
+      };
+      if (state.autoZoom) opts.zoom = 18.2;
+      state.map.easeTo(opts);
     },
     setPosition: function(lat, lon, bearing, speedKmh, hasFix) {
       state.hasFix = !!hasFix;
@@ -683,12 +1480,13 @@
       if (!isNaN(bearing)) state.carBearing = bearing;
       syncCarLayer();
       if (state.following && !state.overview && !state.preview) {
-        var zoom = state.map ? state.map.getZoom() : 15.8;
-        if (!state.userZoomed && speedKmh > 0) {
-          var targetZ = speedKmh > 70 ? 14.8 : speedKmh > 35 ? 15.7 : 16.5;
-          if (Math.abs(zoom - targetZ) > 0.35 && state.map) state.map.setZoom(targetZ);
+        var targetZ = null;
+        if (!state.userZoomed && state.autoZoom) {
+          if (state.navActive) {
+            targetZ = speedKmh > 90 ? 16.4 : speedKmh > 55 ? 17.3 : 18.2;
+          }
         }
-        applyCameraFollow(420);
+        applyCameraFollow(420, targetZ);
       }
     },
     setPreviewPlace: function(lat, lon, name) {
@@ -700,7 +1498,7 @@
       if (state.map) {
         state.map.flyTo({
           center: [lon, lat],
-          zoom: Math.max(15.2, state.map.getZoom() || 15.5),
+          zoom: Math.max(15.5, state.map.getZoom() || 15.8),
           pitch: desiredPitch(),
           bearing: 0,
           duration: 600
@@ -752,22 +1550,29 @@
       syncPreviewLayer();
       notifyFollow(true);
       if (!state.map) return;
-      if (state.hasFix && !isNaN(state.carLat) && !isNaN(state.carLon)) {
-        state.map.easeTo({
+      var h = state.map.getContainer().clientHeight || 400;
+      var pitch = desiredPitch();
+      if (!isNaN(state.carLat) && !isNaN(state.carLon)) {
+        var opts = {
           center: [state.carLon, state.carLat],
-          zoom: 16.0,
-          pitch: desiredPitch(),
+          pitch: pitch,
           bearing: state.headingUp ? state.carBearing : 0,
+          padding: pitch > 0 ? { top: Math.round(h * (state.navActive ? 0.34 : 0.25)), bottom: 16, left: 0, right: 0 } : { top: 0, bottom: 0, left: 0, right: 0 },
           duration: 500
-        });
+        };
+        if (state.navActive && state.autoZoom) opts.zoom = 18.2;
+        else if (!state.navActive) opts.zoom = 16.0;
+        state.map.easeTo(opts);
       } else {
-        state.map.easeTo({
+        var opts2 = {
           center: [state.initLon, state.initLat],
-          zoom: 14.5,
-          pitch: desiredPitch(),
+          pitch: pitch,
           bearing: 0,
           duration: 500
-        });
+        };
+        if (state.navActive && state.autoZoom) opts2.zoom = 17.5;
+        else if (!state.navActive) opts2.zoom = 15.0;
+        state.map.easeTo(opts2);
       }
     },
     focusPoint: function(lat, lon, zoom) {
@@ -777,7 +1582,7 @@
       notifyFollow(false);
       state.map.flyTo({
         center: [lon, lat],
-        zoom: zoom || 16.2,
+        zoom: zoom || 16.5,
         pitch: desiredPitch(),
         duration: 500
       });
@@ -785,7 +1590,7 @@
     zoomBy: function(delta) {
       if (!state.map) return;
       state.userZoomed = true;
-      state.map.easeTo({ zoom: Math.max(3, Math.min(19, state.map.getZoom() + delta)), duration: 220 });
+      state.map.easeTo({ zoom: Math.max(3, Math.min(19.5, state.map.getZoom() + delta)), duration: 220 });
     },
     setWaveAlert: function(active, kind, lat, lon) {
       state.wave.active = !!active;
@@ -794,9 +1599,10 @@
       state.wave.lon = isNaN(lon) ? NaN : lon;
       syncWaveLoop();
     },
-    setPoliceReports: function(list) {
-      state.policeReports = Array.isArray(list) ? list : [];
-      syncPoliceLayer();
+    setRoadHazards: function(alerts, jams) {
+      state.hazards.alerts = Array.isArray(alerts) ? alerts : [];
+      state.hazards.jams = Array.isArray(jams) ? jams : [];
+      syncHazardsLayers();
     }
   };
 
@@ -818,13 +1624,13 @@
   css.onerror = function() {
     var altCss = document.createElement('link');
     altCss.rel = 'stylesheet';
-    altCss.href = 'https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css';
+    altCss.href = 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css';
     document.head.appendChild(altCss);
   };
 
-  loadScript('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js', initMap, function() {
-    loadScript('https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js', initMap, function() {
-      notifyFail('cdn_load_failed');
+  loadScript('./maplibre-gl.js', initMap, function() {
+    loadScript('https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js', initMap, function() {
+      notifyFail('lib_load_failed');
     });
   });
 })();

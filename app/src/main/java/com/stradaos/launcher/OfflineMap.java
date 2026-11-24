@@ -340,7 +340,7 @@ public class OfflineMap {
             } else if ("leisure".equals(k)) {
                 if ("park".equals(v) || "garden".equals(v) || "pitch".equals(v) || "golf_course".equals(v) || "nature_reserve".equals(v) || "playground".equals(v) || "stadium".equals(v)) c = GREEN;
             } else if ("building".equals(k)) {
-                if (z >= 16 && !"no".equals(v)) c = BUILDING;
+                if (z >= 15 && !"no".equals(v)) c = BUILDING;
             } else if ("railway".equals(k)) {
                 if ("rail".equals(v) || "light_rail".equals(v) || "narrow_gauge".equals(v)) c = RAIL;
             }
@@ -352,6 +352,7 @@ public class OfflineMap {
     private static final class Data {
         final ArrayList<W> ways = new ArrayList<W>();
         final ArrayList<Object[]> places = new ArrayList<Object[]>();   // {nombre, x, y, rango}
+        final ArrayList<Object[]> pois = new ArrayList<Object[]>();     // {nombre, x, y, color}
     }
 
     private Data read(int z, int x, int y, float size) throws IOException {
@@ -412,6 +413,7 @@ public class OfflineMap {
             int sp = b.byte8();
             int nt = sp & 0x0f;
             int rank = 0;
+            int poiCol = 0;
             for (int t = 0; t < nt; t++) {
                 int id = b.uvar();
                 if (id < 0 || id >= poiK.length) return;
@@ -420,19 +422,40 @@ public class OfflineMap {
             for (int t = 0; t < nt; t++) {
                 int id = tagIds[t];
                 skipVarValue(b, poiV[id], poiK[id]);
-                if ("place".equals(poiK[id])) {
-                    String v = poiV[id];
-                    rank = "city".equals(v) ? 5 : "town".equals(v) ? 4 : "village".equals(v) || "suburb".equals(v) ? 3
-                            : "neighbourhood".equals(v) || "quarter".equals(v) ? 2 : "hamlet".equals(v) ? 1 : 0;
+                String pk = poiK[id], pv = poiV[id];
+                if ("place".equals(pk)) {
+                    rank = "city".equals(pv) ? 5 : "town".equals(pv) ? 4 : "village".equals(pv) || "suburb".equals(pv) ? 3
+                            : "neighbourhood".equals(pv) || "quarter".equals(pv) ? 2 : "hamlet".equals(pv) ? 1 : 0;
+                } else if (poiCol == 0) {
+                    if ("amenity".equals(pk)) {
+                        if ("fuel".equals(pv) || "charging_station".equals(pv)) poiCol = 0xFFF59E0B;
+                        else if ("hospital".equals(pv) || "clinic".equals(pv) || "pharmacy".equals(pv)) poiCol = 0xFFEF4444;
+                        else if ("restaurant".equals(pv) || "cafe".equals(pv) || "fast_food".equals(pv)) poiCol = 0xFFFB923C;
+                        else if ("parking".equals(pv) || "bus_station".equals(pv)) poiCol = 0xFF38BDF8;
+                        else if ("place_of_worship".equals(pv) || "school".equals(pv) || "university".equals(pv) || "bank".equals(pv) || "police".equals(pv)) poiCol = 0xFF7DD3FC;
+                    } else if ("shop".equals(pk)) {
+                        poiCol = 0xFFA78BFA;
+                    } else if ("tourism".equals(pk) || "leisure".equals(pk)) {
+                        poiCol = 0xFF34D399;
+                    } else if ("healthcare".equals(pk)) {
+                        poiCol = 0xFFEF4444;
+                    } else if ("railway".equals(pk) || "aeroway".equals(pk)) {
+                        poiCol = 0xFF38BDF8;
+                    }
                 }
             }
             int fb = b.byte8();
             String name = (fb & 0x80) != 0 ? local(b.str()) : null;
             if ((fb & 0x40) != 0) b.str();
             if ((fb & 0x20) != 0) b.svar();
-            if (rank > 0 && name != null) {
-                int minZ = rank >= 4 ? 0 : rank == 3 ? 13 : 15;
-                if (z >= minZ) out.places.add(new Object[]{name, (float) ((lonX(lo, z) - x) * size), (float) ((latY(la, z) - y) * size), rank});
+            if (name != null && name.length() > 0) {
+                float px = (float) ((lonX(lo, z) - x) * size), py = (float) ((latY(la, z) - y) * size);
+                if (rank > 0) {
+                    int minZ = rank >= 4 ? 0 : rank == 3 ? 13 : 15;
+                    if (z >= minZ) out.places.add(new Object[]{name, px, py, rank});
+                } else if (poiCol != 0 && z >= 15) {
+                    out.pois.add(new Object[]{name, px, py, poiCol});
+                }
             }
         }
         if (b.p > firstWay) return;
@@ -571,29 +594,33 @@ public class OfflineMap {
     // ── dibujo ──
 
     static final class Palette {
-        int land, sea, urban, green, forest, building, rail, text, halo, casing, minor;
+        int land, sea, waterLine, urban, green, forest, building, rail, text, poiText, halo, casing, minor;
+        boolean dark;
         int[] road = new int[ROADS.length];
     }
 
     static Palette palette(boolean light, int bright) {
         Palette p = new Palette();
+        p.dark = !light;
         if (light) {
-            p.land = 0xFFF2EFE9; p.sea = 0xFFAAD3DF; p.urban = 0xFFE9E5DF; p.green = 0xFFCDEBC0; p.forest = 0xFFB5D9A4;
-            p.building = 0xFFDCD3CC; p.rail = 0xFF9A9A9A; p.text = 0xFF2B2E34; p.halo = 0xF0FFFFFF; p.casing = 0xFFC4BCB2;
+            p.land = 0xFFF2EFE9; p.sea = 0xFFAAD3DF; p.waterLine = 0xFFAAD3DF; p.urban = 0xFFE9E5DF; p.green = 0xFFCDEBC0; p.forest = 0xFFB5D9A4;
+            p.building = 0xFFDCD3CC; p.rail = 0xFF9A9A9A; p.text = 0xFF2B2E34; p.poiText = 0xFF1E293B; p.halo = 0xF0FFFFFF; p.casing = 0xFFC4BCB2;
             int[] r = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
                     0xFFFFFFFF, 0xFFF7FABF, 0xFFFCD6A4, 0xFFF9B29C, 0xFFE892A2};
             p.road = r;
         } else {
-            p.land = 0xFF1C1F25; p.sea = 0xFF15293B; p.urban = 0xFF20232A; p.green = 0xFF1C2B23; p.forest = 0xFF1A2A21;
-            p.building = 0xFF2A2E36; p.rail = 0xFF4E545F; p.text = 0xFFD5D9E0; p.halo = 0xE0101216; p.casing = 0xFF111317;
-            int[] r = {0xFF353A44, 0xFF3A3F49, 0xFF3F4550, 0xFF444A56, 0xFF444A56, 0xFF444A56,
-                    0xFF59606D, 0xFF6A7180, 0xFF8A6D45, 0xFFA2703F, 0xFFB8773E};
+            // Obsidian Night palette: luminous cyan & amber roads, emerald parks, sapphire water against #06080E
+            p.land = bright >= 2 ? 0xFF090C14 : bright <= 0 ? 0xFF040509 : 0xFF06080E;
+            p.sea = 0xFF0B2848; p.waterLine = 0xFF0EA5E9; p.urban = 0xFF0D121C; p.green = 0xFF0D2C22; p.forest = 0xFF0A241C;
+            p.building = 0xFF182233; p.rail = 0xFF64748B; p.text = 0xFFF4F8FF; p.poiText = 0xFFBAE6FD; p.halo = 0xF504060A; p.casing = 0xFF030508;
+            int[] r = {0xFF364963, 0xFF3C526E, 0xFF425A78, 0xFF4B6688, 0xFF527094, 0xFF56769B,
+                    0xFF6288B5, 0xFF0EA5E9, 0xFF22D3EE, 0xFFFB923C, 0xFFF59E0B};
             p.road = r;
-            float lift = bright <= 0 ? 0f : bright == 1 ? 0.06f : 0.13f;
+            float lift = bright <= 0 ? 0f : bright == 1 ? 0.04f : 0.11f;
             if (lift > 0) {
-                p.land = mix(p.land, lift); p.urban = mix(p.urban, lift); p.green = mix(p.green, lift); p.forest = mix(p.forest, lift);
-                p.building = mix(p.building, lift); p.sea = mix(p.sea, lift);
-                for (int i = 0; i < r.length; i++) r[i] = mix(r[i], lift * 1.6f);
+                p.urban = mix(p.urban, lift); p.green = mix(p.green, lift * 0.7f); p.forest = mix(p.forest, lift * 0.6f);
+                p.building = mix(p.building, lift * 1.1f);
+                for (int i = 0; i <= 6; i++) r[i] = mix(r[i], lift * 1.4f);
             }
         }
         p.minor = p.road[0];
@@ -646,7 +673,7 @@ public class OfflineMap {
                         line.setColor(pal.rail);
                         line.setStrokeWidth(Math.max(1f, 1.6f * k * Math.max(zf, 0.6f)));
                     } else {
-                        line.setColor(pal.sea);
+                        line.setColor(pal.waterLine);
                         line.setStrokeWidth(Math.max(1f, (kind == RIVER ? 5f : 1.6f) * k * zf));
                     }
                     path.reset();
@@ -793,11 +820,51 @@ public class OfflineMap {
             c.drawText(name, px - tw / 2, py, bold);
             used.add(box);
         }
+
+        // POIs con nombre a zoom cercano (estaciones, combustible, hospitales, comercios…)
+        if (z >= 15 && !d.pois.isEmpty()) {
+            Paint pt = new Paint(txt);
+            pt.setColor(pal.poiText);
+            pt.setTextSize(9.5f * k);
+            Paint phalo = new Paint(halo);
+            phalo.setTextSize(pt.getTextSize());
+            phalo.setStrokeWidth(2.8f * k);
+            Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+            Paint dotRim = new Paint(Paint.ANTI_ALIAS_FLAG);
+            dotRim.setColor(pal.dark ? 0xFFF8FAFC : 0xFFFFFFFF);
+            int drawnPois = 0;
+            for (Object[] poi : d.pois) {
+                if (drawnPois >= 12) break;
+                String name = (String) poi[0];
+                float px = (Float) poi[1], py = (Float) poi[2];
+                int col = (Integer) poi[3];
+                float tw = pt.measureText(name);
+                float r = 2.8f * k;
+                float tx = px + r + 3 * k;
+                float ty = py + 3.2f * k;
+                RectF box = new RectF(px - r - 2 * k, py - 8 * k, tx + tw + 2 * k, py + 5 * k);
+                if (box.left < pad || box.top < pad || box.right > size - pad || box.bottom > size - pad) continue;
+                boolean hit = false;
+                for (RectF u : used) if (RectF.intersects(u, box)) { hit = true; break; }
+                if (hit) continue;
+                c.drawCircle(px, py, r + 1.1f * k, dotRim);
+                dot.setColor(col);
+                c.drawCircle(px, py, r, dot);
+                c.drawText(name, tx, ty, phalo);
+                c.drawText(name, tx, ty, pt);
+                used.add(box);
+                drawnPois++;
+            }
+        }
     }
 
     String describe() {
         java.text.DateFormat df = I18n.latin(java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM, I18n.loc));
         return file.getName() + " · " + (fileSize / (1024 * 1024)) + " MB · " + df.format(new java.util.Date(mapDate));
+    }
+
+    String signature() {
+        return file.getName() + ":" + fileSize + ":" + mapDate;
     }
 
     // ───────────────────────── lectura directa y utilidades ─────────────────────────
@@ -823,7 +890,7 @@ public class OfflineMap {
         return Math.sqrt(dx * dx + dy * dy);
     }
 
-    private static String fold(String s) {
+    static String fold(String s) {
         if (s == null) return "";
         String norm = Normalizer.normalize(s, Normalizer.Form.NFD);
         StringBuilder sb = new StringBuilder(norm.length());
@@ -870,7 +937,7 @@ public class OfflineMap {
                     for (long bn = 0; bn < s.blocks; bn++) {
                         if (System.currentTimeMillis() > deadline) break;
                         long col = bn % s.w, row = bn / s.w;
-                        scanSearchBlock(s, (int) row, (int) col, false, qFold, tokens, null, nearLat, nearLon, bestByKey, visitedSubBlocks);
+                        scanSearchBlock(s, (int) row, (int) col, false, qFold, tokens, null, nearLat, nearLon, bestByKey, visitedSubBlocks, false);
                     }
                 } else {
                     scanSpiral(s, nearLat, nearLon, 3, false, qFold, tokens, null, bestByKey, visitedSubBlocks, deadline);
@@ -881,7 +948,7 @@ public class OfflineMap {
         // 2. Subarchivo de detalle alrededor de la posición (POIs y calles con nombre)
         Sub detail = subs[zMax];
         if (detail != null) {
-            int rad = cat != null ? 3 : 4; // hasta (2*rad+1)^2 bloques alrededor (~15-22 km)
+            int rad = cat != null ? 4 : 5;
             scanSpiral(detail, nearLat, nearLon, rad, cat == null, qFold, tokens, cat, bestByKey, visitedSubBlocks, deadline);
         }
 
@@ -896,19 +963,73 @@ public class OfflineMap {
         return out;
     }
 
+    /** Extrae un catálogo de ciudades y POIs cercanos desde el .map para indexarlos en SQLite. */
+    ArrayList<SearchHit> extractPoiCatalog(double nearLat, double nearLon, int maxEntries) {
+        ArrayList<SearchHit> out = new ArrayList<SearchHit>();
+        if (subs == null || subs.length == 0 || maxEntries <= 0) return out;
+        if (Double.isNaN(nearLat) || Double.isNaN(nearLon) || !contains(nearLat, nearLon)) {
+            nearLat = (minLat + maxLat) * 0.5;
+            nearLon = (minLon + maxLon) * 0.5;
+        }
+        HashMap<String, SearchHit> bestByKey = new HashMap<String, SearchHit>();
+        HashSet<Long> visitedSubBlocks = new HashSet<Long>();
+        long deadline = System.currentTimeMillis() + 6500L;
+
+        // 1. Subarchivos generales (ciudades, pueblos, aeropuertos en todo el mapa)
+        ArrayList<Sub> overviews = new ArrayList<Sub>();
+        for (Sub s : subs) {
+            if (s != null && s.zMax < zMax && !overviews.contains(s)) overviews.add(s);
+        }
+        for (Sub s : overviews) {
+            if (System.currentTimeMillis() > deadline || bestByKey.size() >= maxEntries) break;
+            if (s.blocks <= 96) {
+                for (long bn = 0; bn < s.blocks; bn++) {
+                    if (System.currentTimeMillis() > deadline || bestByKey.size() >= maxEntries) break;
+                    long col = bn % s.w, row = bn / s.w;
+                    scanSearchBlock(s, (int) row, (int) col, false, "", new String[0], null, nearLat, nearLon, bestByKey, visitedSubBlocks, true);
+                }
+            } else {
+                scanSpiral(s, nearLat, nearLon, 5, false, "", new String[0], null, bestByKey, visitedSubBlocks, deadline, true, maxEntries);
+            }
+        }
+
+        // 2. Subarchivo de detalle alrededor de la ubicación (POIs y vías principales)
+        Sub detail = subs[zMax];
+        if (detail != null && System.currentTimeMillis() < deadline && bestByKey.size() < maxEntries) {
+            scanSpiral(detail, nearLat, nearLon, 7, false, "", new String[0], null, bestByKey, visitedSubBlocks, deadline, true, maxEntries);
+        }
+
+        out.addAll(bestByKey.values());
+        Collections.sort(out, new Comparator<SearchHit>() {
+            public int compare(SearchHit a, SearchHit b) {
+                if (b.score != a.score) return b.score > a.score ? 1 : -1;
+                return a.distM < b.distM ? -1 : a.distM > b.distM ? 1 : 0;
+            }
+        });
+        if (out.size() > maxEntries) return new ArrayList<SearchHit>(out.subList(0, maxEntries));
+        return out;
+    }
+
     private void scanSpiral(Sub s, double nearLat, double nearLon, int maxRad, boolean scanWays,
                             String qFold, String[] tokens, String cat,
                             HashMap<String, SearchHit> best, HashSet<Long> visited, long deadline) {
+        scanSpiral(s, nearLat, nearLon, maxRad, scanWays, qFold, tokens, cat, best, visited, deadline, false, Integer.MAX_VALUE);
+    }
+
+    private void scanSpiral(Sub s, double nearLat, double nearLon, int maxRad, boolean scanWays,
+                            String qFold, String[] tokens, String cat,
+                            HashMap<String, SearchHit> best, HashSet<Long> visited, long deadline,
+                            boolean indexAll, int maxEntries) {
         int cCol = (int) (tileX(nearLon, s.base) - s.left);
         int cRow = (int) (tileY(nearLat, s.base) - s.top);
         for (int r = 0; r <= maxRad; r++) {
             for (int dr = -r; dr <= r; dr++) {
                 for (int dc = -r; dc <= r; dc++) {
                     if (Math.abs(dr) != r && Math.abs(dc) != r) continue;
-                    if (System.currentTimeMillis() > deadline) return;
+                    if (System.currentTimeMillis() > deadline || best.size() >= maxEntries) return;
                     int rr = cRow + dr, cc = cCol + dc;
                     if (rr < 0 || rr >= s.h || cc < 0 || cc >= s.w) continue;
-                    scanSearchBlock(s, rr, cc, scanWays, qFold, tokens, cat, nearLat, nearLon, best, visited);
+                    scanSearchBlock(s, rr, cc, scanWays, qFold, tokens, cat, nearLat, nearLon, best, visited, indexAll);
                 }
             }
         }
@@ -917,7 +1038,8 @@ public class OfflineMap {
     private void scanSearchBlock(Sub s, int row, int col, boolean scanWays,
                                  String qFold, String[] tokens, String cat,
                                  double nearLat, double nearLon,
-                                 HashMap<String, SearchHit> best, HashSet<Long> visited) {
+                                 HashMap<String, SearchHit> best, HashSet<Long> visited,
+                                 boolean indexAll) {
         long bn = (long) row * s.w + col;
         long bKey = s.start * 1000003L + bn;
         if (!visited.add(bKey)) return;
@@ -958,7 +1080,11 @@ public class OfflineMap {
                         else if ("town".equals(v)) boost = 40;
                         else if ("village".equals(v) || "suburb".equals(v)) boost = 30;
                         else boost = 15;
-                    } else if ("amenity".equals(k) || "shop".equals(k) || "tourism".equals(k) || "railway".equals(k) || "aeroway".equals(k)) {
+                    } else if ("highway".equals(k) && ("services".equals(v) || "rest_area".equals(v))) {
+                        tagLabel = v;
+                        boost = Math.max(boost, 32);
+                        if (cat != null && ("fuel".equals(cat) || "food".equals(cat) || "parking".equals(cat))) catOk = true;
+                    } else if ("amenity".equals(k) || "shop".equals(k) || "tourism".equals(k) || "railway".equals(k) || "aeroway".equals(k) || "public_transport".equals(k)) {
                         if (tagLabel == null) tagLabel = v;
                         boost = Math.max(boost, 22);
                         if (cat != null && matchesCat(cat, k, v)) catOk = true;
@@ -973,7 +1099,7 @@ public class OfflineMap {
                     if (cat == null) continue;
                     name = prettyTag(tagLabel);
                 }
-                int matchSc = cat != null ? 100 : matchScore(name, qFold, tokens);
+                int matchSc = indexAll ? (60 + boost) : (cat != null ? 100 : matchScore(name, qFold, tokens));
                 if (matchSc <= 0) continue;
                 SearchHit h = new SearchHit();
                 h.name = name;
@@ -1052,22 +1178,28 @@ public class OfflineMap {
     }
 
     private static boolean matchesCat(String cat, String k, String v) {
-        if ("fuel".equals(cat)) return "amenity".equals(k) && "fuel".equals(v);
+        if ("fuel".equals(cat)) return ("amenity".equals(k) && ("fuel".equals(v) || "charging_station".equals(v)))
+                || ("highway".equals(k) && ("services".equals(v) || "rest_area".equals(v)));
         if ("health".equals(cat)) return "amenity".equals(k) && ("hospital".equals(v) || "clinic".equals(v) || "pharmacy".equals(v) || "doctors".equals(v));
-        if ("parking".equals(cat)) return "amenity".equals(k) && "parking".equals(v);
-        if ("food".equals(cat)) return ("amenity".equals(k) && ("restaurant".equals(v) || "cafe".equals(v) || "fast_food".equals(v)))
-                || ("shop".equals(k) && ("supermarket".equals(v) || "convenience".equals(v)));
+        if ("parking".equals(cat)) return ("amenity".equals(k) && "parking".equals(v))
+                || ("highway".equals(k) && ("services".equals(v) || "rest_area".equals(v)));
+        if ("food".equals(cat)) return ("amenity".equals(k) && ("restaurant".equals(v) || "cafe".equals(v) || "fast_food".equals(v) || "food_court".equals(v)))
+                || ("shop".equals(k) && ("supermarket".equals(v) || "convenience".equals(v)))
+                || ("highway".equals(k) && ("services".equals(v) || "rest_area".equals(v)));
         return false;
     }
 
     private static String prettyTag(String v) {
-        if ("fuel".equals(v)) return "Estación de servicio";
+        if ("fuel".equals(v) || "charging_station".equals(v)) return "Estación de servicio";
+        if ("services".equals(v) || "rest_area".equals(v)) return "Área de servicio";
         if ("hospital".equals(v)) return "Hospital";
-        if ("clinic".equals(v)) return "Clínica";
+        if ("clinic".equals(v) || "doctors".equals(v)) return "Clínica";
         if ("pharmacy".equals(v)) return "Farmacia";
         if ("parking".equals(v)) return "Parqueadero";
-        if ("restaurant".equals(v)) return "Restaurante";
-        if ("supermarket".equals(v)) return "Supermercado";
+        if ("restaurant".equals(v) || "fast_food".equals(v) || "food_court".equals(v)) return "Restaurante";
+        if ("cafe".equals(v)) return "Cafetería";
+        if ("supermarket".equals(v) || "convenience".equals(v)) return "Supermercado";
+        if ("mall".equals(v) || "department_store".equals(v)) return "Centro comercial";
         return v != null ? v : "Lugar";
     }
 

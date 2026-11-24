@@ -13,13 +13,8 @@ import android.os.SystemClock;
 import android.view.View;
 
 /**
- * Velocímetro del tema Faro (Bloque 16): aro fino abierto abajo con el avance más grueso (grafito en claro, cobre con
- * brillo en oscuro). Tres modos, los mismos de StradaOS: 2 mixto (aro + número grande), 1 analógico (aro con puntos y
- * una aguja fina) y 0 digital (número grande con una línea de avance debajo). El circulito del límite solo aparece
- * cuando la navegación integrada trae el límite real de la vía.
- *
- * Igual que Gauge: la aguja y el número se acercan a la velocidad nueva fotograma a fotograma (sin saltos entre
- * lecturas del GPS) y solo redibuja mientras se mueve. Funciona desde Android 4.1.
+ * Velocímetro del cockpit (Faro y NightPulse).
+ * Soporta tres modos (0 digital, 1 analógico, 2 mixto) más tipografía, paleta y detalles propios de cada tema.
  */
 public class FaroGauge extends View {
 
@@ -33,6 +28,7 @@ public class FaroGauge extends View {
     private long last;
     private int limit;
     private int text = 0xFFF2F3F5, muted = 0xFF8C919A, track = 0xFF2A2D33;
+    private String themeId = Faro.ID;
 
     private final Paint pTrack = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pProg = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -55,12 +51,23 @@ public class FaroGauge extends View {
         pNum.setTextAlign(Paint.Align.CENTER);
     }
 
-    /** Colores del tema (claro u oscuro). */
+    /** Colores del tema (claro u oscuro) y estilo de diseño del cockpit activo. */
     public void setTheme(boolean isLight, int textColor, int mutedColor) {
+        setCockpitTheme(Faro.ID, isLight, textColor, mutedColor);
+    }
+
+    public void setCockpitTheme(String id, boolean isLight, int textColor, int mutedColor) {
+        themeId = id != null ? id : Faro.ID;
         light = isLight;
         text = textColor;
         muted = mutedColor;
-        track = Faro.track(isLight);
+        track = CockpitThemes.track(themeId, isLight);
+        if (CockpitThemes.isCustom(themeId)) {
+            Typeface tf = CockpitThemes.displayFont(getContext(), themeId);
+            pBig.setTypeface(tf != null ? tf : Typeface.create("sans-serif-light", Typeface.NORMAL));
+        } else {
+            pBig.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
+        }
         invalidate();
     }
 
@@ -82,7 +89,10 @@ public class FaroGauge extends View {
         postInvalidateOnAnimation();
     }
 
-    private int progColor() { return light ? text : Faro.COPPER_LIGHT; }
+    private int progColor() {
+        if (CockpitThemes.NIGHTPULSE.equals(themeId)) return light ? 0xFF0062E6 : 0xFF7DD3FC;
+        return light ? text : Faro.COPPER_LIGHT;
+    }
 
     @Override
     protected void onDraw(Canvas c) {
@@ -93,14 +103,23 @@ public class FaroGauge extends View {
             if (Math.abs(target - val) < 0.04f) { val = target; last = 0; }
             else { last = now; postInvalidateOnAnimation(); }
         }
+
         float w = getWidth(), h = getHeight(), cx = w / 2f, cy = h / 2f, d = Math.min(w, h);
         if (d <= 0) return;
-        // brillo detrás del velocímetro en el modo claro (como la referencia)
-        if (light) {
+
+        boolean nightPulse = CockpitThemes.NIGHTPULSE.equals(themeId);
+
+        // Fondo sutil detrás del velocímetro según tema
+        if (nightPulse && !light) {
+            pBg.setShader(new RadialGradient(cx, cy, d / 2f, new int[]{0x381E90FF, 0x120A4DA2, 0x00000000},
+                new float[]{0f, 0.58f, 1f}, Shader.TileMode.CLAMP));
+            c.drawCircle(cx, cy, d / 2f, pBg);
+        } else if (light) {
             pBg.setShader(new RadialGradient(cx, cy, d / 2f, new int[]{0xD9FFFFFF, 0x66FFFFFF, 0x00FFFFFF},
                 new float[]{0f, 0.6f, 1f}, Shader.TileMode.CLAMP));
             c.drawCircle(cx, cy, d / 2f, pBg);
         }
+
         float frac = Math.max(0, Math.min(1, val / max));
         String num = ok ? String.valueOf(Math.round(val < 1.5f && target == 0 ? 0 : val)) : "--";
         String unit = mph ? "mph" : "km/h";
@@ -108,14 +127,44 @@ public class FaroGauge extends View {
 
         float r = d / 2f * 0.80f;
         rect.set(cx - r, cy - r, cx + r, cy + r);
+
         // pista fina
         pTrack.setColor(track);
         pTrack.setStrokeWidth(Math.max(1.5f, r * 0.028f));
         c.drawArc(rect, START, SWEEP, false, pTrack);
+
+        // NightPulse: marcas deportivas en el aro incluso en modo mixto
+        if (nightPulse && mode == 2) {
+            pDot.setStyle(Paint.Style.FILL);
+            for (int v = 0; v <= max; v += 20) {
+                double a = Math.toRadians(START + SWEEP * v / max);
+                float cs = (float) Math.cos(a), sn = (float) Math.sin(a);
+                boolean active = ok && val >= v;
+                pDot.setColor(active ? (light ? 0xFF0062E6 : 0xFF7DD3FC) : Aurora.a(muted, 0.35f));
+                c.drawCircle(cx + cs * r * 0.88f, cy + sn * r * 0.88f, r * 0.016f, pDot);
+            }
+        }
+
         float sweep = SWEEP * frac;
         if (sweep > 0.5f) {
-            if (!light) {
-                // brillo: el mismo arco ancho y casi transparente
+            if (nightPulse) {
+                if (!light) {
+                    pGlow.setShader(null);
+                    pGlow.setColor(Aurora.a(0xFF1E90FF, 0.22f));
+                    pGlow.setStrokeWidth(r * 0.16f);
+                    c.drawArc(rect, START, sweep, false, pGlow);
+                }
+                float f = Math.max(0.02f, sweep / 360f);
+                int c0 = light ? 0xFF004BB5 : 0xFF0052CC;
+                int c1 = light ? 0xFF0062E6 : 0xFF1E90FF;
+                int c2 = light ? 0xFF38BDF8 : 0xFF7DD3FC;
+                SweepGradient sg = new SweepGradient(cx, cy, new int[]{c0, c1, c2, c2}, new float[]{0f, f * 0.5f, f, 1f});
+                rot.setRotate(START, cx, cy);
+                sg.setLocalMatrix(rot);
+                pProg.setShader(sg);
+                pProg.setColor(0xFF000000);
+            } else if (!light) {
+                // Faro original
                 pGlow.setShader(null);
                 pGlow.setColor(Aurora.a(Faro.COPPER, 0.16f));
                 pGlow.setStrokeWidth(r * 0.17f);
@@ -135,8 +184,8 @@ public class FaroGauge extends View {
             c.drawArc(rect, START, sweep, false, pProg);
             pProg.setShader(null);
         }
+
         if (mode == 1) {
-            // puntos cada 20 y números chicos cada 40
             pDot.setStyle(Paint.Style.FILL);
             pNum.setColor(muted);
             pNum.setTextSize(r * 0.13f);
@@ -151,7 +200,6 @@ public class FaroGauge extends View {
                     c.drawText(String.valueOf(v), cx + cs * rl, cy + sn * rl - (pNum.ascent() + pNum.descent()) / 2f, pNum);
                 }
             }
-            // aguja fina
             double na = Math.toRadians(START + sweep);
             float ncs = (float) Math.cos(na), nsn = (float) Math.sin(na);
             pGlow.setShader(null);
@@ -166,10 +214,10 @@ public class FaroGauge extends View {
         } else {
             pBig.setColor(text);
             pBig.setTextSize(r * 0.68f);
-            c.drawText(num, cx, cy + r * 0.20f, pBig);
+            c.drawText(num, cx, cy + r * 0.18f, pBig);
             pUnit.setColor(muted);
             pUnit.setTextSize(r * 0.14f);
-            c.drawText(unit, cx, cy + r * 0.46f, pUnit);
+            c.drawText(unit, cx, cy + r * 0.45f, pUnit);
         }
         drawLimit(c, cx + r * 0.98f, cy - r * 0.86f, r * 0.20f);
     }
@@ -182,14 +230,13 @@ public class FaroGauge extends View {
         pUnit.setColor(muted);
         pUnit.setTextSize(d * 0.08f);
         c.drawText(unit, cx, base + d * 0.12f, pUnit);
-        // línea de avance
         float lw = d * 0.56f, y = base + d * 0.21f, x0 = cx - lw / 2, x1 = cx + lw / 2;
         pTrack.setColor(track);
         pTrack.setStrokeWidth(Math.max(1.5f, d * 0.014f));
         c.drawLine(x0, y, x1, y, pTrack);
         if (frac > 0.005f) {
             pProg.setShader(null);
-            pProg.setColor(light ? text : Faro.COPPER);
+            pProg.setColor(progColor());
             pProg.setStrokeWidth(Math.max(2f, d * 0.024f));
             c.drawLine(x0, y, x0 + lw * frac, y, pProg);
         }

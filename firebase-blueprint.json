@@ -1,0 +1,129 @@
+{
+  "entities": {
+    "RoadAlert": {
+      "title": "RoadAlert",
+      "description": "Crowdsourced road enforcement, traffic accident, emergency, or hazard report shared by authenticated drivers.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase UID of the authenticated driver who created the report."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "police",
+            "accident",
+            "emergency"
+          ],
+          "description": "Primary alert category."
+        },
+        "subtype": {
+          "type": "string",
+          "description": "Specific Malaysia or Waze-compatible subtype such as roadblock, speed_trap, accident_minor, accident_major, flood, hazard, or road_closed."
+        },
+        "street": {
+          "type": "string",
+          "description": "Optional road, highway, or locality name."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional short driver note."
+        },
+        "country": {
+          "type": "string",
+          "description": "Optional ISO country code such as MY."
+        },
+        "lat": {
+          "type": "number",
+          "description": "WGS84 latitude of the alert."
+        },
+        "lon": {
+          "type": "number",
+          "description": "WGS84 longitude of the alert."
+        },
+        "confirmCount": {
+          "type": "integer",
+          "description": "Total driver confirmations (starts at 1)."
+        },
+        "dismissCount": {
+          "type": "integer",
+          "description": "Total driver gone/dismiss votes (starts at 0)."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "cleared"
+          ],
+          "description": "Current visibility status of the alert."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (client must submit FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated (client must submit FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "category",
+        "subtype",
+        "lat",
+        "lon",
+        "confirmCount",
+        "dismissCount",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AlertVote": {
+      "title": "AlertVote",
+      "description": "Per-driver confirmation or cleared vote for a road alert.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase UID of the voting driver."
+        },
+        "vote": {
+          "type": "string",
+          "enum": [
+            "confirm",
+            "gone"
+          ],
+          "description": "Driver feedback on whether the alert is still active."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the vote (client must submit FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "vote",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/road_alerts/{alertId}": {
+      "schema": {
+        "$ref": "#/entities/RoadAlert"
+      },
+      "description": "Shared crowdsourced road enforcement, accident, emergency, and hazard alerts."
+    },
+    "/road_alerts/{alertId}/votes/{voteUid}": {
+      "schema": {
+        "$ref": "#/entities/AlertVote"
+      },
+      "description": "Per-user vote records preventing duplicate confirmations or dismissals."
+    }
+  }
+}

@@ -1,5 +1,7 @@
 plugins {
     id 'com.android.application'
+    id 'com.google.gms.google-services'
+    id 'com.google.android.libraries.mapsplatform.secrets-gradle-plugin'
 }
 
 // Firma de release: se toma de variables de entorno (GitHub Actions). Sin ellas, el APK de release
@@ -12,13 +14,22 @@ android {
 
     defaultConfig {
         applicationId 'com.stradaos.launcher'
-        // Android 4.1+: el objetivo del proyecto es revivir pantallas de carro antiguas.
-        minSdk 16
+        // Android 6.0+: requerido por Firebase Firestore, Auth y Credential Manager.
+        minSdk 23
         // 28 a propósito: mantiene el comportamiento probado en pantallas viejas y nuevas.
         targetSdk 28
         versionCode 69
         versionName '2.32.0'
         manifestPlaceholders = [appLabel: 'StradaOS']
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    secrets {
+        propertiesFileName = '.env'
+        defaultPropertiesFileName = '.env.example'
     }
 
     signingConfigs {
@@ -115,4 +126,11 @@ tasks.named('preBuild') { dependsOn legacyJar }
 
 dependencies {
     implementation files(layout.buildDirectory.file('intermediates/hiddenapi/stradaos-legacy-rc.jar')).builtBy(legacyJar)
+    implementation platform('com.google.firebase:firebase-bom:34.0.0')
+    implementation 'com.google.firebase:firebase-firestore'
+    implementation 'com.google.firebase:firebase-auth'
+    implementation 'androidx.credentials:credentials:1.5.0'
+    implementation 'androidx.credentials:credentials-play-services-auth:1.5.0'
+    implementation 'com.google.android.libraries.identity.googleid:googleid:1.1.1'
+    implementation 'androidx.annotation:annotation:1.9.1'
 }
